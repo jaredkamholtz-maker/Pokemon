@@ -148,36 +148,38 @@ def _extract_prices_detail(soup: BeautifulSoup) -> dict:
     return prices
 
 
-def _extract_prices_list(soup: BeautifulSoup, card_name: str, set_name: str) -> dict:
+def _find_best_list_link(soup: BeautifulSoup, card_name: str, set_name: str) -> str | None:
     """
-    Fall back: extract from a list/search results page.
-    Only Ungraded + limited grade data available here.
-    Tries to find the row that best matches card_name + set_name.
+    From a PriceCharting search/list page, find the URL of the best-matching
+    individual card page by scoring rows on card name + set name similarity.
     """
-    prices: dict[str, float | None] = {}
-    best_row = None
-    best_score = 0
+    best_url = None
+    best_score = -1
 
-    for row in soup.select("#games_table tbody tr, table.product-list tbody tr"):
-        title_el = row.find(class_="title") or row.find("a")
-        if not title_el:
+    for row in soup.select("#games_table tbody tr, .product tbody tr, table tbody tr"):
+        link = row.find("a", href=re.compile(r"/game/"))
+        if not link:
             continue
-        title_text = title_el.get_text(strip=True).lower()
-        # Score: prefer rows where card name and set name appear
-        score = (card_name.lower() in title_text) + (set_name.lower() in title_text)
+        text = link.get_text(strip=True).lower()
+        # Also grab the console/set cell if present
+        console_el = row.find(class_="console") or row.find(class_="set")
+        console_text = console_el.get_text(strip=True).lower() if console_el else ""
+        combined = text + " " + console_text
+
+        score = 0
+        for word in card_name.lower().split():
+            if word in combined:
+                score += 1
+        for word in set_name.lower().split():
+            if word in combined:
+                score += 0.5
+
         if score > best_score:
             best_score = score
-            best_row = row
+            href = link.get("href", "")
+            best_url = href if href.startswith("http") else f"{BASE_URL}{href}"
 
-    if best_row:
-        for td in best_row.find_all("td", class_=re.compile(r"price|used|loose")):
-            el = td.find(class_="js-price") or td
-            val = _parse_price(el.get_text(strip=True))
-            if val and "ungraded" not in prices:
-                prices["ungraded"] = val
-                break
-
-    return prices
+    return best_url if best_score > 0 else None
 
 
 def fetch_card_prices(card_name: str, set_name: str, card_number: str) -> dict:
@@ -227,13 +229,21 @@ def fetch_card_prices(card_name: str, set_name: str, card_number: str) -> dict:
         print(f"  Saved debug page → {DEBUG_FILE}")
 
     if _is_list_page(soup):
-        prices = _extract_prices_list(soup, card_name, set_name)
-        if not prices:
-            result["error"] = f"Landed on list page; could not find card row. URL: {used_url}"
+        # Follow the best-matching link to the individual card detail page
+        detail_url = _find_best_list_link(soup, card_name, set_name)
+        if detail_url:
+            detail_resp = _get_page(detail_url)
+            if detail_resp and detail_resp.status_code == 200:
+                soup = BeautifulSoup(detail_resp.text, "html.parser")
+                result["source_url"] = detail_url
+                # Fall through to detail extraction below
+            else:
+                result["error"] = f"Found list link {detail_url} but it returned {detail_resp and detail_resp.status_code}"
+                return result
+        else:
+            result["error"] = f"Landed on list page and no matching card link found. URL: {used_url}"
             return result
-        # List page only has ungraded — flag it but continue
-        result["raw_price"] = prices.get("ungraded")
-        result["error"] = "List page — no PSA 9/10 prices available; use card number for detail page"
+
     else:
         prices = _extract_prices_detail(soup)
         result["raw_price"] = prices.get("ungraded")
