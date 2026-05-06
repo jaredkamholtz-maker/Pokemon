@@ -130,33 +130,64 @@ def fetch_population_playwright(card_name: str, set_name: str,
                 ctx = browser.new_context(
                     user_agent=USER_AGENT,
                     viewport={"width": 1280, "height": 900},
+                    # Mask automation signals
+                    extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
                 )
                 page = ctx.new_page()
+                # Spoof navigator.webdriver to avoid bot detection
+                page.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                )
 
-                # Step 1: load search page
-                page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+                # Capture JSON API responses — PSA's SPA calls its own backend
+                api_log: list[dict] = []
+
+                def on_response(resp):
+                    ct = resp.headers.get("content-type", "")
+                    if "json" in ct:
+                        try:
+                            body = resp.json()
+                            api_log.append({
+                                "url": resp.url,
+                                "status": resp.status,
+                                "preview": str(body)[:500],
+                            })
+                        except Exception:
+                            pass
+
+                page.on("response", on_response)
+
+                # Step 1: load search — use networkidle so JS fully executes
+                page.goto(search_url, wait_until="networkidle", timeout=45000)
                 try:
+                    # Wait for actual card result links to appear
                     page.wait_for_selector(
-                        "a[href*='/pop/pokemon'], table, .search-result",
-                        timeout=12000,
+                        "a[href*='/pop/pokemon-cards/']",
+                        timeout=20000,
                     )
                 except Exception:
                     pass
-                time.sleep(4)
+                # Extra settle time for late renders
+                time.sleep(6)
 
                 search_html = page.content()
                 _save_debug("psa_search.html", search_html)
 
-                # Step 2: find best-matching link
-                links = page.query_selector_all("a[href*='/pop/']")
+                # Save API calls so we can find the right endpoint
+                import json
+                _save_debug(
+                    "psa_api_calls.json",
+                    json.dumps(api_log, indent=2, default=str),
+                )
+
+                # Step 2: find best-matching pop link
+                links = page.query_selector_all("a[href*='/pop/pokemon-cards/']")
                 best_href = None
                 best_score = -1.0
                 for link in links:
                     try:
                         text = link.inner_text()
                         href = link.get_attribute("href") or ""
-                        if not re.search(r"/pop/pokemon", href, re.I):
-                            continue
                         score = _score_link(text, card_name, set_name, num)
                         if score > best_score:
                             best_score = score
@@ -171,15 +202,12 @@ def fetch_population_playwright(card_name: str, set_name: str,
                 pop_url = best_href if best_href.startswith("http") else f"{BASE_URL}{best_href}"
 
                 # Step 3: navigate to card pop page
-                page.goto(pop_url, wait_until="domcontentloaded", timeout=30000)
+                page.goto(pop_url, wait_until="networkidle", timeout=45000)
                 try:
-                    page.wait_for_selector(
-                        "table, [class*='grade'], [class*='pop'], tr",
-                        timeout=12000,
-                    )
+                    page.wait_for_selector("table, tr", timeout=15000)
                 except Exception:
                     pass
-                time.sleep(4)
+                time.sleep(5)
 
                 pop_html = page.content()
                 _save_debug("psa_pop_page.html", pop_html)
