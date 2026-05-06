@@ -1,19 +1,20 @@
 """
-Fetch PSA grade population data from PSA's public population report (psacard.com/pop).
+Fetch PSA grade population data from 130point.com.
 
-Strategy: direct URL navigation — no search or JSONP needed.
+130point.com aggregates PSA/BGS/CGC population data publicly without requiring
+authentication. PSA's own website (psacard.com) blocks all automated requests.
 
-PSA pop pages follow: /pop/pokemon-cards/{year}/{set-slug}/{card-slug}-{num}/{spec-id}/
-We navigate to the set listing page, find the matching card link by scoring on
-card name + number, then fetch the grade table from the card's pop report page.
-
-First-time setup:
-    pip install curl_cffi
+Strategy:
+  1. Search 130point.com for the card + set name.
+  2. Follow the best-matching result link to the card's grade breakdown page.
+  3. Parse the PSA grade distribution table (grades 1-10 + counts).
+  4. Save debug HTML to .tmp/debug_pop/ on first card.
 
 Writes results to .tmp/pokedata_population.csv (same path for pipeline compat).
 
 Usage:
     python execution/scrape_pokedata_population.py --watchlist data/watchlist.csv
+    python execution/scrape_pokedata_population.py --watchlist .tmp/discovered_cards.csv
 """
 
 import argparse
@@ -22,19 +23,13 @@ import time
 from pathlib import Path
 
 import pandas as pd
+import requests
 from bs4 import BeautifulSoup
 
-try:
-    from curl_cffi import requests
-    _IMPERSONATE = "chrome120"
-except ImportError:
-    import requests
-    _IMPERSONATE = None
-
 OUTPUT_FILE = Path(".tmp/pokedata_population.csv")
-DEBUG_DIR = Path(".tmp/debug_psa")
-BASE_URL = "https://www.psacard.com"
-RATE_DELAY = 3.0
+DEBUG_DIR = Path(".tmp/debug_pop")
+BASE_URL = "https://130point.com"
+RATE_DELAY = 2.0
 
 HEADERS = {
     "User-Agent": (
@@ -46,39 +41,11 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# PSA set slug + year for each set in the watchlist.
-# Format: "Watchlist set_name" → (year, "psa-url-slug")
-PSA_SET_MAP: dict[str, tuple[int, str]] = {
-    "Base Set":         (1999, "base-set"),
-    "Base Set 2":       (2000, "base-set-2"),
-    "Jungle":           (1999, "jungle"),
-    "Fossil":           (1999, "fossil"),
-    "Team Rocket":      (2000, "team-rocket"),
-    "Aquapolis":        (2003, "aquapolis"),
-    "Celebrations":     (2021, "celebrations"),
-    "Flashfire":        (2014, "flashfire"),
-    "Celestial Storm":  (2018, "celestial-storm"),
-    "Vivid Voltage":    (2020, "vivid-voltage"),
-    "Darkness Ablaze":  (2020, "darkness-ablaze"),
-    "Fusion Strike":    (2021, "fusion-strike"),
-    "Evolving Skies":   (2021, "evolving-skies"),
-    "151":              (2023, "scarlet-violet-151"),
-    "Obsidian Flames":  (2023, "obsidian-flames"),
-}
-
-
-def _make_session():
-    if _IMPERSONATE:
-        return requests.Session(impersonate=_IMPERSONATE)
-    s = requests.Session()
-    s.headers.update(HEADERS)
-    return s
-
 
 def _slugify(text: str) -> str:
     text = str(text).lower().strip()
-    text = re.sub(r"[^a-z0-9\s\-]", "", text)
-    text = re.sub(r"[\s\-]+", "-", text)
+    text = re.sub(r"[^a-z0-9\s]", "", text)
+    text = re.sub(r"\s+", "-", text)
     return text
 
 
@@ -90,19 +57,21 @@ def _save_debug(name: str, content: str) -> None:
         print(f"  Saved debug → {path}")
 
 
-def _score_link(text: str, href: str, card_name: str, num: str) -> float:
+def _score_link(text: str, href: str, card_name: str, set_name: str, num: str) -> float:
     combined = (text + " " + href).lower()
     score = sum(1.0 for w in card_name.lower().split() if len(w) > 2 and w in combined)
+    score += sum(0.3 for w in set_name.lower().split() if len(w) > 2 and w in combined)
     if num and num in combined:
-        score += 1.5  # card number is highly specific
+        score += 1.5
     return score
 
 
 def _parse_grade_table(html: str) -> dict[int, int]:
-    """Parse PSA grade counts from a pop report page."""
+    """Parse PSA grade counts. 130point shows a grade breakdown table."""
     soup = BeautifulSoup(html, "html.parser")
     grade_counts: dict[int, int] = {}
 
+    # Strategy 1: table rows where first cell is a grade number
     for row in soup.find_all("tr"):
         cells = row.find_all(["td", "th"])
         if not cells:
@@ -125,8 +94,8 @@ def _parse_grade_table(html: str) -> dict[int, int]:
     if grade_counts:
         return grade_counts
 
-    # Fallback: elements with grade-related class names
-    for el in soup.find_all(class_=re.compile(r"grade|pop|count", re.I)):
+    # Strategy 2: look for labeled grade elements
+    for el in soup.find_all(class_=re.compile(r"grade|pop|count|psa", re.I)):
         text = el.get_text(" ", strip=True)
         for m in re.finditer(r"\b(10|[1-9])\b[^\d]*?(\d[\d,]*)", text):
             grade = int(m.group(1))
@@ -140,39 +109,58 @@ def _parse_grade_table(html: str) -> dict[int, int]:
     return grade_counts
 
 
-def _find_card_on_set_page(session, set_url: str, card_name: str,
-                           num: str) -> str:
+def _search_130point(card_name: str, set_name: str, num: str) -> tuple[str, str]:
     """
-    Fetch a PSA set listing page and return the URL of the best-matching card.
-    PSA set pages list cards as links under /pop/pokemon-cards/{year}/{set}/{card}-{num}/
+    Search 130point.com and return (best_card_url, search_html).
+    Tries multiple URL patterns.
     """
-    resp = session.get(set_url, timeout=20)
-    print(f"  Set page status: {resp.status_code} ({set_url})")
-    _save_debug("psa_set_page.html", resp.text)
+    session = requests.Session()
+    session.headers.update(HEADERS)
 
-    if resp.status_code != 200:
-        return ""
+    # Try multiple search approaches
+    search_queries = [
+        f"{card_name} {set_name}",
+        card_name,
+    ]
+    if num:
+        search_queries.insert(0, f"{card_name} {num} {set_name}")
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    for query in search_queries:
+        try:
+            resp = session.get(
+                f"{BASE_URL}/",
+                params={"q": query},
+                timeout=15,
+            )
+        except Exception as e:
+            print(f"  Request failed: {e}")
+            continue
 
-    # Card links are one level deeper in the URL hierarchy
-    set_path = set_url.replace(BASE_URL, "").rstrip("/")
-    pattern = re.compile(rf"^{re.escape(set_path)}/[^/]+/?$")
+        if resp.status_code != 200:
+            print(f"  130point.com returned {resp.status_code}")
+            continue
 
-    best_href = ""
-    best_score = -1.0
+        _save_debug("pop_search.html", resp.text)
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-    for a in soup.find_all("a", href=pattern):
-        href = a.get("href", "")
-        text = a.get_text(" ", strip=True)
-        score = _score_link(text, href, card_name, num)
-        if score > best_score:
-            best_score = score
-            best_href = href
+        # Score all result links
+        best_href = ""
+        best_score = -1.0
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "")
+            if not any(kw in href.lower() for kw in ["/card", "/sets", "/sales", "pokemon"]):
+                continue
+            text = a.get_text(" ", strip=True)
+            score = _score_link(text, href, card_name, set_name, num)
+            if score > best_score:
+                best_score = score
+                best_href = href
 
-    if best_href and best_score > 0:
-        return best_href if best_href.startswith("http") else f"{BASE_URL}{best_href}"
-    return ""
+        if best_href and best_score > 0:
+            url = best_href if best_href.startswith("http") else f"{BASE_URL}{best_href}"
+            return url, resp.text
+
+    return "", ""
 
 
 def fetch_population(card_name: str, set_name: str, card_number: str) -> dict:
@@ -192,48 +180,25 @@ def fetch_population(card_name: str, set_name: str, card_number: str) -> dict:
     if card_number and str(card_number) != "nan":
         num = str(card_number).split("/")[0].strip()
 
-    set_info = PSA_SET_MAP.get(set_name)
-    if not set_info:
-        base["error"] = (
-            f"Set '{set_name}' not in PSA_SET_MAP. "
-            "Add it to execution/scrape_pokedata_population.py."
-        )
-        return base
-
-    year, set_slug = set_info
-    set_url = f"{BASE_URL}/pop/pokemon-cards/{year}/{set_slug}"
-
     try:
-        session = _make_session()
-
-        # Step 1: find the card on the set listing page
-        card_url = _find_card_on_set_page(session, set_url, card_name, num)
+        card_url, _ = _search_130point(card_name, set_name, num)
 
         if not card_url:
-            # The set page may list cards one level deeper (variant page).
-            # Try constructing URL directly: /pop/pokemon-cards/{year}/{set}/{card}-{num}/
-            card_slug = _slugify(card_name)
-            direct = f"{set_url}/{card_slug}-{num}" if num else f"{set_url}/{card_slug}"
-            print(f"  Trying direct URL: {direct}")
-            resp = session.get(direct, timeout=20)
-            if resp.status_code == 200 and "grade" in resp.text.lower():
-                card_url = direct
-                _save_debug("psa_pop_page.html", resp.text)
-                grade_counts = _parse_grade_table(resp.text)
-            else:
-                base["error"] = (
-                    f"No matching card found on PSA set page {set_url}. "
-                    f"Check {DEBUG_DIR}/psa_set_page.html"
-                )
-                return base
-        else:
-            # Step 2: fetch the card's pop report page
-            print(f"  Card URL: {card_url}")
-            pop_resp = session.get(card_url, timeout=20)
-            _save_debug("psa_pop_page.html", pop_resp.text)
-            grade_counts = _parse_grade_table(pop_resp.text)
+            base["error"] = (
+                f"No match on 130point.com for '{card_name} {set_name}'. "
+                f"Check {DEBUG_DIR}/pop_search.html"
+            )
+            return base
 
         base["source_url"] = card_url
+
+        # Fetch the card's grade breakdown page
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        pop_resp = session.get(card_url, timeout=15)
+        _save_debug("pop_card_page.html", pop_resp.text)
+
+        grade_counts = _parse_grade_table(pop_resp.text)
 
         if grade_counts:
             total = sum(grade_counts.values())
@@ -246,8 +211,8 @@ def fetch_population(card_name: str, set_name: str, card_number: str) -> dict:
                 base["gem_rate"] = round((psa9 + psa10) / total, 4)
         else:
             base["error"] = (
-                f"Pop page loaded but no grade counts parsed. "
-                f"Check {DEBUG_DIR}/psa_pop_page.html"
+                f"Card page loaded but no grade counts parsed. "
+                f"Check {DEBUG_DIR}/pop_card_page.html"
             )
 
     except Exception as e:
@@ -262,7 +227,7 @@ def run(watchlist_path: str) -> pd.DataFrame:
     total = len(watchlist)
 
     for i, row in watchlist.iterrows():
-        print(f"[{i+1}/{total}] Scraping population: {row['card_name']} ({row['set_name']})")
+        print(f"[{i+1}/{total}] Population: {row['card_name']} ({row['set_name']})")
         pop = fetch_population(
             card_name=row["card_name"],
             set_name=row["set_name"],
