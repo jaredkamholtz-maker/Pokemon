@@ -1,35 +1,35 @@
 """
-Fetch PSA grade population data from pokedata.io for each card in the watchlist.
+Fetch PSA grade population data from PSA's public population report (psacard.com/pop).
 
-Strategy (no headless browser):
-  1. GET /api/sets?tcg=Pokemon to find the set_id for each set.
-  2. GET /api/cards?set_id={id} (or similar) to find the card_id.
-  3. GET /api/psa?card_id={id} (or similar) to get grade population counts.
-  4. Log all probed endpoints + responses on first card to debug_pokedata_api.json
-     so that working endpoints can be identified if the guesses miss.
+pokedata.io's /api/population endpoint requires a logged-in session and returns
+500 errors without one. PSA's own pop report is the authoritative source and is
+publicly accessible without authentication.
 
-The /api/sets endpoint is confirmed working (captured during earlier Playwright run).
-Card and population endpoints are inferred from the URL pattern and probed systematically.
+Strategy:
+  1. GET psacard.com/pop/search?q={card_name}+{set_name} to find the card.
+  2. Score result links by name + set word matches; follow the best one.
+  3. Parse the grade table on the individual pop report page.
+  4. Save debug HTML on first card to .tmp/debug_psa/ for inspection.
 
-Writes results to .tmp/pokedata_population.csv
+Writes results to .tmp/pokedata_population.csv (same path for pipeline compat).
 
 Usage:
     python execution/scrape_pokedata_population.py --watchlist data/watchlist.csv
 """
 
 import argparse
-import json
 import re
 import time
 from pathlib import Path
 
 import pandas as pd
 import requests
+from bs4 import BeautifulSoup
 
 OUTPUT_FILE = Path(".tmp/pokedata_population.csv")
-DEBUG_FILE = Path(".tmp/debug_pokedata_api.json")
-BASE_URL = "https://www.pokedata.io"
-RATE_DELAY = 1.0
+DEBUG_DIR = Path(".tmp/debug_psa")
+BASE_URL = "https://www.psacard.com"
+RATE_DELAY = 2.0
 
 HEADERS = {
     "User-Agent": (
@@ -37,184 +37,101 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, */*",
-    "Referer": "https://www.pokedata.io/",
+    "Accept": "text/html,application/xhtml+xml,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Cache set list for the run so we only fetch it once
-_sets_cache: list[dict] | None = None
 
-
-def get_sets() -> list[dict]:
-    global _sets_cache
-    if _sets_cache is not None:
-        return _sets_cache
-    resp = requests.get(f"{BASE_URL}/api/sets?tcg=Pokemon", headers=HEADERS, timeout=15)
-    resp.raise_for_status()
-    _sets_cache = resp.json()
-    return _sets_cache
-
-
-def find_set_id(set_name: str) -> int | None:
-    sets = get_sets()
-    target = set_name.lower().strip()
-
-    # 1. Exact match
-    for s in sets:
-        if s.get("name", "").lower().strip() == target:
-            return s["id"]
-
-    # 2. Best partial match scored by length similarity.
-    # Using a ratio prevents "Base Set" from matching "Base Set 2"
-    # when the actual "Base Set" entry exists elsewhere in the list.
-    best_id = None
-    best_ratio = 0.0
-    for s in sets:
-        name = s.get("name", "").lower().strip()
-        if target in name or name in target:
-            ratio = min(len(target), len(name)) / max(len(target), len(name))
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best_id = s["id"]
-
-    return best_id
-
-
-def _api_get(url: str, probe_log: list) -> dict | list | None:
-    """GET a URL; log to probe_log (including 5xx bodies); return parsed JSON or None."""
+def _get(url: str, params: dict = None) -> requests.Response | None:
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        entry = {"url": url, "status": resp.status_code, "preview": ""}
-        if resp.status_code == 200:
-            data = resp.json()
-            entry["preview"] = json.dumps(data)[:400]
-            probe_log.append(entry)
-            return data
-        # Log 5xx body — often reveals correct parameter names
-        if resp.status_code >= 500:
-            entry["preview"] = resp.text[:300]
-        probe_log.append(entry)
-    except Exception as e:
-        probe_log.append({"url": url, "status": "error", "preview": str(e)})
-    return None
+        return requests.get(url, params=params, headers=HEADERS,
+                            timeout=15, allow_redirects=True)
+    except Exception:
+        return None
 
 
-def find_card_id(set_id: int, card_name: str, card_number: str,
-                 probe_log: list) -> tuple[int | None, str]:
+def _save_debug(name: str, content: str) -> None:
+    path = DEBUG_DIR / name
+    if not path.exists():
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        print(f"  Saved debug → {path}")
+
+
+def search_psa(card_name: str, set_name: str, card_number: str) -> str | None:
     """
-    Fetch all cards for a set from /api/cards?set_id={id} and filter locally.
-    The API ignores name/q query params — filtering must be done client-side.
-    Returns the card's internal `id` field.
+    Search PSA pop report and return URL of the best-matching card's pop page.
+    Returns None if no suitable result found.
     """
-    url = f"{BASE_URL}/api/cards?set_id={set_id}"
-    data = _api_get(url, probe_log)
-    if not data or not isinstance(data, list):
-        return None, ""
+    num = card_number.split("/")[0].strip() if card_number and card_number != "nan" else ""
+    query = f"{card_name} {set_name}" + (f" {num}" if num else "")
 
-    card_name_lower = card_name.lower().strip()
-    target_num = card_number.split("/")[0].strip() if card_number and card_number != "nan" else ""
+    resp = _get(f"{BASE_URL}/pop/search", params={"q": query})
+    if not resp or resp.status_code != 200:
+        return None
 
-    best_id = None
-    best_tcgplayer_id = ""
-    best_score = -1
-    for card in data:
-        if not isinstance(card, dict):
-            continue
-        name = card.get("name", "").lower().strip()
-        num = str(card.get("num") or card.get("number") or "").strip()
+    _save_debug("psa_search.html", resp.text)
 
-        if name == card_name_lower:
-            score = 2
-        elif card_name_lower in name or name in card_name_lower:
-            score = 1
-        else:
-            continue
+    soup = BeautifulSoup(resp.text, "html.parser")
+    card_words = [w for w in card_name.lower().split() if len(w) > 2]
+    set_words = [w for w in set_name.lower().split() if len(w) > 2]
 
-        if target_num and num == target_num:
-            score += 1
+    best_url = None
+    best_score = -1.0
+
+    for link in soup.find_all("a", href=re.compile(r"/pop/pokemon", re.I)):
+        text = link.get_text(" ", strip=True).lower()
+        score = sum(w in text for w in card_words)
+        score += sum(w in text for w in set_words) * 0.5
+        if num and num in text:
+            score += 0.5
 
         if score > best_score:
             best_score = score
-            best_id = card.get("id") or card.get("card_id")
-            best_tcgplayer_id = str(card.get("tcgplayer_id") or "")
+            href = link["href"]
+            best_url = href if href.startswith("http") else f"{BASE_URL}{href}"
 
-    return best_id, best_tcgplayer_id
-
-
-def fetch_population_by_card_id(card_id: int, tcgplayer_id: str,
-                                probe_log: list) -> dict[int, int]:
-    """Try known API patterns to get PSA grade counts for a card_id."""
-    candidates = [
-        # /api/population returned 500 (endpoint exists) — try all param name variants
-        f"{BASE_URL}/api/population?card_id={card_id}",
-        f"{BASE_URL}/api/population?id={card_id}",
-        f"{BASE_URL}/api/population?cardId={card_id}",
-        f"{BASE_URL}/api/population/{card_id}",
-        # Try with tcgplayer_id as identifier
-        f"{BASE_URL}/api/population?tcgplayer_id={tcgplayer_id}",
-        # Other likely patterns
-        f"{BASE_URL}/api/psa?card_id={card_id}",
-        f"{BASE_URL}/api/psa?id={card_id}",
-        f"{BASE_URL}/api/grades?card_id={card_id}",
-        f"{BASE_URL}/api/grades?id={card_id}",
-        f"{BASE_URL}/api/psa_grades?card_id={card_id}",
-        f"{BASE_URL}/api/grade_distribution?card_id={card_id}",
-        f"{BASE_URL}/api/cards/{card_id}/population",
-        f"{BASE_URL}/api/cards/{card_id}/psa",
-        f"{BASE_URL}/api/cards/{card_id}/grades",
-    ]
-
-    for url in candidates:
-        data = _api_get(url, probe_log)
-        if data is None:
-            continue
-        grade_counts = _extract_grade_counts(data)
-        if grade_counts:
-            return grade_counts
-
-    return {}
+    return best_url if best_score > 0 else None
 
 
-def _extract_grade_counts(data) -> dict[int, int]:
-    """Parse grade counts from various JSON structures."""
-    if not data:
+def fetch_pop_counts(url: str) -> dict[int, int]:
+    """Fetch a PSA pop card page and extract grade 1-10 counts from the table."""
+    resp = _get(url)
+    if not resp or resp.status_code != 200:
         return {}
 
-    # Pattern A: {"1": 50, "2": 30, ..., "10": 200}
-    if isinstance(data, dict):
-        numeric = {k: v for k, v in data.items()
-                   if re.fullmatch(r"(10|[1-9])", str(k)) and isinstance(v, (int, float))}
-        if len(numeric) >= 3:
-            return {int(k): int(v) for k, v in numeric.items()}
+    _save_debug("psa_pop_page.html", resp.text)
 
-    # Pattern B: [{grade: X, count: Y}, ...]
-    records = data if isinstance(data, list) else (
-        data.get("results") or data.get("grades") or data.get("population") or []
-    )
-    if isinstance(records, list):
-        counts: dict[int, int] = {}
-        for item in records:
-            if not isinstance(item, dict):
+    soup = BeautifulSoup(resp.text, "html.parser")
+    grade_counts: dict[int, int] = {}
+
+    for row in soup.find_all("tr"):
+        cells = row.find_all(["td", "th"])
+        if not cells:
+            continue
+
+        label = cells[0].get_text(strip=True)
+        m = re.match(r"(?:PSA\s*|Grade\s*)?(\d{1,2})$", label.strip(), re.I)
+        if not m:
+            continue
+
+        grade = int(m.group(1))
+        if not (1 <= grade <= 10):
+            continue
+
+        for cell in cells[1:]:
+            count_text = cell.get_text(strip=True).replace(",", "")
+            try:
+                count = int(count_text)
+                grade_counts[grade] = grade_counts.get(grade, 0) + count
+                break
+            except ValueError:
                 continue
-            grade = (item.get("grade") or item.get("psa_grade") or
-                     item.get("psaGrade") or item.get("Grade"))
-            count = (item.get("count") or item.get("pop") or item.get("population") or
-                     item.get("pop_count") or item.get("total"))
-            if grade is not None and count is not None:
-                try:
-                    g = int(float(str(grade)))
-                    if 1 <= g <= 10:
-                        counts[g] = int(count)
-                except (ValueError, TypeError):
-                    pass
-        if len(counts) >= 3:
-            return counts
 
-    return {}
+    return grade_counts
 
 
-def fetch_population(card_name: str, set_name: str, card_number: str,
-                     save_debug: bool = False) -> dict:
+def fetch_population(card_name: str, set_name: str, card_number: str) -> dict:
     base = {
         "card_name": card_name,
         "set_name": set_name,
@@ -223,30 +140,22 @@ def fetch_population(card_name: str, set_name: str, card_number: str,
         "psa10_count": None,
         "psa9_count": None,
         "gem_rate": None,
-        "source_url": f"{BASE_URL}/card/{set_name.lower().replace(' ', '-')}/{card_name.lower().replace(' ', '-')}",
+        "source_url": None,
         "error": None,
     }
 
-    probe_log: list = []
-
     try:
-        set_id = find_set_id(set_name)
-        if set_id is None:
-            base["error"] = f"Set '{set_name}' not found in pokedata.io /api/sets"
+        pop_url = search_psa(card_name, set_name, card_number)
+
+        if not pop_url:
+            base["error"] = (
+                f"Not found in PSA pop search for '{card_name} {set_name}'. "
+                f"Check {DEBUG_DIR}/psa_search.html for what PSA returned."
+            )
             return base
 
-        card_id, tcgplayer_id = find_card_id(set_id, card_name, card_number, probe_log)
-
-        grade_counts: dict[int, int] = {}
-        if card_id:
-            grade_counts = fetch_population_by_card_id(card_id, tcgplayer_id, probe_log)
-        else:
-            base["error"] = f"Card '{card_name}' not found via set_id={set_id} API endpoints"
-
-        if save_debug:
-            DEBUG_FILE.parent.mkdir(parents=True, exist_ok=True)
-            DEBUG_FILE.write_text(json.dumps(probe_log, indent=2))
-            print(f"  Saved API probe log → {DEBUG_FILE}")
+        base["source_url"] = pop_url
+        grade_counts = fetch_pop_counts(pop_url)
 
         if grade_counts:
             total = sum(grade_counts.values())
@@ -257,11 +166,10 @@ def fetch_population(card_name: str, set_name: str, card_number: str,
             base["psa9_count"] = psa9
             if total > 0:
                 base["gem_rate"] = round((psa9 + psa10) / total, 4)
-            base["error"] = None
-        elif not base["error"]:
+        else:
             base["error"] = (
-                f"card_id={card_id} found but no population data returned. "
-                f"Check {DEBUG_FILE} for probed endpoints."
+                f"Pop page loaded but no grade counts parsed. URL: {pop_url}. "
+                f"Check {DEBUG_DIR}/psa_pop_page.html"
             )
 
     except Exception as e:
@@ -275,21 +183,12 @@ def run(watchlist_path: str) -> pd.DataFrame:
     rows = []
     total = len(watchlist)
 
-    print("Loading pokedata.io set list...")
-    try:
-        sets = get_sets()
-        print(f"  {len(sets)} sets loaded.")
-    except Exception as e:
-        print(f"  WARNING: Could not load set list: {e}")
-
     for i, row in watchlist.iterrows():
         print(f"[{i+1}/{total}] Scraping population: {row['card_name']} ({row['set_name']})")
-        save_debug = not DEBUG_FILE.exists()
         pop = fetch_population(
             card_name=row["card_name"],
             set_name=row["set_name"],
             card_number=str(row.get("card_number", "")),
-            save_debug=save_debug,
         )
         rows.append(pop)
         time.sleep(RATE_DELAY)
