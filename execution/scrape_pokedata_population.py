@@ -81,7 +81,7 @@ def find_set_id(set_name: str) -> int | None:
 
 
 def _api_get(url: str, probe_log: list) -> dict | list | None:
-    """GET a URL; log to probe_log; return parsed JSON or None."""
+    """GET a URL; log to probe_log (including 5xx bodies); return parsed JSON or None."""
     try:
         resp = requests.get(url, headers=HEADERS, timeout=10)
         entry = {"url": url, "status": resp.status_code, "preview": ""}
@@ -90,13 +90,17 @@ def _api_get(url: str, probe_log: list) -> dict | list | None:
             entry["preview"] = json.dumps(data)[:400]
             probe_log.append(entry)
             return data
+        # Log 5xx body — often reveals correct parameter names
+        if resp.status_code >= 500:
+            entry["preview"] = resp.text[:300]
         probe_log.append(entry)
     except Exception as e:
         probe_log.append({"url": url, "status": "error", "preview": str(e)})
     return None
 
 
-def find_card_id(set_id: int, card_name: str, card_number: str, probe_log: list) -> int | None:
+def find_card_id(set_id: int, card_name: str, card_number: str,
+                 probe_log: list) -> tuple[int | None, str]:
     """
     Fetch all cards for a set from /api/cards?set_id={id} and filter locally.
     The API ignores name/q query params — filtering must be done client-side.
@@ -105,13 +109,13 @@ def find_card_id(set_id: int, card_name: str, card_number: str, probe_log: list)
     url = f"{BASE_URL}/api/cards?set_id={set_id}"
     data = _api_get(url, probe_log)
     if not data or not isinstance(data, list):
-        return None
+        return None, ""
 
     card_name_lower = card_name.lower().strip()
     target_num = card_number.split("/")[0].strip() if card_number and card_number != "nan" else ""
 
-    # Score each card: name match + optional number match
     best_id = None
+    best_tcgplayer_id = ""
     best_score = -1
     for card in data:
         if not isinstance(card, dict):
@@ -126,32 +130,38 @@ def find_card_id(set_id: int, card_name: str, card_number: str, probe_log: list)
         else:
             continue
 
-        # Bonus for matching card number
         if target_num and num == target_num:
             score += 1
 
         if score > best_score:
             best_score = score
             best_id = card.get("id") or card.get("card_id")
+            best_tcgplayer_id = str(card.get("tcgplayer_id") or "")
 
-    return best_id
+    return best_id, best_tcgplayer_id
 
 
-def fetch_population_by_card_id(card_id: int, probe_log: list) -> dict[int, int]:
+def fetch_population_by_card_id(card_id: int, tcgplayer_id: str,
+                                probe_log: list) -> dict[int, int]:
     """Try known API patterns to get PSA grade counts for a card_id."""
     candidates = [
-        # stat_url observed in card data — most likely candidate
-        f"{BASE_URL}/api/cards/stats?card_id={card_id}",
-        f"{BASE_URL}/api/cards/stats?id={card_id}",
+        # /api/population returned 500 (endpoint exists) — try all param name variants
+        f"{BASE_URL}/api/population?card_id={card_id}",
+        f"{BASE_URL}/api/population?id={card_id}",
+        f"{BASE_URL}/api/population?cardId={card_id}",
+        f"{BASE_URL}/api/population/{card_id}",
+        # Try with tcgplayer_id as identifier
+        f"{BASE_URL}/api/population?tcgplayer_id={tcgplayer_id}",
         # Other likely patterns
         f"{BASE_URL}/api/psa?card_id={card_id}",
-        f"{BASE_URL}/api/population?card_id={card_id}",
+        f"{BASE_URL}/api/psa?id={card_id}",
         f"{BASE_URL}/api/grades?card_id={card_id}",
-        f"{BASE_URL}/api/cards/{card_id}/stats",
-        f"{BASE_URL}/api/cards/{card_id}/psa",
+        f"{BASE_URL}/api/grades?id={card_id}",
+        f"{BASE_URL}/api/psa_grades?card_id={card_id}",
+        f"{BASE_URL}/api/grade_distribution?card_id={card_id}",
         f"{BASE_URL}/api/cards/{card_id}/population",
+        f"{BASE_URL}/api/cards/{card_id}/psa",
         f"{BASE_URL}/api/cards/{card_id}/grades",
-        f"{BASE_URL}/api/psa/{card_id}",
     ]
 
     for url in candidates:
@@ -225,11 +235,11 @@ def fetch_population(card_name: str, set_name: str, card_number: str,
             base["error"] = f"Set '{set_name}' not found in pokedata.io /api/sets"
             return base
 
-        card_id = find_card_id(set_id, card_name, card_number, probe_log)
+        card_id, tcgplayer_id = find_card_id(set_id, card_name, card_number, probe_log)
 
         grade_counts: dict[int, int] = {}
         if card_id:
-            grade_counts = fetch_population_by_card_id(card_id, probe_log)
+            grade_counts = fetch_population_by_card_id(card_id, tcgplayer_id, probe_log)
         else:
             base["error"] = f"Card '{card_name}' not found via set_id={set_id} API endpoints"
 
