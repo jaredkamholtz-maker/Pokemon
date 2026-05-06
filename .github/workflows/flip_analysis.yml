@@ -4,7 +4,22 @@ on:
   schedule:
     # 8am ET Monday and Friday (13:00 UTC)
     - cron: "0 13 * * 1,5"
-  workflow_dispatch:  # also allows manual trigger from GitHub Actions tab
+  workflow_dispatch:
+    inputs:
+      era:
+        description: "Limit scan to one era (leave blank for full run)"
+        required: false
+        default: ""
+        type: choice
+        options:
+          - ""
+          - mega-evolution
+          - sword-shield
+          - scarlet-violet
+      sets:
+        description: "Comma-separated set names (overrides era, leave blank to use era/full)"
+        required: false
+        default: ""
 
 jobs:
   analyze:
@@ -37,7 +52,14 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-        run: python execution/run_analysis.py
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.sets }}" ]; then
+            ARGS="--sets '${{ github.event.inputs.sets }}'"
+          elif [ -n "${{ github.event.inputs.era }}" ]; then
+            ARGS="--era ${{ github.event.inputs.era }}"
+          fi
+          python execution/run_analysis.py $ARGS
 
       - name: Upload results
         if: always()
