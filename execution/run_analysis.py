@@ -158,7 +158,7 @@ def run(watchlist_path: str, skip_sheets: bool = False, skip_email: bool = False
     print(f"{'='*60}\n")
 
     # Step 1: Prices
-    print("[1/4] Fetching TCGPlayer prices...")
+    print("[1/4] Fetching prices from PriceCharting...")
     prices_df = prices_mod.run(watchlist_path)
 
     # Step 2: Population
