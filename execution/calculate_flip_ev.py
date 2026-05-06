@@ -163,6 +163,10 @@ def run(grading_fee: float = None, selling_fee_rate: float = None, min_roi: floa
     # Flag low-data cards
     df["low_data"] = df["total_graded"].fillna(0) < 50
 
+    # Ensure roi column always exists even if all cards errored
+    if "roi" not in df.columns:
+        df["roi"] = pd.NA
+
     # Sort by ROI descending
     df_sorted = df.sort_values("roi", ascending=False, na_position="last")
 

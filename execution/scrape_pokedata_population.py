@@ -1,12 +1,12 @@
 """
 Scrape PSA grade population data from pokedata.io for each card in the watchlist.
 
-pokedata.io shows how many copies of each card have been submitted to PSA and
-what grade they received. This script extracts:
-  - total_graded: all submissions
-  - psa10_count: grade 10 copies
-  - psa9_count:  grade 9 copies
-  - gem_rate:    (psa9 + psa10) / total
+pokedata.io blocks plain HTTP requests, so this script uses Playwright (headless
+Chromium) to render the page like a real browser before parsing the HTML.
+
+First-time setup (run once):
+    pip install playwright
+    playwright install chromium
 
 Writes results to .tmp/pokedata_population.csv
 
@@ -20,108 +20,106 @@ import time
 from pathlib import Path
 
 import pandas as pd
-import requests
-from bs4 import BeautifulSoup
 
 OUTPUT_FILE = Path(".tmp/pokedata_population.csv")
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
 BASE_URL = "https://www.pokedata.io"
-SEARCH_URL = f"{BASE_URL}/search"
-RATE_DELAY = 2.0  # be respectful; pokedata.io is a small site
+RATE_DELAY = 3.0  # seconds between page loads
 MAX_RETRIES = 3
 
 
-def _get_with_retry(url: str, params: dict = None) -> requests.Response:
-    """GET with exponential backoff on 429 / 5xx."""
-    delay = 5.0
+def slugify(text: str) -> str:
+    """Convert card/set name to a URL-safe slug matching pokedata.io conventions."""
+    text = text.lower()
+    # Replace é/è etc with e
+    text = text.encode("ascii", "ignore").decode()
+    # Remove anything that's not alphanumeric, space, or hyphen
+    text = re.sub(r"[^a-z0-9\s\-]", "", text)
+    # Collapse spaces/hyphens to single hyphen
+    text = re.sub(r"[\s\-]+", "-", text.strip())
+    return text
+
+
+def build_card_url(card_name: str, set_name: str) -> str:
+    """Construct the pokedata.io card page URL from name + set."""
+    return f"{BASE_URL}/card/{slugify(set_name)}/{slugify(card_name)}"
+
+
+def fetch_page_html(url: str) -> str | None:
+    """Use Playwright headless Chromium to fetch a fully-rendered page."""
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        raise ImportError(
+            "Playwright not installed. Run:\n"
+            "  pip install playwright\n"
+            "  playwright install chromium"
+        )
+
     for attempt in range(MAX_RETRIES):
-        resp = requests.get(url, headers=HEADERS, params=params, timeout=20)
-        if resp.status_code == 429 or resp.status_code >= 500:
-            print(f"  Rate limited / server error ({resp.status_code}), sleeping {delay}s...")
-            time.sleep(delay)
-            delay *= 2
-            continue
-        resp.raise_for_status()
-        return resp
-    raise RuntimeError(f"Failed after {MAX_RETRIES} retries: {url}")
-
-
-def search_card(card_name: str, set_name: str) -> str | None:
-    """
-    Search pokedata.io and return the URL of the best matching card page.
-    Returns None if no match found.
-    """
-    query = f"{card_name} {set_name}"
-    resp = _get_with_retry(SEARCH_URL, params={"q": query})
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    # pokedata.io search returns a list of cards; find the first matching link
-    # Look for anchor tags that point to card detail pages (/cards/ or /pokemon/)
-    card_link_patterns = ["/cards/", "/pokemon/", "/card/"]
-    for pattern in card_link_patterns:
-        links = soup.find_all("a", href=re.compile(re.escape(pattern)))
-        if links:
-            href = links[0].get("href", "")
-            return href if href.startswith("http") else BASE_URL + href
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True)
+                ctx = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1280, "height": 800},
+                )
+                page = ctx.new_page()
+                page.goto(url, wait_until="networkidle", timeout=30000)
+                html = page.content()
+                browser.close()
+                return html
+        except PWTimeout:
+            print(f"  Timeout on attempt {attempt + 1}/{MAX_RETRIES}: {url}")
+            time.sleep(5 * (attempt + 1))
+        except Exception as e:
+            print(f"  Error on attempt {attempt + 1}/{MAX_RETRIES}: {e}")
+            time.sleep(5 * (attempt + 1))
 
     return None
 
 
-def parse_population_page(url: str) -> dict:
+def parse_population_html(html: str, source_url: str) -> dict:
     """
     Parse a pokedata.io card page and extract PSA grade distribution.
-    Returns dict: total_graded, psa10_count, psa9_count, source_url
+    Tries multiple strategies since the page layout may vary.
     """
-    resp = _get_with_retry(url)
-    soup = BeautifulSoup(resp.text, "html.parser")
-    text = soup.get_text(separator=" ")
+    from bs4 import BeautifulSoup
 
+    soup = BeautifulSoup(html, "lxml")
     grade_counts: dict[int, int] = {}
 
-    # Strategy 1: look for a population table with grade columns
-    tables = soup.find_all("table")
-    for table in tables:
-        rows = table.find_all("tr")
-        for row in rows:
-            cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+    # Strategy 1: look for table rows with grade numbers
+    for table in soup.find_all("table"):
+        for row in table.find_all("tr"):
+            cells = [td.get_text(strip=True).replace(",", "") for td in row.find_all(["td", "th"])]
             for i, cell in enumerate(cells):
-                # Match cells that are a grade number (1-10)
-                if re.fullmatch(r"(10|[1-9])", cell):
-                    # The count is usually in the next cell
-                    if i + 1 < len(cells):
-                        count_text = cells[i + 1].replace(",", "")
-                        if re.fullmatch(r"\d+", count_text):
-                            grade_counts[int(cell)] = int(count_text)
+                if re.fullmatch(r"(10|[1-9])", cell) and i + 1 < len(cells):
+                    count_str = cells[i + 1]
+                    if re.fullmatch(r"\d+", count_str):
+                        grade_counts[int(cell)] = int(count_str)
 
-    # Strategy 2: parse inline "Grade X: N" patterns from page text if table parse failed
+    # Strategy 2: scan all text for "PSA 10: N" or "Grade 10 N" patterns
     if not grade_counts:
-        for match in re.finditer(r"(?:Grade\s+|PSA\s+)(\d{1,2})[:\s]+(\d[\d,]*)", text, re.I):
-            grade = int(match.group(1))
-            count = int(match.group(2).replace(",", ""))
-            if 1 <= grade <= 10:
+        text = soup.get_text(separator=" ")
+        for m in re.finditer(
+            r"(?:PSA\s+|Grade\s+)(10|[1-9])\D{0,5}?([\d,]+)", text, re.I
+        ):
+            grade = int(m.group(1))
+            count = int(m.group(2).replace(",", ""))
+            if count < 10_000_000:  # sanity cap
                 grade_counts[grade] = grade_counts.get(grade, 0) + count
 
-    # Strategy 3: look for data-* attributes or JSON-LD embedded data
+    # Strategy 3: look for elements with data attributes or aria labels
     if not grade_counts:
-        scripts = soup.find_all("script", type="application/json")
-        for script in scripts:
-            try:
-                import json
-                data = json.loads(script.string or "")
-                # Try to find grade distribution in any nested structure
-                data_str = json.dumps(data)
-                for match in re.finditer(r'"grade"\s*:\s*(\d+).*?"count"\s*:\s*(\d+)', data_str):
-                    grade_counts[int(match.group(1))] = int(match.group(2))
-            except Exception:
-                pass
+        for el in soup.find_all(attrs={"data-grade": True}):
+            grade = int(el.get("data-grade", 0))
+            count_text = el.get_text(strip=True).replace(",", "")
+            if re.fullmatch(r"\d+", count_text) and 1 <= grade <= 10:
+                grade_counts[grade] = int(count_text)
 
     total_graded = sum(grade_counts.values())
     psa10_count = grade_counts.get(10, 0)
@@ -131,13 +129,13 @@ def parse_population_page(url: str) -> dict:
         "total_graded": total_graded,
         "psa10_count": psa10_count,
         "psa9_count": psa9_count,
-        "source_url": url,
+        "source_url": source_url,
         "parse_success": total_graded > 0,
     }
 
 
 def fetch_population(card_name: str, set_name: str, card_number: str) -> dict:
-    """Full pipeline for a single card: search → parse → return population dict."""
+    """Full pipeline for a single card: build URL → render → parse → return."""
     base = {
         "card_name": card_name,
         "set_name": set_name,
@@ -150,22 +148,26 @@ def fetch_population(card_name: str, set_name: str, card_number: str) -> dict:
         "error": None,
     }
 
+    url = build_card_url(card_name, set_name)
+    base["source_url"] = url
+
     try:
-        card_url = search_card(card_name, set_name)
-        if not card_url:
-            base["error"] = "Card not found on pokedata.io"
+        html = fetch_page_html(url)
+        if not html:
+            base["error"] = f"Failed to load page after {MAX_RETRIES} retries"
             return base
 
-        pop = parse_population_page(card_url)
+        pop = parse_population_html(html, url)
         base.update(pop)
 
         if pop["total_graded"] and pop["total_graded"] > 0:
             gem_count = pop["psa10_count"] + pop["psa9_count"]
             base["gem_rate"] = round(gem_count / pop["total_graded"], 4)
+        elif not pop["parse_success"]:
+            base["error"] = "Page loaded but population data could not be parsed (layout may have changed)"
 
-        if not pop["parse_success"]:
-            base["error"] = "Page found but population data could not be parsed"
-
+    except ImportError as e:
+        base["error"] = str(e)
     except Exception as e:
         base["error"] = str(e)
 
@@ -185,7 +187,7 @@ def run(watchlist_path: str) -> pd.DataFrame:
             card_number=str(row.get("card_number", "")),
         )
         rows.append(pop)
-        time.sleep(RATE_DELAY)  # polite crawling between cards
+        time.sleep(RATE_DELAY)
 
     df = pd.DataFrame(rows)
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
