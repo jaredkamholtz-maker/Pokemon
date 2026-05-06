@@ -32,7 +32,8 @@ HEADERS = {
 # Explicit aliases for sets whose names differ between our target_sets.csv
 # and PokeData.io's catalog. Add entries here when [SKIP] is logged.
 ALIASES: dict[str, list[str]] = {
-    "151":        ["Scarlet & Violet 151", "Pokemon 151", "SV 151", "151"],
+    "151":        ["Scarlet & Violet 151", "Pokemon 151", "SV 151", "151",
+                   "Pokémon Card 151", "SV3.5", "sv3.5"],
     "Base Set 2": ["Base Set 2", "Base Set Two"],
 }
 
@@ -103,7 +104,6 @@ def run(target_sets_path: str = "data/target_sets.csv",
     target_df = pd.read_csv(target_sets_path)
 
     if sets:
-        # Exact set names take priority
         target_df = target_df[target_df["set_name"].isin(sets)]
         if target_df.empty:
             raise ValueError(f"None of the requested sets found in {target_sets_path}: {sets}")
@@ -125,7 +125,11 @@ def run(target_sets_path: str = "data/target_sets.csv",
     for set_name in set_names:
         set_id = find_set_id(set_name, all_sets)
         if not set_id:
-            print(f"  [SKIP] '{set_name}' not found in PokeData.io catalog")
+            # Show closest matches to help diagnose alias issues
+            close = [s.get("name") for s in all_sets
+                     if set_name.lower()[:4] in s.get("name", "").lower()][:5]
+            hint = f" — closest: {close}" if close else ""
+            print(f"  [SKIP] '{set_name}' not found in PokeData.io catalog{hint}")
             continue
 
         print(f"  Fetching {set_name} (set_id={set_id})...", end=" ", flush=True)
