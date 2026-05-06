@@ -119,7 +119,10 @@ def apply_filters(df: pd.DataFrame, args) -> pd.DataFrame:
 
     # Must have meaningful spread: PSA 10 premium > 2× grading fee
     grading_fee = args.grading_fee if args.grading_fee else load_env_float("GRADING_FEE", 25.0)
-    mask &= df["psa10_premium"].fillna(0) > grading_fee * 2
+    if "psa10_premium" in df.columns:
+        mask &= df["psa10_premium"].fillna(0) > grading_fee * 2
+    else:
+        mask &= False  # no spread data at all, nothing qualifies
 
     return df[mask].copy()
 

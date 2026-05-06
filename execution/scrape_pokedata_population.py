@@ -82,10 +82,14 @@ def fetch_page_html(url: str) -> str | None:
     return None
 
 
+DEBUG_HTML_FILE = Path(".tmp/debug_pokedata_page.html")
+
+
 def parse_population_html(html: str, source_url: str) -> dict:
     """
     Parse a pokedata.io card page and extract PSA grade distribution.
     Tries multiple strategies since the page layout may vary.
+    Saves raw HTML to .tmp/debug_pokedata_page.html on first parse failure for inspection.
     """
     from bs4 import BeautifulSoup
 
@@ -124,13 +128,20 @@ def parse_population_html(html: str, source_url: str) -> dict:
     total_graded = sum(grade_counts.values())
     psa10_count = grade_counts.get(10, 0)
     psa9_count = grade_counts.get(9, 0)
+    parse_success = total_graded > 0
+
+    # Save raw HTML on first failure so the parser can be debugged
+    if not parse_success and not DEBUG_HTML_FILE.exists():
+        DEBUG_HTML_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DEBUG_HTML_FILE.write_text(html, encoding="utf-8")
+        print(f"  Saved debug HTML → {DEBUG_HTML_FILE}")
 
     return {
         "total_graded": total_graded,
         "psa10_count": psa10_count,
         "psa9_count": psa9_count,
         "source_url": source_url,
-        "parse_success": total_graded > 0,
+        "parse_success": parse_success,
     }
 
 
