@@ -8,6 +8,8 @@ This replaces the static watchlist for broad market scanning.
 
 Usage:
     python execution/discover_cards.py
+    python execution/discover_cards.py --era vintage
+    python execution/discover_cards.py --sets "151,Evolving Skies,Obsidian Flames"
     python execution/discover_cards.py --target-sets data/target_sets.csv
 """
 
@@ -95,8 +97,24 @@ def get_cards_for_set(set_id: int) -> list[dict]:
 
 
 def run(target_sets_path: str = "data/target_sets.csv",
-        output_path: str = str(OUTPUT_FILE)) -> pd.DataFrame:
+        output_path: str = str(OUTPUT_FILE),
+        era: str | None = None,
+        sets: list[str] | None = None) -> pd.DataFrame:
     target_df = pd.read_csv(target_sets_path)
+
+    if sets:
+        # Exact set names take priority
+        target_df = target_df[target_df["set_name"].isin(sets)]
+        if target_df.empty:
+            raise ValueError(f"None of the requested sets found in {target_sets_path}: {sets}")
+    elif era:
+        if "era" not in target_df.columns:
+            raise ValueError(f"'era' column missing from {target_sets_path}")
+        target_df = target_df[target_df["era"] == era]
+        if target_df.empty:
+            available = target_df["era"].unique().tolist() if "era" in target_df.columns else []
+            raise ValueError(f"No sets found for era '{era}'. Available: {available}")
+
     set_names = target_df["set_name"].tolist()
 
     print(f"Fetching PokeData.io set catalog...")
@@ -135,5 +153,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Discover all cards in target sets")
     parser.add_argument("--target-sets", default="data/target_sets.csv")
     parser.add_argument("--output", default=str(OUTPUT_FILE))
+    parser.add_argument("--era", default=None,
+                        help="Filter by era (vintage, sword-shield, scarlet-violet)")
+    parser.add_argument("--sets", default=None,
+                        help="Comma-separated set names, e.g. '151,Evolving Skies'")
     args = parser.parse_args()
-    run(target_sets_path=args.target_sets, output_path=args.output)
+    sets_list = [s.strip() for s in args.sets.split(",")] if args.sets else None
+    run(target_sets_path=args.target_sets, output_path=args.output,
+        era=args.era, sets=sets_list)

@@ -1,24 +1,24 @@
-set_name,notes
-Base Set,1999 vintage — iconic chase cards
-Base Set 2,2000 reprint
-Jungle,1999 vintage
-Fossil,1999 vintage
-Team Rocket,2000 vintage
-Neo Genesis,2000 — Lugia / Ho-Oh era
-Aquapolis,2003 era e-Series
-Celebrations,2021 — 25th anniversary reprints
-Darkness Ablaze,2020 — Charizard VMAX
-Vivid Voltage,2020 — Pikachu VMAX rainbow
-Fusion Strike,2021 — Mew VMAX rainbow
-Brilliant Stars,2022 — Arceus VSTAR hits
-Evolving Skies,2021 — Umbreon / Rayquaza alt arts
-Lost Origin,2022 — Giratina alt arts
-Silver Tempest,2022
-Crown Zenith,2023 — GX Ultra Shiny reprints
-Paldea Evolved,2023
-151,2023 — Scarlet & Violet 151 SIRs
-Paradox Rift,2023 — Iron Valiant / Roaring Moon alt arts
-Obsidian Flames,2023 — Charizard ex hyper rare
-Temporal Forces,2024
-Twilight Masquerade,2024 — Bloodmoon Ursaluna alt art
-Surging Sparks,2024 — Pikachu ex alt arts
+set_name,era,notes
+Base Set,vintage,1999 vintage — iconic chase cards
+Base Set 2,vintage,2000 reprint
+Jungle,vintage,1999 vintage
+Fossil,vintage,1999 vintage
+Team Rocket,vintage,2000 vintage
+Neo Genesis,vintage,2000 — Lugia / Ho-Oh era
+Aquapolis,vintage,2003 era e-Series
+Celebrations,sword-shield,2021 — 25th anniversary reprints
+Darkness Ablaze,sword-shield,2020 — Charizard VMAX
+Vivid Voltage,sword-shield,2020 — Pikachu VMAX rainbow
+Fusion Strike,sword-shield,2021 — Mew VMAX rainbow
+Brilliant Stars,sword-shield,2022 — Arceus VSTAR hits
+Evolving Skies,sword-shield,2021 — Umbreon / Rayquaza alt arts
+Lost Origin,sword-shield,2022 — Giratina alt arts
+Silver Tempest,sword-shield,2022
+Crown Zenith,sword-shield,2023 — GX Ultra Shiny reprints
+Paldea Evolved,scarlet-violet,2023
+151,scarlet-violet,2023 — Scarlet & Violet 151 SIRs
+Paradox Rift,scarlet-violet,2023 — Iron Valiant / Roaring Moon alt arts
+Obsidian Flames,scarlet-violet,2023 — Charizard ex hyper rare
+Temporal Forces,scarlet-violet,2024
+Twilight Masquerade,scarlet-violet,2024 — Bloodmoon Ursaluna alt art
+Surging Sparks,scarlet-violet,2024 — Pikachu ex alt arts

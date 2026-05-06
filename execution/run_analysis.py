@@ -7,6 +7,8 @@ Pass --watchlist to analyze a specific list of cards instead.
 
 Usage:
     python execution/run_analysis.py                          # full market scan
+    python execution/run_analysis.py --era vintage            # vintage sets only
+    python execution/run_analysis.py --sets "151,Evolving Skies,Obsidian Flames"
     python execution/run_analysis.py --skip-discovery         # reuse last discovered_cards.csv
     python execution/run_analysis.py --watchlist data/watchlist.csv  # fixed card list
     python execution/run_analysis.py --skip-sheets --skip-email
@@ -154,6 +156,8 @@ def send_email(body: str, subject: str) -> bool:
 def run(
     watchlist: str | None = None,
     target_sets: str = "data/target_sets.csv",
+    era: str | None = None,
+    sets: list[str] | None = None,
     skip_discovery: bool = False,
     skip_sheets: bool = False,
     skip_email: bool = False,
@@ -165,18 +169,20 @@ def run(
     print(f"Pokemon Flip Analysis  —  {today}")
     print(f"{'='*60}\n")
 
-    # Determine card source: fixed watchlist or full market discovery
+    # Determine card source: fixed watchlist or market discovery (full / filtered)
     if watchlist:
         card_source = watchlist
         print(f"[MODE] Fixed watchlist: {watchlist}")
     else:
         card_source = DISCOVERED_PATH
+        scope = f"era={era}" if era else (f"sets={sets}" if sets else "full universe")
         if skip_discovery and Path(DISCOVERED_PATH).exists():
             n = len(pd.read_csv(DISCOVERED_PATH))
-            print(f"[MODE] Full market scan — reusing {n} previously discovered cards")
+            print(f"[MODE] Market scan ({scope}) — reusing {n} previously discovered cards")
         else:
-            print(f"[0/?] Discovering cards from {target_sets}...")
-            discover_mod.run(target_sets_path=target_sets, output_path=DISCOVERED_PATH)
+            print(f"[0/?] Discovering cards ({scope}) from {target_sets}...")
+            discover_mod.run(target_sets_path=target_sets, output_path=DISCOVERED_PATH,
+                             era=era, sets=sets)
             n = len(pd.read_csv(DISCOVERED_PATH))
             print(f"  → {n} cards discovered\n")
 
@@ -244,6 +250,16 @@ if __name__ == "__main__":
         help="Sets to scan for full market mode (default: data/target_sets.csv)",
     )
     parser.add_argument(
+        "--era",
+        default=None,
+        help="Filter discovery to one era: vintage, sword-shield, scarlet-violet",
+    )
+    parser.add_argument(
+        "--sets",
+        default=None,
+        help="Comma-separated set names to scan, e.g. '151,Evolving Skies,Obsidian Flames'",
+    )
+    parser.add_argument(
         "--skip-discovery",
         action="store_true",
         help="Skip card discovery and reuse the last .tmp/discovered_cards.csv",
@@ -252,9 +268,12 @@ if __name__ == "__main__":
     parser.add_argument("--skip-email", action="store_true", help="Skip email notification")
     args = parser.parse_args()
 
+    sets_list = [s.strip() for s in args.sets.split(",")] if args.sets else None
     run(
         watchlist=args.watchlist,
         target_sets=args.target_sets,
+        era=args.era,
+        sets=sets_list,
         skip_discovery=args.skip_discovery,
         skip_sheets=args.skip_sheets,
         skip_email=args.skip_email,
