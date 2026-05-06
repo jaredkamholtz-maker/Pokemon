@@ -39,6 +39,7 @@ jobs:
 
       - name: Run flip analysis
         env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GRADING_FEE: ${{ secrets.GRADING_FEE }}
           SELLING_FEE_RATE: ${{ secrets.SELLING_FEE_RATE }}
           MIN_ROI: ${{ secrets.MIN_ROI }}

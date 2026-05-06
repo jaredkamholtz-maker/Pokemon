@@ -30,6 +30,7 @@ import discover_cards as discover_mod
 import fetch_tcgplayer_prices as prices_mod
 import scrape_pokedata_population as pop_mod
 import calculate_flip_ev as ev_mod
+import filter_cards_ai as ai_mod
 
 DISCOVERED_PATH = ".tmp/discovered_cards.csv"
 
@@ -184,15 +185,23 @@ def run(
             n = len(pd.read_csv(DISCOVERED_PATH))
             print(f"  → {n} cards discovered\n")
 
-    total_cards = len(pd.read_csv(card_source))
+    # AI pre-filter: drop commons/trainers/bulk before expensive scraping
+    print("[PRE] AI filtering for PSA flip candidates...")
+    card_df = pd.read_csv(card_source)
+    filtered_df = ai_mod.filter_cards(card_df)
+    filtered_path = ".tmp/filtered_cards.csv"
+    filtered_df.to_csv(filtered_path, index=False)
+    card_source = filtered_path
+
+    total_cards = len(filtered_df)
     print(f"Analyzing {total_cards} cards...\n")
 
     # Step 1: Prices
-    print("[1/3] Fetching prices from PriceCharting...")
+    print("[1/3] Fetching prices from PriceCharting (parallel)...")
     prices_df = prices_mod.run(card_source)
 
     # Step 2: Population
-    print("\n[2/3] Scraping population data from 130point.com...")
+    print("\n[2/3] Scraping population data from 130point.com (parallel)...")
     pop_df = pop_mod.run(card_source)
 
     # Step 3: EV calculation

@@ -19,7 +19,9 @@ Usage:
 
 import argparse
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -233,22 +235,34 @@ def fetch_population(card_name: str, set_name: str, card_number: str) -> dict:
     return base
 
 
-def run(watchlist_path: str) -> pd.DataFrame:
+def run(watchlist_path: str, max_workers: int = 5) -> pd.DataFrame:
     watchlist = pd.read_csv(watchlist_path)
-    rows = []
     total = len(watchlist)
+    results: list = [None] * total
+    counter = {"done": 0}
+    lock = threading.Lock()
 
-    for i, row in watchlist.iterrows():
-        print(f"[{i+1}/{total}] Population: {row['card_name']} ({row['set_name']})")
+    def _fetch(i: int, row) -> None:
         pop = fetch_population(
             card_name=row["card_name"],
             set_name=row["set_name"],
             card_number=str(row.get("card_number", "")),
         )
-        rows.append(pop)
-        time.sleep(RATE_DELAY)
+        results[i] = pop
+        with lock:
+            counter["done"] += 1
+            if counter["done"] % 50 == 0 or counter["done"] == total:
+                print(f"  [{counter['done']}/{total}] population fetched")
 
-    df = pd.DataFrame(rows)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(_fetch, i, row)
+            for i, (_, row) in enumerate(watchlist.iterrows())
+        ]
+        for f in as_completed(futures):
+            f.result()
+
+    df = pd.DataFrame(results)
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(OUTPUT_FILE, index=False)
     print(f"\nSaved {len(df)} rows → {OUTPUT_FILE}")

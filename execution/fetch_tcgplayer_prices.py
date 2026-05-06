@@ -19,7 +19,9 @@ Usage:
 
 import argparse
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -256,26 +258,39 @@ def fetch_card_prices(card_name: str, set_name: str, card_number: str) -> dict:
     return result
 
 
-def run(watchlist_path: str) -> pd.DataFrame:
+def run(watchlist_path: str, max_workers: int = 8) -> pd.DataFrame:
     watchlist = pd.read_csv(watchlist_path)
     required_cols = {"card_name", "set_name", "card_number"}
     missing = required_cols - set(watchlist.columns)
     if missing:
         raise ValueError(f"watchlist.csv missing columns: {missing}")
 
-    rows = []
     total = len(watchlist)
-    for i, row in watchlist.iterrows():
-        print(f"[{i+1}/{total}] Fetching prices: {row['card_name']} ({row['set_name']})")
+    results: list = [None] * total
+    counter = {"done": 0}
+    lock = threading.Lock()
+
+    def _fetch(i: int, row) -> None:
         prices = fetch_card_prices(
             card_name=row["card_name"],
             set_name=row["set_name"],
             card_number=str(row.get("card_number", "")),
         )
-        rows.append(prices)
-        time.sleep(RATE_DELAY)
+        results[i] = prices
+        with lock:
+            counter["done"] += 1
+            if counter["done"] % 50 == 0 or counter["done"] == total:
+                print(f"  [{counter['done']}/{total}] prices fetched")
 
-    df = pd.DataFrame(rows)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(_fetch, i, row)
+            for i, (_, row) in enumerate(watchlist.iterrows())
+        ]
+        for f in as_completed(futures):
+            f.result()  # re-raise any exception
+
+    df = pd.DataFrame(results)
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(OUTPUT_FILE, index=False)
     print(f"\nSaved {len(df)} rows → {OUTPUT_FILE}")
