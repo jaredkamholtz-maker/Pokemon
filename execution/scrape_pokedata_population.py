@@ -1,12 +1,17 @@
 """
 Fetch PSA grade population data from PSA's public population report (psacard.com/pop).
 
-PSA's pop search page is server-side rendered — no JavaScript or Playwright needed.
-A plain requests GET to /pop/search?q={card_name} returns the full HTML with results
-in a #tableResults table.
+PSA's pop search page is server-side rendered. However, PSA uses Cloudflare Bot
+Management which detects Python requests via TLS fingerprint and serves empty results.
+
+Fix: use curl_cffi which impersonates Chrome's TLS fingerprint at the socket level,
+bypassing Cloudflare's JA3/JA4 fingerprint checks.
+
+First-time setup:
+    pip install curl_cffi
 
 Strategy:
-  1. GET psacard.com/pop/search?q={card_name} with a realistic browser UA.
+  1. GET psacard.com/pop/search?q={card_name} with Chrome TLS impersonation.
   2. Parse #tableResults rows; score each link on card_name + set_name similarity.
   3. Follow the best-scoring link to the card's pop report page.
   4. Parse the grade table for grades 1-10 counts.
@@ -25,8 +30,14 @@ from pathlib import Path
 from urllib.parse import quote
 
 import pandas as pd
-import requests
 from bs4 import BeautifulSoup
+
+try:
+    from curl_cffi import requests
+    _IMPERSONATE = "chrome120"
+except ImportError:
+    import requests
+    _IMPERSONATE = None
 
 OUTPUT_FILE = Path(".tmp/pokedata_population.csv")
 DEBUG_DIR = Path(".tmp/debug_psa")
@@ -45,6 +56,14 @@ HEADERS = {
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
 }
+
+
+def _make_session():
+    if _IMPERSONATE:
+        return requests.Session(impersonate=_IMPERSONATE)
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    return s
 
 
 def _save_debug(name: str, content: str) -> None:
@@ -112,8 +131,7 @@ def _search_psa(card_name: str, set_name: str, num: str) -> tuple[str, str]:
     Search PSA pop report for a card. Returns (best_pop_url, search_html).
     Tries card-name-only first (more permissive), then card+set if needed.
     """
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    session = _make_session()
 
     queries = [
         card_name,
@@ -195,8 +213,7 @@ def fetch_population(card_name: str, set_name: str, card_number: str) -> dict:
         base["source_url"] = pop_url
 
         # Fetch the pop report page
-        session = requests.Session()
-        session.headers.update(HEADERS)
+        session = _make_session()
         try:
             pop_resp = session.get(pop_url, timeout=20)
             pop_html = pop_resp.text
