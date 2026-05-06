@@ -68,8 +68,6 @@ def calculate_breakeven(
     return {
         "breakeven_gem_rate": round(breakeven, 4) if breakeven is not None else None,
         "psa10_premium": round(psa10_premium, 2) if psa10_price else None,
-        "gem_rate": None,
-        "total_graded": None,
         "profit": None,
         "roi": None,
         "error_ev": None,
@@ -129,7 +127,6 @@ def calculate_ev(
     opt_roi = opt_profit / cost if cost > 0 else 0.0
 
     return {
-        "gem_rate": round(gem_rate, 4),
         "psa10_rate": round(psa10_rate, 4),
         "psa9_rate": round(psa9_rate, 4),
         "expected_revenue": round(expected_revenue, 2),
@@ -139,7 +136,7 @@ def calculate_ev(
         "roi": round(roi, 4),
         "optimistic_roi": round(opt_roi, 4),
         "psa10_premium": round(psa10_price - raw_price, 2) if psa10_price else None,
-        "error": None,
+        "error_ev": None,
     }
 
 
