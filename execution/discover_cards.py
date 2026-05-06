@@ -27,6 +27,13 @@ HEADERS = {
     "Accept": "application/json",
 }
 
+# Explicit aliases for sets whose names differ between our target_sets.csv
+# and PokeData.io's catalog. Add entries here when [SKIP] is logged.
+ALIASES: dict[str, list[str]] = {
+    "151":        ["Scarlet & Violet 151", "Pokemon 151", "SV 151", "151"],
+    "Base Set 2": ["Base Set 2", "Base Set Two"],
+}
+
 
 def get_all_sets() -> list[dict]:
     resp = requests.get(f"{POKEDATA_BASE}/api/sets", headers=HEADERS, timeout=15)
@@ -38,27 +45,37 @@ def get_all_sets() -> list[dict]:
 def find_set_id(target_name: str, all_sets: list[dict]) -> int | None:
     """
     Find PokeData.io set ID for a target set name.
-    Uses length-ratio scoring to avoid partial matches (e.g. 'Base Set' → 'Base Set 2').
+    Tries exact match first, then aliases, then length-ratio fuzzy match.
+    Penalises candidates that are shorter than the target to avoid
+    'Base Set' (8 chars) winning over 'Base Set 2' (10 chars).
     """
     target = target_name.lower().strip()
+    set_by_name = {s.get("name", "").lower().strip(): s["id"] for s in all_sets}
 
-    for s in all_sets:
-        if s.get("name", "").lower().strip() == target:
-            return s["id"]
+    # 1. Exact match
+    if target in set_by_name:
+        return set_by_name[target]
 
+    # 2. Known aliases
+    for alias in ALIASES.get(target_name, []):
+        alias_lower = alias.lower().strip()
+        if alias_lower in set_by_name:
+            return set_by_name[alias_lower]
+
+    # 3. Fuzzy ratio match — require candidate length >= target length * 0.9
+    #    to avoid shorter subsets winning (e.g. 'Base Set' for target 'Base Set 2')
     best_id = None
     best_score = 0.0
-    for s in all_sets:
-        name = s.get("name", "").lower().strip()
+    for name, sid in set_by_name.items():
+        if len(name) < len(target) * 0.9:
+            continue  # candidate too short, likely a subset
         ratio = min(len(target), len(name)) / max(len(target), len(name), 1)
         if ratio < 0.75:
             continue
-        in_target = target in name
-        in_name = name in target
-        score = ratio + (0.3 if in_target or in_name else 0.0)
+        score = ratio + (0.2 if target in name else 0.0)
         if score > best_score:
             best_score = score
-            best_id = s["id"]
+            best_id = sid
 
     return best_id
 
