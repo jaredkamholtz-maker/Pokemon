@@ -127,10 +127,13 @@ def send_email(body: str, subject: str) -> bool:
         print("  Email not configured — skipping. Set SMTP_HOST, SMTP_USER, SMTP_PASS, EMAIL_TO in .env")
         return False
 
+    # EMAIL_TO supports comma-separated addresses: you@example.com,client@example.com
+    recipients = [addr.strip() for addr in email_to.split(",") if addr.strip()]
+
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = smtp_user
-    msg["To"] = email_to
+    msg["To"] = ", ".join(recipients)
     msg.attach(MIMEText(body, "plain"))
 
     try:
@@ -138,8 +141,8 @@ def send_email(body: str, subject: str) -> bool:
             server.ehlo()
             server.starttls()
             server.login(smtp_user, smtp_pass)
-            server.sendmail(smtp_user, email_to, msg.as_string())
-        print(f"  Email sent to {email_to}")
+            server.sendmail(smtp_user, recipients, msg.as_string())
+        print(f"  Email sent to {', '.join(recipients)}")
         return True
     except Exception as e:
         print(f"  Email failed: {e}")
