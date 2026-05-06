@@ -163,18 +163,19 @@ def fetch_population_playwright(card_name: str, set_name: str,
 
                 page.on("response", on_response)
 
-                # Step 1: load search — use networkidle so JS fully executes
-                page.goto(search_url, wait_until="networkidle", timeout=45000)
+                # Step 1: load search — use "load" not "networkidle" (PSA has
+                # continuous analytics that prevent networkidle from firing)
+                page.goto(search_url, wait_until="load", timeout=45000)
                 try:
                     # Wait for actual card result links to appear
                     page.wait_for_selector(
                         "a[href*='/pop/pokemon-cards/']",
-                        timeout=20000,
+                        timeout=25000,
                     )
                 except Exception:
                     pass
-                # Extra settle time for late renders
-                time.sleep(6)
+                # Extra settle time for late-rendering React components
+                time.sleep(4)
 
                 search_html = page.content()
                 _save_debug("psa_search.html", search_html)
@@ -208,7 +209,7 @@ def fetch_population_playwright(card_name: str, set_name: str,
                 pop_url = best_href if best_href.startswith("http") else f"{BASE_URL}{best_href}"
 
                 # Step 3: navigate to card pop page
-                page.goto(pop_url, wait_until="networkidle", timeout=45000)
+                page.goto(pop_url, wait_until="load", timeout=45000)
                 try:
                     page.wait_for_selector("table, tr", timeout=15000)
                 except Exception:
