@@ -69,3 +69,4 @@ jobs:
           name: flip-results-${{ github.run_id }}
           path: .tmp/
           retention-days: 14
+          include-hidden-files: true
