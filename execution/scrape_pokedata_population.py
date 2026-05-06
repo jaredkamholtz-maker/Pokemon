@@ -58,16 +58,26 @@ def get_sets() -> list[dict]:
 def find_set_id(set_name: str) -> int | None:
     sets = get_sets()
     target = set_name.lower().strip()
-    # Exact match first
+
+    # 1. Exact match
     for s in sets:
         if s.get("name", "").lower().strip() == target:
             return s["id"]
-    # Partial match
+
+    # 2. Best partial match scored by length similarity.
+    # Using a ratio prevents "Base Set" from matching "Base Set 2"
+    # when the actual "Base Set" entry exists elsewhere in the list.
+    best_id = None
+    best_ratio = 0.0
     for s in sets:
-        name = s.get("name", "").lower()
+        name = s.get("name", "").lower().strip()
         if target in name or name in target:
-            return s["id"]
-    return None
+            ratio = min(len(target), len(name)) / max(len(target), len(name))
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_id = s["id"]
+
+    return best_id
 
 
 def _api_get(url: str, probe_log: list) -> dict | list | None:
@@ -87,46 +97,57 @@ def _api_get(url: str, probe_log: list) -> dict | list | None:
 
 
 def find_card_id(set_id: int, card_name: str, card_number: str, probe_log: list) -> int | None:
-    """Try known API patterns to get the card's internal ID from pokedata.io."""
-    card_name_lower = card_name.lower()
+    """
+    Fetch all cards for a set from /api/cards?set_id={id} and filter locally.
+    The API ignores name/q query params — filtering must be done client-side.
+    Returns the card's internal `id` field.
+    """
+    url = f"{BASE_URL}/api/cards?set_id={set_id}"
+    data = _api_get(url, probe_log)
+    if not data or not isinstance(data, list):
+        return None
 
-    # Try several likely endpoint patterns
-    candidates = [
-        f"{BASE_URL}/api/cards?set_id={set_id}",
-        f"{BASE_URL}/api/cards?set_id={set_id}&name={card_name}",
-        f"{BASE_URL}/api/cards?set_id={set_id}&q={card_name}",
-        f"{BASE_URL}/api/card?set_id={set_id}&name={card_name}",
-        f"{BASE_URL}/api/sets/{set_id}/cards",
-        f"{BASE_URL}/api/sets/{set_id}/cards?name={card_name}",
-    ]
+    card_name_lower = card_name.lower().strip()
+    target_num = card_number.split("/")[0].strip() if card_number and card_number != "nan" else ""
 
-    for url in candidates:
-        data = _api_get(url, probe_log)
-        if data is None:
+    # Score each card: name match + optional number match
+    best_id = None
+    best_score = -1
+    for card in data:
+        if not isinstance(card, dict):
+            continue
+        name = card.get("name", "").lower().strip()
+        num = str(card.get("num") or card.get("number") or "").strip()
+
+        if name == card_name_lower:
+            score = 2
+        elif card_name_lower in name or name in card_name_lower:
+            score = 1
+        else:
             continue
 
-        records = data if isinstance(data, list) else data.get("results") or data.get("cards") or []
-        if not isinstance(records, list):
-            continue
+        # Bonus for matching card number
+        if target_num and num == target_num:
+            score += 1
 
-        for card in records:
-            if not isinstance(card, dict):
-                continue
-            name = card.get("name", "").lower()
-            num = str(card.get("number") or card.get("card_number") or "")
-            if card_name_lower in name or name in card_name_lower:
-                if not card_number or card_number == "nan" or num == card_number.split("/")[0]:
-                    return card.get("id") or card.get("card_id")
+        if score > best_score:
+            best_score = score
+            best_id = card.get("id") or card.get("card_id")
 
-    return None
+    return best_id
 
 
 def fetch_population_by_card_id(card_id: int, probe_log: list) -> dict[int, int]:
     """Try known API patterns to get PSA grade counts for a card_id."""
     candidates = [
+        # stat_url observed in card data — most likely candidate
+        f"{BASE_URL}/api/cards/stats?card_id={card_id}",
+        f"{BASE_URL}/api/cards/stats?id={card_id}",
+        # Other likely patterns
         f"{BASE_URL}/api/psa?card_id={card_id}",
         f"{BASE_URL}/api/population?card_id={card_id}",
         f"{BASE_URL}/api/grades?card_id={card_id}",
+        f"{BASE_URL}/api/cards/{card_id}/stats",
         f"{BASE_URL}/api/cards/{card_id}/psa",
         f"{BASE_URL}/api/cards/{card_id}/population",
         f"{BASE_URL}/api/cards/{card_id}/grades",
