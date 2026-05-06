@@ -1,14 +1,15 @@
 """
 Fetch PSA grade population data from pokedata.io for each card in the watchlist.
 
-pokedata.io is a Next.js app that loads all card data via internal API calls
-after the page renders. This script uses Playwright to load the page and
-intercept those API responses directly, rather than parsing the HTML shell.
-
-First-time setup (run once):
-    pip install playwright
-    playwright install chromium
-    sudo playwright install-deps chromium
+Strategy (no headless browser needed):
+  1. Fetch the current Next.js buildId from the pokedata.io homepage.
+  2. For each card, GET /_next/data/{buildId}/card/{set-slug}/{card-slug}.json
+     which returns server-rendered page props as JSON.
+  3. Recursively search props for PSA grade count data.
+  4. If props don't contain population, probe direct /api/ endpoints using
+     any card_id/set_id found in the props.
+  5. Save first card's full props to .tmp/debug_pokedata_card_props.json
+     so the data structure can be inspected if extraction fails.
 
 Writes results to .tmp/pokedata_population.csv
 
@@ -23,189 +24,148 @@ import time
 from pathlib import Path
 
 import pandas as pd
+import requests
+from bs4 import BeautifulSoup
 
 OUTPUT_FILE = Path(".tmp/pokedata_population.csv")
-API_LOG_FILE = Path(".tmp/debug_pokedata_api_calls.json")
+DEBUG_FILE = Path(".tmp/debug_pokedata_card_props.json")
 BASE_URL = "https://www.pokedata.io"
-RATE_DELAY = 4.0
-MAX_RETRIES = 2
+RATE_DELAY = 1.5
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/html, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.pokedata.io/",
+}
+
+_build_id: str | None = None
+
+
+def get_build_id() -> str:
+    """Fetch the current Next.js buildId from the pokedata.io homepage."""
+    global _build_id
+    if _build_id:
+        return _build_id
+
+    resp = requests.get(BASE_URL, headers=HEADERS, timeout=15)
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    script = soup.find("script", {"id": "__NEXT_DATA__"})
+    if not script or not script.string:
+        raise RuntimeError("Could not find __NEXT_DATA__ in pokedata.io homepage")
+
+    data = json.loads(script.string)
+    _build_id = data["buildId"]
+    return _build_id
 
 
 def slugify(text: str) -> str:
-    """Convert card/set name to URL slug matching pokedata.io conventions."""
     text = text.lower().encode("ascii", "ignore").decode()
     text = re.sub(r"[^a-z0-9\s\-]", "", text)
     text = re.sub(r"[\s\-]+", "-", text.strip())
     return text
 
 
-def build_card_url(card_name: str, set_name: str) -> str:
-    return f"{BASE_URL}/card/{slugify(set_name)}/{slugify(card_name)}"
+def fetch_card_props(set_slug: str, card_slug: str) -> dict:
+    """Fetch card page props via Next.js JSON data route (no browser needed)."""
+    build_id = get_build_id()
+    url = f"{BASE_URL}/_next/data/{build_id}/card/{set_slug}/{card_slug}.json"
+    resp = requests.get(url, headers=HEADERS, timeout=15)
+    if resp.status_code == 404:
+        return {}
+    resp.raise_for_status()
+    return resp.json().get("pageProps", {})
 
 
-def fetch_card_api_data(url: str) -> tuple[list[dict], str]:
-    """
-    Load a pokedata.io card page with Playwright, intercept all JSON API
-    responses, and return them alongside the final page HTML.
+def _search_for_grade_data(obj, depth: int = 0) -> dict[int, int]:
+    """Recursively search a nested JSON structure for PSA grade counts."""
+    if depth > 8 or not obj:
+        return {}
 
-    Returns (api_responses, page_html).
-    """
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        raise ImportError(
-            "Playwright not installed.\n"
-            "  pip install playwright\n"
-            "  playwright install chromium\n"
-            "  sudo playwright install-deps chromium"
-        )
+    if isinstance(obj, dict):
+        # Pattern A: {"1": 50, "2": 30, ..., "10": 200} — grade keys directly on dict
+        numeric_keys = {
+            k: v for k, v in obj.items()
+            if re.fullmatch(r"(10|[1-9])", str(k)) and isinstance(v, (int, float))
+        }
+        if len(numeric_keys) >= 3:
+            return {int(k): int(v) for k, v in numeric_keys.items()}
 
-    api_responses = []
+        # Pattern B: recurse into keys that suggest population data first
+        pop_keys = [k for k in obj if any(
+            kw in k.lower() for kw in ("psa", "pop", "grade", "gem", "graded")
+        )]
+        for k in pop_keys:
+            result = _search_for_grade_data(obj[k], depth + 1)
+            if result:
+                return result
 
-    for attempt in range(MAX_RETRIES):
+        # Recurse all other values
+        for v in obj.values():
+            result = _search_for_grade_data(v, depth + 1)
+            if result:
+                return result
+
+    elif isinstance(obj, list):
+        # Pattern C: [{grade: X, count: Y}, ...] list of grade objects
+        from_list: dict[int, int] = {}
+        for item in obj:
+            if isinstance(item, dict):
+                grade = (item.get("grade") or item.get("psa_grade")
+                         or item.get("psaGrade") or item.get("Grade"))
+                count = (item.get("count") or item.get("pop") or item.get("population")
+                         or item.get("pop_count") or item.get("popCount") or item.get("Count"))
+                if grade is not None and count is not None:
+                    try:
+                        g = int(float(str(grade)))
+                        if 1 <= g <= 10:
+                            from_list[g] = int(count)
+                    except (ValueError, TypeError):
+                        pass
+        if len(from_list) >= 3:
+            return from_list
+
+        # Recurse into list items
+        for item in obj:
+            result = _search_for_grade_data(item, depth + 1)
+            if result:
+                return result
+
+    return {}
+
+
+def _try_direct_api(card_id) -> dict[int, int]:
+    """Probe known direct API patterns using the card_id from page props."""
+    if not card_id:
+        return {}
+
+    candidates = [
+        f"{BASE_URL}/api/psa?card_id={card_id}",
+        f"{BASE_URL}/api/population?card_id={card_id}",
+        f"{BASE_URL}/api/cards/{card_id}/psa",
+        f"{BASE_URL}/api/cards/{card_id}/population",
+        f"{BASE_URL}/api/cards/{card_id}/grades",
+        f"{BASE_URL}/api/grades?card_id={card_id}",
+    ]
+    for url in candidates:
         try:
-            with sync_playwright() as pw:
-                browser = pw.chromium.launch(headless=True)
-                ctx = browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    ),
-                    viewport={"width": 1280, "height": 800},
-                )
-                page = ctx.new_page()
-
-                def on_response(response):
-                    # Capture any JSON response that looks like card/pricing data
-                    content_type = response.headers.get("content-type", "")
-                    if "json" in content_type:
-                        try:
-                            body = response.json()
-                            api_responses.append({
-                                "url": response.url,
-                                "status": response.status,
-                                "data": body,
-                            })
-                        except Exception:
-                            pass
-
-                page.on("response", on_response)
-                page.goto(url, wait_until="networkidle", timeout=30000)
-
-                # Wait for loading spinners to disappear (data loaded)
-                try:
-                    page.wait_for_selector(
-                        ".MuiCircularProgress-root",
-                        state="hidden",
-                        timeout=12000,
-                    )
-                except Exception:
-                    pass  # spinner may never appear or may not go away
-
-                # Extra settle time for late XHR calls
-                time.sleep(3)
-
-                html = page.content()
-                browser.close()
-            return api_responses, html
-
-        except Exception as e:
-            print(f"  Attempt {attempt + 1}/{MAX_RETRIES} failed: {e}")
-            time.sleep(5 * (attempt + 1))
-
-    return [], ""
-
-
-def extract_population_from_api(api_responses: list[dict]) -> dict | None:
-    """
-    Search intercepted API responses for grade population data.
-    Returns dict with psa grade counts, or None if not found.
-    """
-    grade_counts: dict[int, int] = {}
-
-    for resp in api_responses:
-        url = resp.get("url", "")
-        data = resp.get("data", {})
-        data_str = json.dumps(data)
-
-        # Look for responses that mention population / grades
-        pop_keywords = ("population", "pop_count", "grade_count", "psa_grade",
-                        "gem_rate", "psa10", "psa9", "graded")
-        if not any(kw in data_str.lower() for kw in pop_keywords):
-            continue
-
-        # Strategy 1: look for a dict keyed by grade number
-        # e.g. {"1": 5, "2": 10, ... "10": 200}
-        if isinstance(data, dict):
-            for key, val in data.items():
-                if re.fullmatch(r"(10|[1-9])", str(key)) and isinstance(val, (int, float)):
-                    grade_counts[int(key)] = int(val)
-
-        # Strategy 2: look for list of {grade: X, count: Y} objects
-        if isinstance(data, list):
-            for item in data:
-                if isinstance(item, dict):
-                    grade = item.get("grade") or item.get("psa_grade")
-                    count = item.get("count") or item.get("pop_count") or item.get("population")
-                    if grade is not None and count is not None:
-                        try:
-                            grade_counts[int(grade)] = int(count)
-                        except (ValueError, TypeError):
-                            pass
-
-        # Strategy 3: regex scan of raw JSON for grade patterns
-        if not grade_counts:
-            for m in re.finditer(
-                r'"(?:grade|psa_grade)"\s*:\s*"?(10|[1-9])"?[^}]*?"(?:count|pop(?:ulation)?|total)"\s*:\s*(\d+)',
-                data_str, re.I
-            ):
-                grade_counts[int(m.group(1))] = int(m.group(2))
-
-        if grade_counts:
-            break  # found it
-
-    return grade_counts if grade_counts else None
-
-
-def extract_population_from_sales(api_responses: list[dict]) -> dict | None:
-    """
-    Fallback: aggregate grade counts from individual sale records.
-    pokedata.io shows eBay sales with grade info — aggregate those.
-    """
-    grade_counts: dict[int, int] = {}
-
-    for resp in api_responses:
-        data = resp.get("data", {})
-
-        # Handle list of sale records or paginated result
-        records = []
-        if isinstance(data, list):
-            records = data
-        elif isinstance(data, dict):
-            for key in ("results", "data", "sales", "items", "records"):
-                if isinstance(data.get(key), list):
-                    records = data[key]
-                    break
-
-        for record in records:
-            if not isinstance(record, dict):
-                continue
-            grade_val = record.get("psa_grade") or record.get("grade")
-            if grade_val is None:
-                continue
-            try:
-                grade = int(float(str(grade_val)))
-                if 1 <= grade <= 10:
-                    grade_counts[grade] = grade_counts.get(grade, 0) + 1
-            except (ValueError, TypeError):
-                pass
-
-    return grade_counts if grade_counts else None
+            resp = requests.get(url, headers=HEADERS, timeout=10)
+            if resp.status_code == 200:
+                result = _search_for_grade_data(resp.json())
+                if result:
+                    return result
+        except Exception:
+            pass
+    return {}
 
 
 def fetch_population(card_name: str, set_name: str, card_number: str) -> dict:
-    """Full pipeline for a single card."""
     base = {
         "card_name": card_name,
         "set_name": set_name,
@@ -218,29 +178,29 @@ def fetch_population(card_name: str, set_name: str, card_number: str) -> dict:
         "error": None,
     }
 
-    url = build_card_url(card_name, set_name)
-    base["source_url"] = url
+    set_slug = slugify(set_name)
+    card_slug = slugify(card_name)
+    base["source_url"] = f"{BASE_URL}/card/{set_slug}/{card_slug}"
 
     try:
-        api_responses, html = fetch_card_api_data(url)
+        props = fetch_card_props(set_slug, card_slug)
 
-        # Log all API calls on first card for debugging
-        if not API_LOG_FILE.exists() and api_responses:
-            API_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-            # Save URL + first 500 chars of each response to keep file small
-            log = [{"url": r["url"], "status": r["status"],
-                    "preview": json.dumps(r["data"])[:500]} for r in api_responses]
-            API_LOG_FILE.write_text(json.dumps(log, indent=2))
-            print(f"  Saved API call log → {API_LOG_FILE}")
+        # Save first card's full props for debugging the data structure
+        if not DEBUG_FILE.exists():
+            DEBUG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            DEBUG_FILE.write_text(json.dumps(props, indent=2, default=str))
+            print(f"  Saved card props → {DEBUG_FILE}")
 
-        if not api_responses and not html:
-            base["error"] = "Page failed to load after retries"
+        if not props:
+            base["error"] = "Card page 404 — slug may not match pokedata.io URL convention"
             return base
 
-        # Try dedicated population endpoint first, fall back to sales aggregation
-        grade_counts = extract_population_from_api(api_responses)
+        grade_counts = _search_for_grade_data(props)
+
         if not grade_counts:
-            grade_counts = extract_population_from_sales(api_responses)
+            card_id = (props.get("cardId") or props.get("card_id")
+                       or props.get("id") or props.get("cardInfo", {}).get("id"))
+            grade_counts = _try_direct_api(card_id)
 
         if grade_counts:
             total = sum(grade_counts.values())
@@ -253,8 +213,8 @@ def fetch_population(card_name: str, set_name: str, card_number: str) -> dict:
                 base["gem_rate"] = round((psa9 + psa10) / total, 4)
         else:
             base["error"] = (
-                "Page loaded but no population data found in API responses. "
-                f"Check {API_LOG_FILE} to inspect what the page returned."
+                f"Population data not found in page props or direct API. "
+                f"Inspect {DEBUG_FILE} to identify the correct structure."
             )
 
     except Exception as e:
@@ -267,6 +227,13 @@ def run(watchlist_path: str) -> pd.DataFrame:
     watchlist = pd.read_csv(watchlist_path)
     rows = []
     total = len(watchlist)
+
+    print("Fetching pokedata.io buildId...")
+    try:
+        build_id = get_build_id()
+        print(f"  buildId: {build_id}")
+    except Exception as e:
+        print(f"  WARNING: Could not fetch buildId: {e}")
 
     for i, row in watchlist.iterrows():
         print(f"[{i+1}/{total}] Scraping population: {row['card_name']} ({row['set_name']})")
