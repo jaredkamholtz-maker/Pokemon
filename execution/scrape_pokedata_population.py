@@ -1,15 +1,15 @@
 """
 Fetch PSA grade population data from pokedata.io for each card in the watchlist.
 
-Strategy (no headless browser needed):
-  1. Fetch the current Next.js buildId from the pokedata.io homepage.
-  2. For each card, GET /_next/data/{buildId}/card/{set-slug}/{card-slug}.json
-     which returns server-rendered page props as JSON.
-  3. Recursively search props for PSA grade count data.
-  4. If props don't contain population, probe direct /api/ endpoints using
-     any card_id/set_id found in the props.
-  5. Save first card's full props to .tmp/debug_pokedata_card_props.json
-     so the data structure can be inspected if extraction fails.
+Strategy (no headless browser):
+  1. GET /api/sets?tcg=Pokemon to find the set_id for each set.
+  2. GET /api/cards?set_id={id} (or similar) to find the card_id.
+  3. GET /api/psa?card_id={id} (or similar) to get grade population counts.
+  4. Log all probed endpoints + responses on first card to debug_pokedata_api.json
+     so that working endpoints can be identified if the guesses miss.
+
+The /api/sets endpoint is confirmed working (captured during earlier Playwright run).
+Card and population endpoints are inferred from the URL pattern and probed systematically.
 
 Writes results to .tmp/pokedata_population.csv
 
@@ -25,12 +25,11 @@ from pathlib import Path
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
 
 OUTPUT_FILE = Path(".tmp/pokedata_population.csv")
-DEBUG_FILE = Path(".tmp/debug_pokedata_card_props.json")
+DEBUG_FILE = Path(".tmp/debug_pokedata_api.json")
 BASE_URL = "https://www.pokedata.io"
-RATE_DELAY = 1.5
+RATE_DELAY = 1.0
 
 HEADERS = {
     "User-Agent": (
@@ -38,134 +37,153 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, text/html, */*",
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "application/json, */*",
     "Referer": "https://www.pokedata.io/",
 }
 
-_build_id: str | None = None
+# Cache set list for the run so we only fetch it once
+_sets_cache: list[dict] | None = None
 
 
-def get_build_id() -> str:
-    """Fetch the current Next.js buildId from the pokedata.io homepage."""
-    global _build_id
-    if _build_id:
-        return _build_id
-
-    resp = requests.get(BASE_URL, headers=HEADERS, timeout=15)
+def get_sets() -> list[dict]:
+    global _sets_cache
+    if _sets_cache is not None:
+        return _sets_cache
+    resp = requests.get(f"{BASE_URL}/api/sets?tcg=Pokemon", headers=HEADERS, timeout=15)
     resp.raise_for_status()
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    script = soup.find("script", {"id": "__NEXT_DATA__"})
-    if not script or not script.string:
-        raise RuntimeError("Could not find __NEXT_DATA__ in pokedata.io homepage")
-
-    data = json.loads(script.string)
-    _build_id = data["buildId"]
-    return _build_id
+    _sets_cache = resp.json()
+    return _sets_cache
 
 
-def slugify(text: str) -> str:
-    text = text.lower().encode("ascii", "ignore").decode()
-    text = re.sub(r"[^a-z0-9\s\-]", "", text)
-    text = re.sub(r"[\s\-]+", "-", text.strip())
-    return text
+def find_set_id(set_name: str) -> int | None:
+    sets = get_sets()
+    target = set_name.lower().strip()
+    # Exact match first
+    for s in sets:
+        if s.get("name", "").lower().strip() == target:
+            return s["id"]
+    # Partial match
+    for s in sets:
+        name = s.get("name", "").lower()
+        if target in name or name in target:
+            return s["id"]
+    return None
 
 
-def fetch_card_props(set_slug: str, card_slug: str) -> dict:
-    """Fetch card page props via Next.js JSON data route (no browser needed)."""
-    build_id = get_build_id()
-    url = f"{BASE_URL}/_next/data/{build_id}/card/{set_slug}/{card_slug}.json"
-    resp = requests.get(url, headers=HEADERS, timeout=15)
-    if resp.status_code == 404:
-        return {}
-    resp.raise_for_status()
-    return resp.json().get("pageProps", {})
+def _api_get(url: str, probe_log: list) -> dict | list | None:
+    """GET a URL; log to probe_log; return parsed JSON or None."""
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        entry = {"url": url, "status": resp.status_code, "preview": ""}
+        if resp.status_code == 200:
+            data = resp.json()
+            entry["preview"] = json.dumps(data)[:400]
+            probe_log.append(entry)
+            return data
+        probe_log.append(entry)
+    except Exception as e:
+        probe_log.append({"url": url, "status": "error", "preview": str(e)})
+    return None
 
 
-def _search_for_grade_data(obj, depth: int = 0) -> dict[int, int]:
-    """Recursively search a nested JSON structure for PSA grade counts."""
-    if depth > 8 or not obj:
-        return {}
+def find_card_id(set_id: int, card_name: str, card_number: str, probe_log: list) -> int | None:
+    """Try known API patterns to get the card's internal ID from pokedata.io."""
+    card_name_lower = card_name.lower()
 
-    if isinstance(obj, dict):
-        # Pattern A: {"1": 50, "2": 30, ..., "10": 200} — grade keys directly on dict
-        numeric_keys = {
-            k: v for k, v in obj.items()
-            if re.fullmatch(r"(10|[1-9])", str(k)) and isinstance(v, (int, float))
-        }
-        if len(numeric_keys) >= 3:
-            return {int(k): int(v) for k, v in numeric_keys.items()}
+    # Try several likely endpoint patterns
+    candidates = [
+        f"{BASE_URL}/api/cards?set_id={set_id}",
+        f"{BASE_URL}/api/cards?set_id={set_id}&name={card_name}",
+        f"{BASE_URL}/api/cards?set_id={set_id}&q={card_name}",
+        f"{BASE_URL}/api/card?set_id={set_id}&name={card_name}",
+        f"{BASE_URL}/api/sets/{set_id}/cards",
+        f"{BASE_URL}/api/sets/{set_id}/cards?name={card_name}",
+    ]
 
-        # Pattern B: recurse into keys that suggest population data first
-        pop_keys = [k for k in obj if any(
-            kw in k.lower() for kw in ("psa", "pop", "grade", "gem", "graded")
-        )]
-        for k in pop_keys:
-            result = _search_for_grade_data(obj[k], depth + 1)
-            if result:
-                return result
+    for url in candidates:
+        data = _api_get(url, probe_log)
+        if data is None:
+            continue
 
-        # Recurse all other values
-        for v in obj.values():
-            result = _search_for_grade_data(v, depth + 1)
-            if result:
-                return result
+        records = data if isinstance(data, list) else data.get("results") or data.get("cards") or []
+        if not isinstance(records, list):
+            continue
 
-    elif isinstance(obj, list):
-        # Pattern C: [{grade: X, count: Y}, ...] list of grade objects
-        from_list: dict[int, int] = {}
-        for item in obj:
-            if isinstance(item, dict):
-                grade = (item.get("grade") or item.get("psa_grade")
-                         or item.get("psaGrade") or item.get("Grade"))
-                count = (item.get("count") or item.get("pop") or item.get("population")
-                         or item.get("pop_count") or item.get("popCount") or item.get("Count"))
-                if grade is not None and count is not None:
-                    try:
-                        g = int(float(str(grade)))
-                        if 1 <= g <= 10:
-                            from_list[g] = int(count)
-                    except (ValueError, TypeError):
-                        pass
-        if len(from_list) >= 3:
-            return from_list
+        for card in records:
+            if not isinstance(card, dict):
+                continue
+            name = card.get("name", "").lower()
+            num = str(card.get("number") or card.get("card_number") or "")
+            if card_name_lower in name or name in card_name_lower:
+                if not card_number or card_number == "nan" or num == card_number.split("/")[0]:
+                    return card.get("id") or card.get("card_id")
 
-        # Recurse into list items
-        for item in obj:
-            result = _search_for_grade_data(item, depth + 1)
-            if result:
-                return result
-
-    return {}
+    return None
 
 
-def _try_direct_api(card_id) -> dict[int, int]:
-    """Probe known direct API patterns using the card_id from page props."""
-    if not card_id:
-        return {}
-
+def fetch_population_by_card_id(card_id: int, probe_log: list) -> dict[int, int]:
+    """Try known API patterns to get PSA grade counts for a card_id."""
     candidates = [
         f"{BASE_URL}/api/psa?card_id={card_id}",
         f"{BASE_URL}/api/population?card_id={card_id}",
+        f"{BASE_URL}/api/grades?card_id={card_id}",
         f"{BASE_URL}/api/cards/{card_id}/psa",
         f"{BASE_URL}/api/cards/{card_id}/population",
         f"{BASE_URL}/api/cards/{card_id}/grades",
-        f"{BASE_URL}/api/grades?card_id={card_id}",
+        f"{BASE_URL}/api/psa/{card_id}",
     ]
+
     for url in candidates:
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=10)
-            if resp.status_code == 200:
-                result = _search_for_grade_data(resp.json())
-                if result:
-                    return result
-        except Exception:
-            pass
+        data = _api_get(url, probe_log)
+        if data is None:
+            continue
+        grade_counts = _extract_grade_counts(data)
+        if grade_counts:
+            return grade_counts
+
     return {}
 
 
-def fetch_population(card_name: str, set_name: str, card_number: str) -> dict:
+def _extract_grade_counts(data) -> dict[int, int]:
+    """Parse grade counts from various JSON structures."""
+    if not data:
+        return {}
+
+    # Pattern A: {"1": 50, "2": 30, ..., "10": 200}
+    if isinstance(data, dict):
+        numeric = {k: v for k, v in data.items()
+                   if re.fullmatch(r"(10|[1-9])", str(k)) and isinstance(v, (int, float))}
+        if len(numeric) >= 3:
+            return {int(k): int(v) for k, v in numeric.items()}
+
+    # Pattern B: [{grade: X, count: Y}, ...]
+    records = data if isinstance(data, list) else (
+        data.get("results") or data.get("grades") or data.get("population") or []
+    )
+    if isinstance(records, list):
+        counts: dict[int, int] = {}
+        for item in records:
+            if not isinstance(item, dict):
+                continue
+            grade = (item.get("grade") or item.get("psa_grade") or
+                     item.get("psaGrade") or item.get("Grade"))
+            count = (item.get("count") or item.get("pop") or item.get("population") or
+                     item.get("pop_count") or item.get("total"))
+            if grade is not None and count is not None:
+                try:
+                    g = int(float(str(grade)))
+                    if 1 <= g <= 10:
+                        counts[g] = int(count)
+                except (ValueError, TypeError):
+                    pass
+        if len(counts) >= 3:
+            return counts
+
+    return {}
+
+
+def fetch_population(card_name: str, set_name: str, card_number: str,
+                     save_debug: bool = False) -> dict:
     base = {
         "card_name": card_name,
         "set_name": set_name,
@@ -174,33 +192,30 @@ def fetch_population(card_name: str, set_name: str, card_number: str) -> dict:
         "psa10_count": None,
         "psa9_count": None,
         "gem_rate": None,
-        "source_url": None,
+        "source_url": f"{BASE_URL}/card/{set_name.lower().replace(' ', '-')}/{card_name.lower().replace(' ', '-')}",
         "error": None,
     }
 
-    set_slug = slugify(set_name)
-    card_slug = slugify(card_name)
-    base["source_url"] = f"{BASE_URL}/card/{set_slug}/{card_slug}"
+    probe_log: list = []
 
     try:
-        props = fetch_card_props(set_slug, card_slug)
-
-        # Save first card's full props for debugging the data structure
-        if not DEBUG_FILE.exists():
-            DEBUG_FILE.parent.mkdir(parents=True, exist_ok=True)
-            DEBUG_FILE.write_text(json.dumps(props, indent=2, default=str))
-            print(f"  Saved card props → {DEBUG_FILE}")
-
-        if not props:
-            base["error"] = "Card page 404 — slug may not match pokedata.io URL convention"
+        set_id = find_set_id(set_name)
+        if set_id is None:
+            base["error"] = f"Set '{set_name}' not found in pokedata.io /api/sets"
             return base
 
-        grade_counts = _search_for_grade_data(props)
+        card_id = find_card_id(set_id, card_name, card_number, probe_log)
 
-        if not grade_counts:
-            card_id = (props.get("cardId") or props.get("card_id")
-                       or props.get("id") or props.get("cardInfo", {}).get("id"))
-            grade_counts = _try_direct_api(card_id)
+        grade_counts: dict[int, int] = {}
+        if card_id:
+            grade_counts = fetch_population_by_card_id(card_id, probe_log)
+        else:
+            base["error"] = f"Card '{card_name}' not found via set_id={set_id} API endpoints"
+
+        if save_debug:
+            DEBUG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            DEBUG_FILE.write_text(json.dumps(probe_log, indent=2))
+            print(f"  Saved API probe log → {DEBUG_FILE}")
 
         if grade_counts:
             total = sum(grade_counts.values())
@@ -211,10 +226,11 @@ def fetch_population(card_name: str, set_name: str, card_number: str) -> dict:
             base["psa9_count"] = psa9
             if total > 0:
                 base["gem_rate"] = round((psa9 + psa10) / total, 4)
-        else:
+            base["error"] = None
+        elif not base["error"]:
             base["error"] = (
-                f"Population data not found in page props or direct API. "
-                f"Inspect {DEBUG_FILE} to identify the correct structure."
+                f"card_id={card_id} found but no population data returned. "
+                f"Check {DEBUG_FILE} for probed endpoints."
             )
 
     except Exception as e:
@@ -228,19 +244,21 @@ def run(watchlist_path: str) -> pd.DataFrame:
     rows = []
     total = len(watchlist)
 
-    print("Fetching pokedata.io buildId...")
+    print("Loading pokedata.io set list...")
     try:
-        build_id = get_build_id()
-        print(f"  buildId: {build_id}")
+        sets = get_sets()
+        print(f"  {len(sets)} sets loaded.")
     except Exception as e:
-        print(f"  WARNING: Could not fetch buildId: {e}")
+        print(f"  WARNING: Could not load set list: {e}")
 
     for i, row in watchlist.iterrows():
         print(f"[{i+1}/{total}] Scraping population: {row['card_name']} ({row['set_name']})")
+        save_debug = not DEBUG_FILE.exists()
         pop = fetch_population(
             card_name=row["card_name"],
             set_name=row["set_name"],
             card_number=str(row.get("card_number", "")),
+            save_debug=save_debug,
         )
         rows.append(pop)
         time.sleep(RATE_DELAY)

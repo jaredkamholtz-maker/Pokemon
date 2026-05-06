@@ -4,13 +4,13 @@ Fetch raw (ungraded) and PSA 9 / PSA 10 prices from PriceCharting.com.
 PriceCharting is a public price database for Pokemon cards (no API key needed).
 It shows ungraded, PSA 9, and PSA 10 prices sourced from completed eBay sales.
 
-URL pattern: https://www.pricecharting.com/game/pokemon-{set-slug}/{card-slug}
+URL pattern (individual card page):
+  https://www.pricecharting.com/game/pokemon-{set-slug}/{card-slug}-{card-number}
 
-For each card in the watchlist this script:
-  1. Constructs the PriceCharting URL from card name and set name.
-  2. Fetches the page and extracts ungraded, PSA 9, and PSA 10 market prices.
-  3. Saves a debug page on the first card if prices cannot be parsed.
-  4. Writes results to .tmp/tcgplayer_prices.csv (same filename for pipeline compat).
+The card number is critical — without it, PriceCharting returns a list/search
+page with only Grade 7 and Grade 8 columns, not the full per-grade detail page.
+
+Writes results to .tmp/tcgplayer_prices.csv (same filename for pipeline compat).
 
 Usage:
     python execution/fetch_tcgplayer_prices.py --watchlist data/watchlist.csv
@@ -43,29 +43,141 @@ HEADERS = {
 
 
 def slugify(text: str) -> str:
-    text = text.lower().encode("ascii", "ignore").decode()
+    text = str(text).lower().encode("ascii", "ignore").decode()
     text = re.sub(r"[^a-z0-9\s\-]", "", text)
     text = re.sub(r"[\s\-]+", "-", text.strip())
     return text
 
 
-def set_to_slug(set_name: str) -> str:
-    """Convert set name to PriceCharting URL slug (prefixed with 'pokemon-')."""
-    return f"pokemon-{slugify(set_name)}"
+def _card_number_slug(card_number: str) -> str:
+    """Convert card number to URL-safe slug. '4/102' → '4', 'H29' → 'h29'."""
+    if not card_number or card_number == "nan":
+        return ""
+    # Remove '/XXX' suffix (e.g. '4/102' → '4')
+    num = card_number.split("/")[0].strip()
+    return slugify(num)
+
+
+def _get_page(url: str) -> requests.Response | None:
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
+        return resp
+    except Exception:
+        return None
+
+
+def _is_list_page(soup: BeautifulSoup) -> bool:
+    """Return True if the page is a search/list page rather than a card detail page."""
+    title = soup.find("title")
+    if title and "| " in title.get_text() and "List" in title.get_text():
+        return True
+    # List page has a #games_table with many rows; card page has #price-data table
+    if soup.find(id="games_table") and not soup.find(id="price-data"):
+        return True
+    return False
 
 
 def _parse_price(text: str) -> float | None:
-    """Extract a dollar amount from text like '$1,234.56' or 'N/A'."""
     if not text:
         return None
-    m = re.search(r"\$?([\d,]+\.?\d*)", text.replace(",", ""))
+    cleaned = text.strip().replace(",", "").replace("$", "")
+    m = re.search(r"(\d+\.?\d*)", cleaned)
     if m:
-        try:
-            val = float(m.group(1).replace(",", ""))
-            return val if val > 0 else None
-        except ValueError:
-            pass
+        val = float(m.group(1))
+        return val if val > 0 else None
     return None
+
+
+def _extract_prices_detail(soup: BeautifulSoup) -> dict:
+    """
+    Extract prices from an individual card detail page.
+
+    PriceCharting card pages have a table with rows identified by id or class:
+      used_price / loose-price → Ungraded
+      grade-9 / psa-9         → PSA 9
+      grade-10 / psa-10       → PSA 10
+
+    Prices are in <span class="js-price"> or <td class="price">.
+    """
+    prices: dict[str, float | None] = {}
+
+    # Strategy 1: look for rows by known id patterns
+    row_id_map = {
+        "ungraded": ["used_price", "loose_price", "used-price", "loose-price"],
+        "grade_9":  ["grade-9", "grade-9-price", "psa-9", "psa-9-price", "graded-9"],
+        "grade_10": ["grade-10", "grade-10-price", "psa-10", "psa-10-price", "graded-10"],
+    }
+    for key, ids in row_id_map.items():
+        for row_id in ids:
+            row = soup.find(id=row_id)
+            if row:
+                el = (
+                    row.find(class_="js-price")
+                    or row.find(class_="price")
+                    or row.find("td", class_=re.compile(r"price"))
+                    or row.find("td")
+                )
+                if el:
+                    val = _parse_price(el.get_text(strip=True))
+                    if val:
+                        prices[key] = val
+                        break
+
+    # Strategy 2: scan ALL table rows for grade labels
+    if len(prices) < 2:
+        for row in soup.find_all("tr"):
+            cells = row.find_all(["td", "th"])
+            if len(cells) < 2:
+                continue
+            label = cells[0].get_text(" ", strip=True).lower()
+            price_text = cells[-1].get_text(strip=True)
+
+            if any(kw in label for kw in ("ungraded", "loose", "used")) and "ungraded" not in prices:
+                val = _parse_price(price_text)
+                if val:
+                    prices["ungraded"] = val
+            elif re.search(r"\bgrade\s*9\b|\bpsa\s*9\b|\b9\s*grade\b", label) and "grade_9" not in prices:
+                val = _parse_price(price_text)
+                if val:
+                    prices["grade_9"] = val
+            elif re.search(r"\bgrade\s*10\b|\bpsa\s*10\b|\bgem\b|\b10\s*grade\b", label) and "grade_10" not in prices:
+                val = _parse_price(price_text)
+                if val:
+                    prices["grade_10"] = val
+
+    return prices
+
+
+def _extract_prices_list(soup: BeautifulSoup, card_name: str, set_name: str) -> dict:
+    """
+    Fall back: extract from a list/search results page.
+    Only Ungraded + limited grade data available here.
+    Tries to find the row that best matches card_name + set_name.
+    """
+    prices: dict[str, float | None] = {}
+    best_row = None
+    best_score = 0
+
+    for row in soup.select("#games_table tbody tr, table.product-list tbody tr"):
+        title_el = row.find(class_="title") or row.find("a")
+        if not title_el:
+            continue
+        title_text = title_el.get_text(strip=True).lower()
+        # Score: prefer rows where card name and set name appear
+        score = (card_name.lower() in title_text) + (set_name.lower() in title_text)
+        if score > best_score:
+            best_score = score
+            best_row = row
+
+    if best_row:
+        for td in best_row.find_all("td", class_=re.compile(r"price|used|loose")):
+            el = td.find(class_="js-price") or td
+            val = _parse_price(el.get_text(strip=True))
+            if val and "ungraded" not in prices:
+                prices["ungraded"] = val
+                break
+
+    return prices
 
 
 def fetch_card_prices(card_name: str, set_name: str, card_number: str) -> dict:
@@ -80,116 +192,58 @@ def fetch_card_prices(card_name: str, set_name: str, card_number: str) -> dict:
         "error": None,
     }
 
-    set_slug = set_to_slug(set_name)
+    set_slug = f"pokemon-{slugify(set_name)}"
     card_slug = slugify(card_name)
-    url = f"{BASE_URL}/game/{set_slug}/{card_slug}"
-    result["source_url"] = url
+    num_slug = _card_number_slug(card_number)
 
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
+    # Build candidate URLs — try most-specific first
+    candidates = []
+    if num_slug:
+        candidates.append(f"{BASE_URL}/game/{set_slug}/{card_slug}-{num_slug}")
+    candidates.append(f"{BASE_URL}/game/{set_slug}/{card_slug}")
 
-        if resp.status_code == 404:
-            # Try with card number appended (PriceCharting sometimes uses it)
-            if card_number and card_number != "nan":
-                url2 = f"{BASE_URL}/game/{set_slug}/{card_slug}-{slugify(card_number)}"
-                resp = requests.get(url2, headers=HEADERS, timeout=15)
-                result["source_url"] = url2
+    soup = None
+    used_url = None
+    for url in candidates:
+        resp = _get_page(url)
+        if resp is None:
+            continue
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            used_url = url
+            break
+        # 404 → try next candidate
 
-        if resp.status_code == 404:
-            result["error"] = f"Card not found on PriceCharting — tried {url}"
+    if soup is None:
+        result["error"] = f"All URLs returned 404: {candidates}"
+        return result
+
+    result["source_url"] = used_url
+
+    # Save debug page on first card
+    if not DEBUG_FILE.exists():
+        DEBUG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DEBUG_FILE.write_text(soup.prettify())
+        print(f"  Saved debug page → {DEBUG_FILE}")
+
+    if _is_list_page(soup):
+        prices = _extract_prices_list(soup, card_name, set_name)
+        if not prices:
+            result["error"] = f"Landed on list page; could not find card row. URL: {used_url}"
             return result
-
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # Save first page for debugging if needed
-        if not DEBUG_FILE.exists():
-            DEBUG_FILE.parent.mkdir(parents=True, exist_ok=True)
-            DEBUG_FILE.write_text(resp.text)
-            print(f"  Saved debug page → {DEBUG_FILE}")
-
-        # PriceCharting price table: rows with id like "price-new", "used-price",
-        # "grade-9-price", "grade-10-price" or similar.
-        # Also tries the #completed-auctions table as fallback.
-        prices = _extract_prices(soup)
-
+        # List page only has ungraded — flag it but continue
+        result["raw_price"] = prices.get("ungraded")
+        result["error"] = "List page — no PSA 9/10 prices available; use card number for detail page"
+    else:
+        prices = _extract_prices_detail(soup)
         result["raw_price"] = prices.get("ungraded")
         result["psa9_price"] = prices.get("grade_9")
         result["psa10_price"] = prices.get("grade_10")
 
         if not any(v is not None for v in [result["raw_price"], result["psa9_price"], result["psa10_price"]]):
-            result["error"] = f"Page loaded but no prices found — check {DEBUG_FILE}"
-
-    except requests.HTTPError as e:
-        result["error"] = f"HTTP {e.response.status_code}: {url}"
-    except Exception as e:
-        result["error"] = str(e)
+            result["error"] = f"Detail page loaded but no prices parsed — check {DEBUG_FILE}"
 
     return result
-
-
-def _extract_prices(soup: BeautifulSoup) -> dict:
-    """
-    Extract ungraded, PSA 9, and PSA 10 prices from a PriceCharting card page.
-
-    PriceCharting uses a table with rows like:
-      <tr id="used_price">  → ungraded / loose price
-      <tr id="grade-9-price"> or similar → PSA 9
-      <tr id="grade-10-price"> → PSA 10
-
-    Prices appear in <td> or <span> with class "price" or "js-price".
-    """
-    prices: dict[str, float | None] = {}
-
-    # Strategy 1: look for rows by known id patterns
-    id_map = {
-        "ungraded": ["used_price", "ungraded-price", "loose_price"],
-        "grade_9":  ["grade-9-price", "psa-9-price", "graded-9"],
-        "grade_10": ["grade-10-price", "psa-10-price", "graded-10"],
-    }
-
-    for key, ids in id_map.items():
-        for row_id in ids:
-            row = soup.find(id=row_id)
-            if row:
-                price_el = (
-                    row.find(class_="price")
-                    or row.find(class_="js-price")
-                    or row.find("td", class_=re.compile(r"price"))
-                    or row.find("span")
-                    or row.find("td")
-                )
-                if price_el:
-                    val = _parse_price(price_el.get_text(strip=True))
-                    if val:
-                        prices[key] = val
-                        break
-
-    # Strategy 2: scan all table rows for grade-related labels
-    if len(prices) < 2:
-        for row in soup.find_all("tr"):
-            cells = row.find_all(["td", "th"])
-            if len(cells) < 2:
-                continue
-            label = cells[0].get_text(strip=True).lower()
-            price_text = cells[-1].get_text(strip=True)
-
-            if any(kw in label for kw in ("ungraded", "loose", "used")) and "ungraded" not in prices:
-                val = _parse_price(price_text)
-                if val:
-                    prices["ungraded"] = val
-            elif "grade 9" in label or "psa 9" in label or "grade-9" in label:
-                if "grade_9" not in prices:
-                    val = _parse_price(price_text)
-                    if val:
-                        prices["grade_9"] = val
-            elif "grade 10" in label or "psa 10" in label or "grade-10" in label or "gem" in label:
-                if "grade_10" not in prices:
-                    val = _parse_price(price_text)
-                    if val:
-                        prices["grade_10"] = val
-
-    return prices
 
 
 def run(watchlist_path: str) -> pd.DataFrame:
