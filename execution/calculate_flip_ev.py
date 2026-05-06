@@ -31,6 +31,51 @@ def load_env_float(key: str, default: float) -> float:
     return float(val) if val else default
 
 
+def calculate_breakeven(
+    raw_price: float,
+    psa9_price: float,
+    psa10_price: float,
+    grading_fee: float,
+    selling_fee_rate: float,
+) -> dict:
+    """
+    When population data is unavailable, compute the minimum gem rate needed
+    for the flip to break even. Assumes graded copies split 60% PSA10 / 40% PSA9.
+
+    breakeven_gem_rate < 0.10  → attractive even assuming poor grading luck
+    breakeven_gem_rate < 0.20  → reasonable bet with decent cards
+    breakeven_gem_rate > 0.40  → high-risk, only works with very gem-worthy copies
+    """
+    cost = raw_price + grading_fee
+    # Weighted PSA price assuming 60/40 PSA10/PSA9 split among gem grades
+    psa_weighted = 0.6 * psa10_price + 0.4 * (psa9_price or psa10_price * 0.7)
+    psa10_premium = psa10_price - raw_price
+
+    if psa_weighted <= raw_price:
+        return {
+            "breakeven_gem_rate": None,
+            "psa10_premium": round(psa10_premium, 2) if psa10_price else None,
+            "error_ev": "PSA10 price not higher than raw — no spread",
+        }
+
+    # Solve: gem * psa_weighted * (1-fee) + (1-gem) * raw * (1-fee) = cost
+    # gem = (cost/(1-fee) - raw) / (psa_weighted - raw)
+    fee_adj = 1 - selling_fee_rate
+    numerator = cost / fee_adj - raw_price
+    denominator = psa_weighted - raw_price
+    breakeven = numerator / denominator if denominator > 0 else None
+
+    return {
+        "breakeven_gem_rate": round(breakeven, 4) if breakeven is not None else None,
+        "psa10_premium": round(psa10_premium, 2) if psa10_price else None,
+        "gem_rate": None,
+        "total_graded": None,
+        "profit": None,
+        "roi": None,
+        "error_ev": None,
+    }
+
+
 def calculate_ev(
     raw_price: float,
     psa9_price: float,
@@ -49,7 +94,7 @@ def calculate_ev(
       cost, selling_fee, profit, roi, recommendation
     """
     if not total_graded or total_graded == 0:
-        return {"error": "no population data"}
+        return {"error_ev": "no population data"}
 
     psa10_rate = psa10_count / total_graded
     psa9_rate = psa9_count / total_graded
@@ -105,9 +150,15 @@ def apply_filters(df: pd.DataFrame, args) -> pd.DataFrame:
     min_gem_rate = load_env_float("MIN_GEM_RATE", 0.30)
     min_pop = int(load_env_float("MIN_POP_COUNT", 50))
     max_raw = load_env_float("MAX_RAW_PRICE", 500.0)
+    grading_fee = args.grading_fee if args.grading_fee else load_env_float("GRADING_FEE", 25.0)
 
-    mask = (
-        df["roi"].notna()
+    if "psa10_premium" not in df.columns:
+        return df.iloc[0:0].copy()  # empty — no spread data at all
+
+    # Track 1: full EV with population data
+    has_pop = df["roi"].notna() & df["gem_rate"].notna() & df["total_graded"].notna()
+    mask_full = (
+        has_pop
         & (df["roi"] >= min_roi)
         & (df["gem_rate"] >= min_gem_rate)
         & (df["total_graded"] >= min_pop)
@@ -115,16 +166,24 @@ def apply_filters(df: pd.DataFrame, args) -> pd.DataFrame:
         & (df["psa10_price"].notna())
         & (df["psa9_price"].notna())
         & (df["error_ev"].isna())
+        & (df["psa10_premium"].fillna(0) > grading_fee * 2)
     )
 
-    # Must have meaningful spread: PSA 10 premium > 2× grading fee
-    grading_fee = args.grading_fee if args.grading_fee else load_env_float("GRADING_FEE", 25.0)
-    if "psa10_premium" in df.columns:
-        mask &= df["psa10_premium"].fillna(0) > grading_fee * 2
-    else:
-        mask &= False  # no spread data at all, nothing qualifies
+    # Track 2: breakeven analysis when population data is unavailable
+    # Surface cards where you need < 15% gem rate to break even — very low bar
+    max_breakeven = load_env_float("MAX_BREAKEVEN_GEM_RATE", 0.15)
+    has_breakeven = df["breakeven_gem_rate"].notna() if "breakeven_gem_rate" in df.columns else pd.Series(False, index=df.index)
+    mask_breakeven = (
+        has_breakeven
+        & ~has_pop
+        & (df["breakeven_gem_rate"] <= max_breakeven)
+        & (df["raw_price"] <= max_raw)
+        & (df["psa10_price"].notna())
+        & (df["psa10_premium"].fillna(0) > grading_fee * 2)
+        & (df["error_ev"].isna())
+    )
 
-    return df[mask].copy()
+    return df[mask_full | mask_breakeven].copy()
 
 
 def run(grading_fee: float = None, selling_fee_rate: float = None, min_roi: float = None) -> pd.DataFrame:
@@ -135,8 +194,9 @@ def run(grading_fee: float = None, selling_fee_rate: float = None, min_roi: floa
     prices = pd.read_csv(PRICES_FILE)
     pop = pd.read_csv(POP_FILE)
 
-    # Merge on card_name + set_name
-    df = pd.merge(prices, pop, on=["card_name", "set_name", "card_number"], how="inner", suffixes=("_price", "_pop"))
+    # Left join: keep all price rows, attach pop data where available
+    df = pd.merge(prices, pop, on=["card_name", "set_name", "card_number"],
+                  how="left", suffixes=("_price", "_pop"))
 
     ev_rows = []
     for _, row in df.iterrows():
@@ -144,20 +204,29 @@ def run(grading_fee: float = None, selling_fee_rate: float = None, min_roi: floa
         if pd.isna(row.get("raw_price")) or pd.isna(row.get("psa10_price")):
             ev_rows.append({"error_ev": "missing prices"})
             continue
-        if pd.isna(row.get("total_graded")) or pd.isna(row.get("psa9_count")):
-            ev_rows.append({"error_ev": "missing population"})
-            continue
 
-        ev = calculate_ev(
-            raw_price=float(row["raw_price"]),
-            psa9_price=float(row["psa9_price"]) if not pd.isna(row.get("psa9_price")) else float(row["raw_price"]) * 1.2,
-            psa10_price=float(row["psa10_price"]),
-            total_graded=int(row["total_graded"]),
-            psa9_count=int(row["psa9_count"]),
-            psa10_count=int(row["psa10_count"]),
-            grading_fee=grading_fee,
-            selling_fee_rate=selling_fee_rate,
-        )
+        has_pop = not pd.isna(row.get("total_graded")) and not pd.isna(row.get("psa9_count"))
+
+        if not has_pop:
+            # No population data — compute breakeven gem rate from prices alone
+            ev = calculate_breakeven(
+                raw_price=float(row["raw_price"]),
+                psa9_price=float(row["psa9_price"]) if not pd.isna(row.get("psa9_price")) else None,
+                psa10_price=float(row["psa10_price"]),
+                grading_fee=grading_fee,
+                selling_fee_rate=selling_fee_rate,
+            )
+        else:
+            ev = calculate_ev(
+                raw_price=float(row["raw_price"]),
+                psa9_price=float(row["psa9_price"]) if not pd.isna(row.get("psa9_price")) else float(row["raw_price"]) * 1.2,
+                psa10_price=float(row["psa10_price"]),
+                total_graded=int(row["total_graded"]),
+                psa9_count=int(row["psa9_count"]),
+                psa10_count=int(row["psa10_count"]),
+                grading_fee=grading_fee,
+                selling_fee_rate=selling_fee_rate,
+            )
         ev_rows.append(ev)
 
     ev_df = pd.DataFrame(ev_rows)
@@ -166,12 +235,20 @@ def run(grading_fee: float = None, selling_fee_rate: float = None, min_roi: floa
     # Flag low-data cards
     df["low_data"] = df["total_graded"].fillna(0) < 50
 
-    # Ensure roi column always exists even if all cards errored
-    if "roi" not in df.columns:
-        df["roi"] = pd.NA
+    # Ensure key columns exist
+    for col in ("roi", "breakeven_gem_rate", "gem_rate"):
+        if col not in df.columns:
+            df[col] = pd.NA
 
-    # Sort by ROI descending
-    df_sorted = df.sort_values("roi", ascending=False, na_position="last")
+    # Sort: cards with real ROI first (desc), then by breakeven_gem_rate asc
+    # (lower breakeven = less gem rate needed = safer opportunity)
+    df["_sort_roi"] = df["roi"].fillna(0)
+    df["_sort_be"] = df["breakeven_gem_rate"].fillna(1.0)
+    df_sorted = df.sort_values(
+        ["_sort_roi", "_sort_be"],
+        ascending=[False, True],
+        na_position="last",
+    ).drop(columns=["_sort_roi", "_sort_be"])
 
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     df_sorted.to_csv(OUTPUT_FILE, index=False)

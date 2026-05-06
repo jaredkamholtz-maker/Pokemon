@@ -23,8 +23,14 @@ import time
 from pathlib import Path
 
 import pandas as pd
-import requests
 from bs4 import BeautifulSoup
+
+try:
+    from curl_cffi import requests
+    _IMPERSONATE = "chrome120"
+except ImportError:
+    import requests
+    _IMPERSONATE = None
 
 OUTPUT_FILE = Path(".tmp/pokedata_population.csv")
 DEBUG_DIR = Path(".tmp/debug_pop")
@@ -109,13 +115,20 @@ def _parse_grade_table(html: str) -> dict[int, int]:
     return grade_counts
 
 
+def _make_session():
+    if _IMPERSONATE:
+        return requests.Session(impersonate=_IMPERSONATE)
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    return s
+
+
 def _search_130point(card_name: str, set_name: str, num: str) -> tuple[str, str]:
     """
     Search 130point.com and return (best_card_url, search_html).
     Tries multiple URL patterns.
     """
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    session = _make_session()
 
     # Try multiple search approaches
     search_queries = [
@@ -193,8 +206,7 @@ def fetch_population(card_name: str, set_name: str, card_number: str) -> dict:
         base["source_url"] = card_url
 
         # Fetch the card's grade breakdown page
-        session = requests.Session()
-        session.headers.update(HEADERS)
+        session = _make_session()
         pop_resp = session.get(card_url, timeout=15)
         _save_debug("pop_card_page.html", pop_resp.text)
 
