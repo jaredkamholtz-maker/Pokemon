@@ -1,13 +1,14 @@
 """
-Authenticate with the TCGPlayer API using the authorization code flow.
+Authenticate with the TCGPlayer API.
 
-Flow:
-  1. POST /app/authorize/{authCode}  →  get a permanent authorizationKey
-  2. Cache the key locally so we only call the endpoint once
-  3. Use the key as the Bearer token on every API request
+TCGPlayer issues either:
+  (a) A permanent authorizationKey — use directly as Bearer token, OR
+  (b) A one-time authCode — POST to /app/authorize/{authCode} to get the key
 
-Setup: set TCGPLAYER_AUTH_CODE in .env to the code from your TCGPlayer
-developer portal, then run this script once to exchange it for the key.
+This script tries (a) first by making a test API call. If that fails with 401,
+it tries (b) to exchange the code for a permanent key and caches the result.
+
+Set TCGPLAYER_AUTH_CODE in .env to whichever value TCGPlayer gave you.
 
 Usage (standalone test):
     python execution/auth_tcgplayer.py
@@ -22,13 +23,29 @@ from dotenv import load_dotenv
 
 CACHE_FILE = Path(".tmp/tcgplayer_auth_key.json")
 BASE_URL = "https://api.tcgplayer.com"
+TEST_URL = f"{BASE_URL}/v2/catalog/categories?limit=1"  # lightweight test endpoint
+
+
+def _save_key(key: str) -> None:
+    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CACHE_FILE.write_text(json.dumps({"authorization_key": key}))
+
+
+def _test_key(key: str) -> bool:
+    """Return True if the key works as a Bearer token."""
+    resp = requests.get(
+        TEST_URL,
+        headers={"Authorization": f"Bearer {key}"},
+        timeout=10,
+    )
+    return resp.status_code == 200
 
 
 def get_token() -> str:
-    """Return the cached authorizationKey, exchanging the auth code if needed."""
+    """Return a working Bearer token, caching after the first successful auth."""
     load_dotenv()
 
-    # Return cached key if we already exchanged the auth code
+    # Return cached key immediately
     if CACHE_FILE.exists():
         cached = json.loads(CACHE_FILE.read_text())
         key = cached.get("authorization_key")
@@ -39,9 +56,17 @@ def get_token() -> str:
     if not auth_code:
         raise EnvironmentError(
             "Missing TCGPLAYER_AUTH_CODE in .env\n"
-            "Set it to the authorization code from your TCGPlayer developer portal."
+            "Set it to the key/code shown in your TCGPlayer developer portal."
         )
 
+    # Try using it directly as the permanent authorization key
+    if _test_key(auth_code):
+        print("TCGPLAYER_AUTH_CODE works directly as a Bearer token — caching it.")
+        _save_key(auth_code)
+        return auth_code
+
+    # Otherwise treat it as a one-time auth code and exchange it
+    print("Treating TCGPLAYER_AUTH_CODE as a one-time auth code, exchanging for permanent key...")
     resp = requests.post(
         f"{BASE_URL}/app/authorize/{auth_code}",
         timeout=15,
@@ -49,13 +74,14 @@ def get_token() -> str:
 
     if resp.status_code == 400:
         raise RuntimeError(
-            "TCGPlayer returned 400 — authorization code is invalid or already used.\n"
-            "Check TCGPLAYER_AUTH_CODE in .env matches the code from your developer portal."
+            "TCGPlayer returned 400 — auth code is invalid.\n"
+            "Check TCGPLAYER_AUTH_CODE in .env."
         )
     if resp.status_code == 404:
         raise RuntimeError(
-            "TCGPlayer returned 404 — authorization code not found.\n"
-            "Make sure you're using the exact code from your TCGPlayer developer portal."
+            "TCGPlayer returned 404 — auth code not found or already used.\n"
+            "Auth codes are single-use. If you already exchanged it, the resulting\n"
+            "authorizationKey should be in your TCGPlayer developer portal — use that instead."
         )
     resp.raise_for_status()
 
@@ -65,9 +91,8 @@ def get_token() -> str:
         raise RuntimeError(f"Unexpected response from TCGPlayer: {data}")
 
     key = results[0]["authorizationKey"]
-    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CACHE_FILE.write_text(json.dumps({"authorization_key": key}))
-    print("Authorization key obtained and cached.")
+    _save_key(key)
+    print(f"Authorization key obtained and cached.")
     return key
 
 
