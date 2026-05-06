@@ -68,8 +68,6 @@ def calculate_breakeven(
     return {
         "breakeven_gem_rate": round(breakeven, 4) if breakeven is not None else None,
         "psa10_premium": round(psa10_premium, 2) if psa10_price else None,
-        "gem_rate": None,
-        "total_graded": None,
         "profit": None,
         "roi": None,
         "error_ev": None,
@@ -90,8 +88,8 @@ def calculate_ev(
     Core EV calculation. All prices in USD.
 
     Returns a dict with:
-      gem_rate, psa10_rate, psa9_rate, expected_revenue,
-      cost, selling_fee, profit, roi, recommendation
+      psa10_rate, psa9_rate, expected_revenue,
+      cost, selling_fee, profit, roi, optimistic_roi, psa10_premium
     """
     if not total_graded or total_graded == 0:
         return {"error_ev": "no population data"}
@@ -129,7 +127,6 @@ def calculate_ev(
     opt_roi = opt_profit / cost if cost > 0 else 0.0
 
     return {
-        "gem_rate": round(gem_rate, 4),
         "psa10_rate": round(psa10_rate, 4),
         "psa9_rate": round(psa9_rate, 4),
         "expected_revenue": round(expected_revenue, 2),
@@ -139,7 +136,7 @@ def calculate_ev(
         "roi": round(roi, 4),
         "optimistic_roi": round(opt_roi, 4),
         "psa10_premium": round(psa10_price - raw_price, 2) if psa10_price else None,
-        "error": None,
+        "error_ev": None,
     }
 
 
@@ -170,7 +167,6 @@ def apply_filters(df: pd.DataFrame, args) -> pd.DataFrame:
     )
 
     # Track 2: breakeven analysis when population data is unavailable
-    # Surface cards where you need < 15% gem rate to break even — very low bar
     max_breakeven = load_env_float("MAX_BREAKEVEN_GEM_RATE", 0.15)
     has_breakeven = df["breakeven_gem_rate"].notna() if "breakeven_gem_rate" in df.columns else pd.Series(False, index=df.index)
     mask_breakeven = (
@@ -200,7 +196,6 @@ def run(grading_fee: float = None, selling_fee_rate: float = None, min_roi: floa
 
     ev_rows = []
     for _, row in df.iterrows():
-        # Skip if missing critical prices
         if pd.isna(row.get("raw_price")) or pd.isna(row.get("psa10_price")):
             ev_rows.append({"error_ev": "missing prices"})
             continue
@@ -208,7 +203,6 @@ def run(grading_fee: float = None, selling_fee_rate: float = None, min_roi: floa
         has_pop = not pd.isna(row.get("total_graded")) and not pd.isna(row.get("psa9_count"))
 
         if not has_pop:
-            # No population data — compute breakeven gem rate from prices alone
             ev = calculate_breakeven(
                 raw_price=float(row["raw_price"]),
                 psa9_price=float(row["psa9_price"]) if not pd.isna(row.get("psa9_price")) else None,
@@ -241,7 +235,6 @@ def run(grading_fee: float = None, selling_fee_rate: float = None, min_roi: floa
             df[col] = pd.NA
 
     # Sort: cards with real ROI first (desc), then by breakeven_gem_rate asc
-    # (lower breakeven = less gem rate needed = safer opportunity)
     df["_sort_roi"] = df["roi"].fillna(0)
     df["_sort_be"] = df["breakeven_gem_rate"].fillna(1.0)
     df_sorted = df.sort_values(
