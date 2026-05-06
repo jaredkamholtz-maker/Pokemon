@@ -19,7 +19,9 @@ Usage:
 
 import argparse
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -60,7 +62,6 @@ def _save_debug(name: str, content: str) -> None:
     if not path.exists():
         DEBUG_DIR.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
-        print(f"  Saved debug → {path}")
 
 
 def _score_link(text: str, href: str, card_name: str, set_name: str, num: str) -> float:
@@ -77,7 +78,6 @@ def _parse_grade_table(html: str) -> dict[int, int]:
     soup = BeautifulSoup(html, "html.parser")
     grade_counts: dict[int, int] = {}
 
-    # Strategy 1: table rows where first cell is a grade number
     for row in soup.find_all("tr"):
         cells = row.find_all(["td", "th"])
         if not cells:
@@ -100,7 +100,6 @@ def _parse_grade_table(html: str) -> dict[int, int]:
     if grade_counts:
         return grade_counts
 
-    # Strategy 2: look for labeled grade elements
     for el in soup.find_all(class_=re.compile(r"grade|pop|count|psa", re.I)):
         text = el.get_text(" ", strip=True)
         for m in re.finditer(r"\b(10|[1-9])\b[^\d]*?(\d[\d,]*)", text):
@@ -124,39 +123,24 @@ def _make_session():
 
 
 def _search_130point(card_name: str, set_name: str, num: str) -> tuple[str, str]:
-    """
-    Search 130point.com and return (best_card_url, search_html).
-    Tries multiple URL patterns.
-    """
     session = _make_session()
 
-    # Try multiple search approaches
-    search_queries = [
-        f"{card_name} {set_name}",
-        card_name,
-    ]
+    search_queries = [f"{card_name} {set_name}", card_name]
     if num:
         search_queries.insert(0, f"{card_name} {num} {set_name}")
 
     for query in search_queries:
         try:
-            resp = session.get(
-                f"{BASE_URL}/",
-                params={"q": query},
-                timeout=15,
-            )
+            resp = session.get(f"{BASE_URL}/", params={"q": query}, timeout=15)
         except Exception as e:
-            print(f"  Request failed: {e}")
             continue
 
         if resp.status_code != 200:
-            print(f"  130point.com returned {resp.status_code}")
             continue
 
         _save_debug("pop_search.html", resp.text)
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Score all result links
         best_href = ""
         best_score = -1.0
         for a in soup.find_all("a", href=True):
@@ -205,7 +189,6 @@ def fetch_population(card_name: str, set_name: str, card_number: str) -> dict:
 
         base["source_url"] = card_url
 
-        # Fetch the card's grade breakdown page
         session = _make_session()
         pop_resp = session.get(card_url, timeout=15)
         _save_debug("pop_card_page.html", pop_resp.text)
@@ -233,22 +216,34 @@ def fetch_population(card_name: str, set_name: str, card_number: str) -> dict:
     return base
 
 
-def run(watchlist_path: str) -> pd.DataFrame:
+def run(watchlist_path: str, max_workers: int = 5) -> pd.DataFrame:
     watchlist = pd.read_csv(watchlist_path)
-    rows = []
     total = len(watchlist)
+    results: list = [None] * total
+    counter = {"done": 0}
+    lock = threading.Lock()
 
-    for i, row in watchlist.iterrows():
-        print(f"[{i+1}/{total}] Population: {row['card_name']} ({row['set_name']})")
+    def _fetch(i: int, row) -> None:
         pop = fetch_population(
             card_name=row["card_name"],
             set_name=row["set_name"],
             card_number=str(row.get("card_number", "")),
         )
-        rows.append(pop)
-        time.sleep(RATE_DELAY)
+        results[i] = pop
+        with lock:
+            counter["done"] += 1
+            if counter["done"] % 50 == 0 or counter["done"] == total:
+                print(f"  [{counter['done']}/{total}] population fetched")
 
-    df = pd.DataFrame(rows)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(_fetch, i, row)
+            for i, (_, row) in enumerate(watchlist.iterrows())
+        ]
+        for f in as_completed(futures):
+            f.result()
+
+    df = pd.DataFrame(results)
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(OUTPUT_FILE, index=False)
     print(f"\nSaved {len(df)} rows → {OUTPUT_FILE}")

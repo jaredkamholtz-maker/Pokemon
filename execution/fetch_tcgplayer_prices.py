@@ -19,7 +19,9 @@ Usage:
 
 import argparse
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -53,7 +55,6 @@ def _card_number_slug(card_number: str) -> str:
     """Convert card number to URL-safe slug. '4/102' → '4', 'H29' → 'h29'."""
     if not card_number or card_number == "nan":
         return ""
-    # Remove '/XXX' suffix (e.g. '4/102' → '4')
     num = card_number.split("/")[0].strip()
     return slugify(num)
 
@@ -71,7 +72,6 @@ def _is_list_page(soup: BeautifulSoup) -> bool:
     title = soup.find("title")
     if title and "| " in title.get_text() and "List" in title.get_text():
         return True
-    # List page has a #games_table with many rows; card page has #price-data table
     if soup.find(id="games_table") and not soup.find(id="price-data"):
         return True
     return False
@@ -101,7 +101,6 @@ def _extract_prices_detail(soup: BeautifulSoup) -> dict:
     """
     prices: dict[str, float | None] = {}
 
-    # Strategy 1: look for rows by known id patterns
     row_id_map = {
         "ungraded": ["used_price", "loose_price", "used-price", "loose-price"],
         "grade_9":  ["grade-9", "grade-9-price", "psa-9", "psa-9-price", "graded-9"],
@@ -123,7 +122,6 @@ def _extract_prices_detail(soup: BeautifulSoup) -> dict:
                         prices[key] = val
                         break
 
-    # Strategy 2: scan ALL table rows for grade labels
     if len(prices) < 2:
         for row in soup.find_all("tr"):
             cells = row.find_all(["td", "th"])
@@ -149,10 +147,6 @@ def _extract_prices_detail(soup: BeautifulSoup) -> dict:
 
 
 def _find_best_list_link(soup: BeautifulSoup, card_name: str, set_name: str) -> str | None:
-    """
-    From a PriceCharting search/list page, find the URL of the best-matching
-    individual card page by scoring rows on card name + set name similarity.
-    """
     best_url = None
     best_score = -1
 
@@ -161,7 +155,6 @@ def _find_best_list_link(soup: BeautifulSoup, card_name: str, set_name: str) -> 
         if not link:
             continue
         text = link.get_text(strip=True).lower()
-        # Also grab the console/set cell if present
         console_el = row.find(class_="console") or row.find(class_="set")
         console_text = console_el.get_text(strip=True).lower() if console_el else ""
         combined = text + " " + console_text
@@ -198,7 +191,6 @@ def fetch_card_prices(card_name: str, set_name: str, card_number: str) -> dict:
     card_slug = slugify(card_name)
     num_slug = _card_number_slug(card_number)
 
-    # Build candidate URLs — try most-specific first
     candidates = []
     if num_slug:
         candidates.append(f"{BASE_URL}/game/{set_slug}/{card_slug}-{num_slug}")
@@ -214,7 +206,6 @@ def fetch_card_prices(card_name: str, set_name: str, card_number: str) -> dict:
             soup = BeautifulSoup(resp.text, "html.parser")
             used_url = url
             break
-        # 404 → try next candidate
 
     if soup is None:
         result["error"] = f"All URLs returned 404: {candidates}"
@@ -222,21 +213,17 @@ def fetch_card_prices(card_name: str, set_name: str, card_number: str) -> dict:
 
     result["source_url"] = used_url
 
-    # Save debug page on first card
     if not DEBUG_FILE.exists():
         DEBUG_FILE.parent.mkdir(parents=True, exist_ok=True)
         DEBUG_FILE.write_text(soup.prettify())
-        print(f"  Saved debug page → {DEBUG_FILE}")
 
     if _is_list_page(soup):
-        # Follow the best-matching link to the individual card detail page
         detail_url = _find_best_list_link(soup, card_name, set_name)
         if detail_url:
             detail_resp = _get_page(detail_url)
             if detail_resp and detail_resp.status_code == 200:
                 soup = BeautifulSoup(detail_resp.text, "html.parser")
                 result["source_url"] = detail_url
-                # Fall through to detail extraction below
             else:
                 result["error"] = f"Found list link {detail_url} but it returned {detail_resp and detail_resp.status_code}"
                 return result
@@ -244,38 +231,50 @@ def fetch_card_prices(card_name: str, set_name: str, card_number: str) -> dict:
             result["error"] = f"Landed on list page and no matching card link found. URL: {used_url}"
             return result
 
-    else:
-        prices = _extract_prices_detail(soup)
-        result["raw_price"] = prices.get("ungraded")
-        result["psa9_price"] = prices.get("grade_9")
-        result["psa10_price"] = prices.get("grade_10")
+    prices = _extract_prices_detail(soup)
+    result["raw_price"] = prices.get("ungraded")
+    result["psa9_price"] = prices.get("grade_9")
+    result["psa10_price"] = prices.get("grade_10")
 
-        if not any(v is not None for v in [result["raw_price"], result["psa9_price"], result["psa10_price"]]):
-            result["error"] = f"Detail page loaded but no prices parsed — check {DEBUG_FILE}"
+    if not any(v is not None for v in [result["raw_price"], result["psa9_price"], result["psa10_price"]]):
+        result["error"] = f"Detail page loaded but no prices parsed — check {DEBUG_FILE}"
 
     return result
 
 
-def run(watchlist_path: str) -> pd.DataFrame:
+def run(watchlist_path: str, max_workers: int = 8) -> pd.DataFrame:
     watchlist = pd.read_csv(watchlist_path)
     required_cols = {"card_name", "set_name", "card_number"}
     missing = required_cols - set(watchlist.columns)
     if missing:
         raise ValueError(f"watchlist.csv missing columns: {missing}")
 
-    rows = []
     total = len(watchlist)
-    for i, row in watchlist.iterrows():
-        print(f"[{i+1}/{total}] Fetching prices: {row['card_name']} ({row['set_name']})")
+    results: list = [None] * total
+    counter = {"done": 0}
+    lock = threading.Lock()
+
+    def _fetch(i: int, row) -> None:
         prices = fetch_card_prices(
             card_name=row["card_name"],
             set_name=row["set_name"],
             card_number=str(row.get("card_number", "")),
         )
-        rows.append(prices)
-        time.sleep(RATE_DELAY)
+        results[i] = prices
+        with lock:
+            counter["done"] += 1
+            if counter["done"] % 50 == 0 or counter["done"] == total:
+                print(f"  [{counter['done']}/{total}] prices fetched")
 
-    df = pd.DataFrame(rows)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(_fetch, i, row)
+            for i, (_, row) in enumerate(watchlist.iterrows())
+        ]
+        for f in as_completed(futures):
+            f.result()  # re-raise any exception
+
+    df = pd.DataFrame(results)
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(OUTPUT_FILE, index=False)
     print(f"\nSaved {len(df)} rows → {OUTPUT_FILE}")
