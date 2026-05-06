@@ -123,7 +123,11 @@ def run(target_sets_path: str = "data/target_sets.csv",
     for set_name in set_names:
         set_id = find_set_id(set_name, all_sets)
         if not set_id:
-            print(f"  [SKIP] '{set_name}' not found in PokeData.io catalog")
+            # Show closest matches to help diagnose alias issues
+            close = [s.get("name") for s in all_sets
+                     if set_name.lower()[:4] in s.get("name", "").lower()][:5]
+            hint = f" — closest: {close}" if close else ""
+            print(f"  [SKIP] '{set_name}' not found in PokeData.io catalog{hint}")
             continue
 
         print(f"  Fetching {set_name} (set_id={set_id})...", end=" ", flush=True)
