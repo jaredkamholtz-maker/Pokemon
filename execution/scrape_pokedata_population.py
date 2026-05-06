@@ -126,12 +126,18 @@ def fetch_population_playwright(card_name: str, set_name: str,
     for attempt in range(MAX_RETRIES):
         try:
             with sync_playwright() as pw:
-                browser = pw.chromium.launch(headless=True)
+                import glob as _glob
+                _chrome_paths = sorted(_glob.glob("/opt/pw-browsers/chromium-*/chrome-linux/chrome"))
+                _exe = _chrome_paths[-1] if _chrome_paths else None
+                browser = pw.chromium.launch(
+                    headless=True,
+                    executable_path=_exe,
+                )
                 ctx = browser.new_context(
                     user_agent=USER_AGENT,
                     viewport={"width": 1280, "height": 900},
-                    # Mask automation signals
                     extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+                    ignore_https_errors=True,
                 )
                 page = ctx.new_page()
                 # Spoof navigator.webdriver to avoid bot detection
