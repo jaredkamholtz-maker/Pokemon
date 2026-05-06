@@ -1,0 +1,48 @@
+name: Pokemon Flip Analysis
+
+on:
+  schedule:
+    # 8am ET Monday and Friday (13:00 UTC)
+    - cron: "0 13 * * 1,5"
+  workflow_dispatch:  # also allows manual trigger from GitHub Actions tab
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240  # full scan can take 2-3 hours
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run flip analysis
+        env:
+          GRADING_FEE: ${{ secrets.GRADING_FEE }}
+          SELLING_FEE_RATE: ${{ secrets.SELLING_FEE_RATE }}
+          MIN_ROI: ${{ secrets.MIN_ROI }}
+          MIN_GEM_RATE: ${{ secrets.MIN_GEM_RATE }}
+          MIN_POP_COUNT: ${{ secrets.MIN_POP_COUNT }}
+          MAX_RAW_PRICE: ${{ secrets.MAX_RAW_PRICE }}
+          MAX_BREAKEVEN_GEM_RATE: ${{ secrets.MAX_BREAKEVEN_GEM_RATE }}
+          GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python execution/run_analysis.py
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flip-results-${{ github.run_id }}
+          path: .tmp/
+          retention-days: 14
