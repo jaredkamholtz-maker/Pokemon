@@ -145,21 +145,22 @@ def fetch_population_playwright(card_name: str, set_name: str,
                     "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
                 )
 
-                # Capture JSON API responses — PSA's SPA calls its own backend
+                # Capture ALL psacard.com responses to find the AJAX search endpoint
                 api_log: list[dict] = []
 
                 def on_response(resp):
+                    if "psacard.com" not in resp.url:
+                        return
                     ct = resp.headers.get("content-type", "")
-                    if "json" in ct:
-                        try:
-                            body = resp.json()
-                            api_log.append({
-                                "url": resp.url,
-                                "status": resp.status,
-                                "preview": str(body)[:500],
-                            })
-                        except Exception:
-                            pass
+                    entry = {"url": resp.url, "status": resp.status, "ct": ct}
+                    try:
+                        if "json" in ct:
+                            entry["preview"] = str(resp.json())[:500]
+                        elif "html" in ct or "text" in ct:
+                            entry["preview"] = resp.text()[:500]
+                    except Exception:
+                        pass
+                    api_log.append(entry)
 
                 page.on("response", on_response)
 
