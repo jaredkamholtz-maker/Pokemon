@@ -25,8 +25,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
-import requests
 from bs4 import BeautifulSoup
+
+try:
+    from curl_cffi import requests as cffi_requests
+    _SESSION = cffi_requests.Session(impersonate="chrome124")
+    _USE_CFFI = True
+except ImportError:
+    import requests as _requests_fallback
+    _SESSION = None
+    _USE_CFFI = False
 
 OUTPUT_FILE = Path(".tmp/tcgplayer_prices.csv")
 DEBUG_FILE = Path(".tmp/debug_pricecharting_page.html")
@@ -34,11 +42,6 @@ BASE_URL = "https://www.pricecharting.com"
 RATE_DELAY = 1.5
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
     "Accept": "text/html,application/xhtml+xml,*/*",
     "Accept-Language": "en-US,en;q=0.9",
 }
@@ -60,9 +63,13 @@ def _card_number_slug(card_number: str) -> str:
     return slugify(num)
 
 
-def _get_page(url: str) -> requests.Response | None:
+def _get_page(url: str):
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
+        if _USE_CFFI:
+            resp = _SESSION.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
+        else:
+            import requests as _req
+            resp = _req.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
         return resp
     except Exception:
         return None
@@ -216,10 +223,18 @@ def fetch_card_prices(card_name: str, set_name: str, card_number: str) -> dict:
             soup = BeautifulSoup(resp.text, "html.parser")
             used_url = url
             break
-        # 404 → try next candidate
+        if resp.status_code == 403:
+            # Bot detection hit — back off and retry once
+            time.sleep(3)
+            resp = _get_page(url)
+            if resp and resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                used_url = url
+                break
+        # 404 / still 403 → try next candidate
 
     if soup is None:
-        result["error"] = f"All URLs returned 404: {candidates}"
+        result["error"] = f"All URLs returned 404/403: {candidates}"
         return result
 
     result["source_url"] = used_url
@@ -235,6 +250,9 @@ def fetch_card_prices(card_name: str, set_name: str, card_number: str) -> dict:
         detail_url = _find_best_list_link(soup, card_name, set_name)
         if detail_url:
             detail_resp = _get_page(detail_url)
+            if detail_resp and detail_resp.status_code == 403:
+                time.sleep(3)
+                detail_resp = _get_page(detail_url)
             if detail_resp and detail_resp.status_code == 200:
                 soup = BeautifulSoup(detail_resp.text, "html.parser")
                 result["source_url"] = detail_url
@@ -258,7 +276,7 @@ def fetch_card_prices(card_name: str, set_name: str, card_number: str) -> dict:
     return result
 
 
-def run(watchlist_path: str, max_workers: int = 8) -> pd.DataFrame:
+def run(watchlist_path: str, max_workers: int = 3) -> pd.DataFrame:
     watchlist = pd.read_csv(watchlist_path)
     required_cols = {"card_name", "set_name", "card_number"}
     missing = required_cols - set(watchlist.columns)
