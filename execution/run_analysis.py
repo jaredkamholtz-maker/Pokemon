@@ -27,6 +27,7 @@ import argparse
 import os
 import smtplib
 import sys
+import urllib.parse
 from datetime import date
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -157,7 +158,19 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         total = row.get("total_graded")
         total_str = f"{int(total):,}" if pd.notna(total) and total == total else "No data"
         url = row.get("source_url") or ""
-        ebay_url = row.get("ebay_listing_url") or ""
+        ebay_listing_url = row.get("ebay_listing_url") or ""
+
+        # Always build an eBay search link so user can find raw copies to buy
+        ebay_search_url = (
+            "https://www.ebay.com/sch/i.html?"
+            + urllib.parse.urlencode({
+                "_nkw": f"{name} {set_name} pokemon raw ungraded",
+                "LH_BIN": "1",
+                "_sop": "15",
+            })
+        )
+        # Prefer a specific listing URL (from image analysis); fall back to search
+        buy_url = ebay_listing_url or ebay_search_url
 
         # Image analysis columns (only present when step 6 ran)
         pred_grade = row.get("predicted_grade")
@@ -165,8 +178,7 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         notes = row.get("notes") or ""
 
         card_link = f'<a href="{url}" style="color:#1a73e8;text-decoration:none;">{name}</a>' if url else name
-        ebay_link = (f' <a href="{ebay_url}" style="font-size:11px;color:#6b7280;">[eBay listing]</a>'
-                     if ebay_url else "")
+        ebay_link = f' <a href="{buy_url}" style="font-size:11px;color:#e67e00;font-weight:600;">[Buy on eBay]</a>'
 
         image_cells = ""
         image_plain = ""
@@ -195,7 +207,7 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
   <td style="padding:10px 14px;text-align:right;color:#6b7280;">{total_str}</td>
 </tr>""")
 
-        link_text = f"\n  eBay: {ebay_url}" if ebay_url else (f"\n  {url}" if url else "")
+        link_text = f"\n  Buy on eBay: {buy_url}" + (f"\n  PriceCharting: {url}" if url else "")
         rows_plain.append(
             f"#{rank} {name} | {set_name}\n"
             f"  Raw: {raw}  PSA9: {psa9}  PSA10: {psa10}  Profit: {roi}  Gem Rate: {gem}  "
