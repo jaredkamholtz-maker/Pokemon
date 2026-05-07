@@ -163,14 +163,14 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         else:
             roi = "—"
         url = row.get("source_url") or ""
-        ebay_listing_url = row.get("ebay_listing_url") or ""
+        _ebay_raw = row.get("ebay_listing_url")
+        ebay_listing_url = str(_ebay_raw) if pd.notna(_ebay_raw) and _ebay_raw else ""
 
-        # Always build an eBay search link so user can find raw copies to buy
+        # Broad eBay search — just card name + set, no BIN/condition filters so results always appear
         ebay_search_url = (
             "https://www.ebay.com/sch/i.html?"
             + urllib.parse.urlencode({
-                "_nkw": f"{name} {set_name} pokemon raw ungraded",
-                "LH_BIN": "1",
+                "_nkw": f"{name} {set_name} pokemon",
                 "_sop": "15",
             })
         )
