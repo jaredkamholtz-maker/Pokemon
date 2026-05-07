@@ -84,22 +84,32 @@ def _get_headers() -> dict:
     return headers
 
 
-def get_cards_for_set(set_id: str) -> list[dict]:
-    """Fetch all cards for a set ID, handling pagination."""
+def get_cards_for_set(set_id: str, max_retries: int = 3) -> list[dict]:
+    """Fetch all cards for a set ID, handling pagination and retrying on timeout."""
     headers = _get_headers()
     cards = []
     page = 1
     while True:
-        try:
-            resp = _SESSION.get(
-                f"{API_BASE}/cards",
-                params={"q": f"set.id:{set_id}", "pageSize": PAGE_SIZE, "page": page,
-                        "select": "id,name,number,rarity"},
-                headers=headers,
-                timeout=20,
-            )
-        except Exception as e:
-            print(f"  Request error on page {page}: {e}")
+        resp = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = _SESSION.get(
+                    f"{API_BASE}/cards",
+                    params={"q": f"set.id:{set_id}", "pageSize": PAGE_SIZE, "page": page,
+                            "select": "id,name,number,rarity"},
+                    headers=headers,
+                    timeout=30,
+                )
+                break  # success
+            except Exception as e:
+                wait = attempt * 5
+                if attempt < max_retries:
+                    print(f"  Timeout on page {page} (attempt {attempt}/{max_retries}) — retrying in {wait}s...")
+                    time.sleep(wait)
+                else:
+                    print(f"  Request failed after {max_retries} attempts on page {page}: {e}")
+
+        if resp is None:
             break
 
         if resp.status_code == 429:
