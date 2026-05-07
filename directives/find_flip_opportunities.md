@@ -14,22 +14,24 @@ Identify Pokemon cards that can be profitably bought raw (ungraded), submitted t
 target_sets.csv
       │
       ▼
-[0] discover_cards.py      → .tmp/discovered_cards.csv    (~3,000 cards)
+[1] discover_cards.py      → .tmp/discovered_cards.csv    (~3,000 cards)
       │
       ▼
-[PRE] filter_cards_ai.py   → .tmp/filtered_cards.csv      (~400–600 cards)
+[2] filter_cards_ai.py     → .tmp/filtered_cards.csv      (~400–600 cards)
       │
       ▼
-[1] fetch_tcgplayer_prices.py → .tmp/tcgplayer_prices.csv  (parallel, 8 workers)
+[3] fetch_tcgplayer_prices.py → .tmp/tcgplayer_prices.csv  (parallel, 3 workers, curl_cffi)
+     → Filter applied: keep only cards with PSA 9 or PSA 10 > $60
       │
       ▼
-[2] scrape_pokedata_population.py → .tmp/pokedata_population.csv (parallel, 5 workers)
+[4] scrape_pokedata_population.py → .tmp/pokedata_population.csv (parallel, 5 workers)
       │
       ▼
-[3] calculate_flip_ev.py   → .tmp/flip_opportunities.csv
+[5] calculate_flip_ev.py   → .tmp/flip_opportunities.csv
+     → Filter applied: gem_rate >= 50% AND ROI >= 10% after $25 grading fee
       │
       ▼
-[OUT] Google Sheet + Email
+[OUT] Google Sheet + HTML Email (card, raw, PSA 9, PSA 10, profit %, gem rate)
 ```
 
 ## Tools / Scripts
@@ -38,10 +40,10 @@ target_sets.csv
 |---|---|
 | `execution/discover_cards.py` | Queries PokeData.io API for all cards in each target set; writes `discovered_cards.csv` |
 | `execution/filter_cards_ai.py` | Sends cards to Claude Haiku in batches of 300; drops commons/trainers/bulk; returns PSA-worthy candidates (~80% reduction) |
-| `execution/fetch_tcgplayer_prices.py` | Gets raw + PSA 9 + PSA 10 market prices from PriceCharting; parallel (8 workers) |
+| `execution/fetch_tcgplayer_prices.py` | Gets raw + PSA 9 + PSA 10 market prices from PriceCharting; parallel (3 workers); uses `curl_cffi` with `impersonate="chrome124"` to bypass Cloudflare bot detection |
 | `execution/scrape_pokedata_population.py` | Scrapes grade population data from 130point.com; parallel (5 workers) |
 | `execution/calculate_flip_ev.py` | Merges price + pop data; two-track EV analysis (see below); outputs full analysis sorted by ROI |
-| `execution/run_analysis.py` | Orchestrates all steps end-to-end; supports era/set/watchlist filtering |
+| `execution/run_analysis.py` | Orchestrates all 5 steps end-to-end; supports era/set filtering and skip flags |
 
 ## Running It
 
@@ -57,11 +59,10 @@ python execution/run_analysis.py --era scarlet-violet
 # Filter to specific sets
 python execution/run_analysis.py --sets "151,Evolving Skies,Obsidian Flames"
 
-# Reuse last discovered cards (skip PokeData.io API call)
-python execution/run_analysis.py --skip-discovery
-
-# Fixed watchlist instead of discovery
-python execution/run_analysis.py --watchlist data/watchlist.csv
+# Skip expensive steps on re-runs (reuse cached intermediate files)
+python execution/run_analysis.py --skip-discovery   # reuse .tmp/discovered_cards.csv
+python execution/run_analysis.py --skip-ai-filter   # reuse .tmp/filtered_cards.csv
+python execution/run_analysis.py --skip-prices      # reuse .tmp/tcgplayer_prices.csv
 
 # Skip outputs
 python execution/run_analysis.py --skip-sheets --skip-email
@@ -167,3 +168,6 @@ Keeps: holo rares, full arts, alt arts, VMAX/VSTAR/ex/GX, secret rares, high-dem
 | 2026-05 | `.tmp/` artifact not uploaded by GitHub Actions | Added `include-hidden-files: true` to upload-artifact step |
 | 2026-05 | PokeData.io calls set "151" → "Pokemon Card 151" | Added `"Pokemon Card 151"` to `ALIASES["151"]`; added closest-match debug hint to `[SKIP]` log |
 | 2026-05 | `run_analysis.py` on main lacked AI filter after partial push overwrote it | Always verify key files on main after any push; never push partial file sets |
+| 2026-05 | 290/299 PriceCharting cards returned 403 (Cloudflare bot detection) | Switched `fetch_tcgplayer_prices.py` to `curl_cffi` with `impersonate="chrome124"`; reduced workers 8→3; added 3s backoff+retry on 403 |
+| 2026-05 | Redesigned pipeline to use PokeData.io for prices — returned 0 cards | PokeData.io `/api/cards` endpoint returns only card metadata (no prices). Reverted to PriceCharting for prices; PokeData.io used only for card discovery. |
+| 2026-05 | AI pre-filter step missing after pipeline redesign | Restored `filter_cards_ai.py` in `run_analysis.py`; it is step 2 and required for performance (cuts scraping 3,000 → 400-600 cards) |

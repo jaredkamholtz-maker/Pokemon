@@ -1,18 +1,22 @@
 """
-Full pipeline: fetch PokeData.io prices → scrape PSA population → filter → email
+Full pipeline: discover cards → AI filter → fetch prices → scrape PSA population → email
 
 Steps:
-  1. fetch_pokedata_prices: discover cards + get ungraded/PSA prices from PokeData.io
+  1. discover_cards: query PokeData.io for all cards in target sets (~3,000 cards)
+  2. filter_cards_ai: Claude Haiku pre-filter → holos, full arts, chase rares (~400-600)
+  3. fetch_tcgplayer_prices: get raw + PSA 9 + PSA 10 prices from PriceCharting
      Filter: PSA 9 or PSA 10 > $60 (configurable MIN_GRADED_PRICE)
-  2. scrape_pokedata_population: get PSA submission counts and gem rate from 130point.com
-  3. Filter: gem rate (PSA 9+10 / total) >= 50%
-  4. Email results: card name, raw price, PSA 9, PSA 10, gem rate, link
+  4. scrape_pokedata_population: get PSA submission counts and gem rate from 130point.com
+  5. calculate_flip_ev: merge prices + population, calculate ROI
+  6. Filter: gem rate >= 50% AND ROI >= 10% after $25 grading fee
+  7. Email results: card name, raw price, PSA 9, PSA 10, profit %, gem rate, link
 
 Usage:
     python execution/run_analysis.py
     python execution/run_analysis.py --era scarlet-violet
     python execution/run_analysis.py --sets "151,Evolving Skies"
-    python execution/run_analysis.py --skip-prices   # reuse last price_candidates.csv
+    python execution/run_analysis.py --skip-discovery  # reuse last discovered_cards.csv
+    python execution/run_analysis.py --skip-prices     # reuse last tcgplayer_prices.csv
     python execution/run_analysis.py --skip-sheets --skip-email
 """
 
@@ -30,10 +34,15 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-import fetch_pokedata_prices as prices_mod
+import discover_cards as discover_mod
+import filter_cards_ai as ai_filter_mod
+import fetch_tcgplayer_prices as prices_mod
 import scrape_pokedata_population as pop_mod
+import calculate_flip_ev as ev_mod
 
-PRICES_PATH = ".tmp/price_candidates.csv"
+DISCOVERED_PATH = ".tmp/discovered_cards.csv"
+FILTERED_PATH = ".tmp/filtered_cards.csv"
+PRICES_PATH = ".tmp/tcgplayer_prices.csv"
 POP_PATH = ".tmp/pokedata_population.csv"
 OUTPUT_PATH = ".tmp/flip_opportunities.csv"
 
@@ -98,12 +107,12 @@ def _fmt_pct(val) -> str:
 def format_email_body(opportunities: pd.DataFrame, today: str) -> tuple[str, str]:
     """Return (html_body, plain_body)."""
     subject_line = f"Pokemon Card Flip Opportunities — {today}"
-    count_summary = f"<strong>{len(opportunities)}</strong> cards with PSA gem rate ≥ 50%"
+    count_summary = f"<strong>{len(opportunities)}</strong> cards with PSA gem rate ≥ 50% and ROI ≥ 10%"
 
     if opportunities.empty:
         html = f"""<html><body style="font-family:sans-serif;color:#222;">
 <h2>{subject_line}</h2>
-<p>No cards met the criteria today (PSA 9/10 &gt; $60 and gem rate ≥ 50%).</p>
+<p>No cards met the criteria today (PSA 9/10 &gt; $60, gem rate ≥ 50%, ROI ≥ 10%).</p>
 </body></html>"""
         plain = f"{subject_line}\n\nNo cards met the criteria today."
         return html, plain
@@ -117,11 +126,11 @@ def format_email_body(opportunities: pd.DataFrame, today: str) -> tuple[str, str
         psa9 = _fmt_price(row.get("psa9_price"))
         psa10 = _fmt_price(row.get("psa10_price"))
         gem = _fmt_pct(row.get("gem_rate"))
+        roi = _fmt_pct(row.get("roi"))
         total = row.get("total_graded")
         total_str = f"{int(total):,}" if pd.notna(total) else "—"
         url = row.get("source_url") or ""
 
-        roi = _fmt_pct(row.get("roi_at_best_grade"))
         name_cell = f'<a href="{url}" style="color:#1a73e8;text-decoration:none;">{name}</a>' if url else name
 
         rows_html.append(f"""<tr style="border-bottom:1px solid #e5e7eb;">
@@ -163,11 +172,11 @@ def format_email_body(opportunities: pd.DataFrame, today: str) -> tuple[str, str
   </tbody>
 </table>
 <p style="font-size:12px;color:#94a3b8;margin-top:24px;">
-  Gem Rate = % of all PSA submissions that graded 9 or 10. Only cards ≥ 50% shown.
+  Profit % = ROI after $25 grading fee vs best graded price. Gem Rate = % of all PSA submissions grading 9 or 10. Only cards ≥ 50% gem rate shown.
 </p>
 </body></html>"""
 
-    plain = f"{subject_line}\n{len(opportunities)} cards with gem rate ≥ 50%\n\n"
+    plain = f"{subject_line}\n{len(opportunities)} cards with gem rate ≥ 50% and ROI ≥ 10%\n\n"
     plain += "\n\n".join(rows_plain)
     return html, plain
 
@@ -211,6 +220,8 @@ def run(
     target_sets: str = "data/target_sets.csv",
     era: str | None = None,
     sets: list[str] | None = None,
+    skip_discovery: bool = False,
+    skip_ai_filter: bool = False,
     skip_prices: bool = False,
     skip_sheets: bool = False,
     skip_email: bool = False,
@@ -220,62 +231,89 @@ def run(
 ):
     load_dotenv()
     today = date.today().isoformat()
+    grading_fee = float(os.environ.get("GRADING_FEE", 25.0))
 
     print(f"\n{'='*60}")
     print(f"Pokemon Flip Analysis  —  {today}")
     print(f"{'='*60}\n")
 
-    # Step 1: Fetch prices from PokeData.io and apply price filter
-    if skip_prices and Path(PRICES_PATH).exists():
-        n = len(pd.read_csv(PRICES_PATH))
-        print(f"[1/2] Reusing {n} price candidates from {PRICES_PATH}")
+    # Step 1: Discover cards from PokeData.io
+    if skip_discovery and Path(DISCOVERED_PATH).exists():
+        n = len(pd.read_csv(DISCOVERED_PATH))
+        print(f"[1/5] Reusing {n} discovered cards from {DISCOVERED_PATH}")
     else:
         scope = f"era={era}" if era else (f"sets={sets}" if sets else "all sets")
-        grading_fee = float(os.environ.get("GRADING_FEE", 25.0))
-        print(f"[1/2] Fetching PokeData.io prices ({scope}, "
-              f"PSA 9/10 > ${min_graded_price:.0f}, ≥{min_roi*100:.0f}% ROI after ${grading_fee:.0f} grading fee)...")
-        prices_mod.run(
-            target_sets_path=target_sets,
-            output_path=PRICES_PATH,
-            era=era,
-            sets=sets,
-            min_graded_price=min_graded_price,
-            grading_fee=grading_fee,
-            min_roi=min_roi,
-        )
+        print(f"[1/5] Discovering cards from PokeData.io ({scope})...")
+        discover_mod.run(target_sets_path=target_sets, era=era, sets=sets)
 
-    price_df = pd.read_csv(PRICES_PATH)
-    if price_df.empty:
-        print("\nNo cards passed the price filter — nothing to analyze.")
+    discovered_df = pd.read_csv(DISCOVERED_PATH)
+    print(f"  → {len(discovered_df)} cards discovered\n")
+
+    # Step 2: AI pre-filter (Claude Haiku)
+    if skip_ai_filter and Path(FILTERED_PATH).exists():
+        n = len(pd.read_csv(FILTERED_PATH))
+        print(f"[2/5] Reusing {n} AI-filtered cards from {FILTERED_PATH}")
+    else:
+        print(f"[2/5] AI pre-filtering {len(discovered_df)} cards (Claude Haiku)...")
+        filtered_df = ai_filter_mod.filter_cards(discovered_df)
+        Path(FILTERED_PATH).parent.mkdir(parents=True, exist_ok=True)
+        filtered_df.to_csv(FILTERED_PATH, index=False)
+
+    filtered_df = pd.read_csv(FILTERED_PATH)
+    print(f"  → {len(filtered_df)} cards after AI filter\n")
+
+    if filtered_df.empty:
+        print("No cards survived AI filter — nothing to analyze.")
         return pd.DataFrame()
 
-    print(f"  → {len(price_df)} candidates\n")
+    # Step 3: Fetch prices from PriceCharting
+    if skip_prices and Path(PRICES_PATH).exists():
+        n = len(pd.read_csv(PRICES_PATH))
+        print(f"[3/5] Reusing {n} price records from {PRICES_PATH}")
+    else:
+        print(f"[3/5] Fetching prices from PriceCharting ({len(filtered_df)} cards, "
+              f"PSA 9/10 > ${min_graded_price:.0f})...")
+        prices_mod.run(watchlist_path=FILTERED_PATH)
 
-    # Step 2: Scrape population data for candidates
-    print(f"[2/2] Scraping PSA population from 130point.com ({len(price_df)} cards)...")
-    pop_mod.run(PRICES_PATH)
-
-    # Join prices + population
-    pop_df = pd.read_csv(POP_PATH)
-    df = pd.merge(
-        price_df,
-        pop_df[["card_name", "set_name", "card_number", "total_graded", "psa9_count", "psa10_count", "gem_rate"]],
-        on=["card_name", "set_name", "card_number"],
-        how="left",
+    prices_df = pd.read_csv(PRICES_PATH)
+    # Apply the PSA > $60 price filter
+    has_graded = (
+        (prices_df["psa10_price"].notna() & (prices_df["psa10_price"] > min_graded_price)) |
+        (prices_df["psa9_price"].notna() & (prices_df["psa9_price"] > min_graded_price))
     )
+    prices_df = prices_df[has_graded & prices_df["raw_price"].notna()]
+    prices_df.to_csv(PRICES_PATH, index=False)
+    print(f"  → {len(prices_df)} cards with PSA 9/10 > ${min_graded_price:.0f}\n")
 
-    # Filter: gem rate >= 50%
-    has_gem = df["gem_rate"].notna()
-    opportunities = df[has_gem & (df["gem_rate"] >= min_gem_rate)].copy()
-    opportunities = opportunities.sort_values("gem_rate", ascending=False)
+    if prices_df.empty:
+        print("No cards passed the price filter — nothing to analyze.")
+        return pd.DataFrame()
 
-    # Save full results
+    # Step 4: Scrape PSA population data from 130point.com
+    print(f"[4/5] Scraping PSA population from 130point.com ({len(prices_df)} cards)...")
+    pop_mod.run(PRICES_PATH)
+    print()
+
+    # Step 5: Calculate EV
+    print(f"[5/5] Calculating flip EV...")
+    df = ev_mod.run(grading_fee=grading_fee, min_roi=min_roi)
+
+    # Apply final filters: gem rate >= 50% AND ROI >= 10%
+    has_pop = df["gem_rate"].notna() & df["roi"].notna()
+    opportunities = df[
+        has_pop &
+        (df["gem_rate"] >= min_gem_rate) &
+        (df["roi"] >= min_roi)
+    ].copy()
+    opportunities = opportunities.sort_values("roi", ascending=False)
+
+    # Save filtered results
     Path(OUTPUT_PATH).parent.mkdir(parents=True, exist_ok=True)
     opportunities.to_csv(OUTPUT_PATH, index=False)
 
     print(f"\n{'='*60}")
-    print(f"{len(opportunities)} opportunities (gem rate ≥ {min_gem_rate*100:.0f}%) "
-          f"out of {len(price_df)} price candidates")
+    print(f"{len(opportunities)} opportunities (gem rate ≥ {min_gem_rate*100:.0f}%, "
+          f"ROI ≥ {min_roi*100:.0f}%) out of {len(prices_df)} price candidates")
     print(f"{'='*60}\n")
 
     # Google Sheets
@@ -296,7 +334,8 @@ def run(
     if opportunities.empty:
         print("No cards met all criteria today.")
     else:
-        cols = ["card_name", "set_name", "raw_price", "psa9_price", "psa10_price", "gem_rate", "total_graded"]
+        cols = ["card_name", "set_name", "raw_price", "psa9_price", "psa10_price",
+                "gem_rate", "roi", "total_graded"]
         print(opportunities[[c for c in cols if c in opportunities.columns]].to_string(index=False))
 
     print(f"\nFull results saved to: {OUTPUT_PATH}")
@@ -310,14 +349,18 @@ if __name__ == "__main__":
                         help="Filter to one era: mega-evolution, sword-shield, scarlet-violet")
     parser.add_argument("--sets", default=None,
                         help="Comma-separated set names, e.g. '151,Evolving Skies'")
+    parser.add_argument("--skip-discovery", action="store_true",
+                        help="Reuse last discovered_cards.csv (skip PokeData.io API call)")
+    parser.add_argument("--skip-ai-filter", action="store_true",
+                        help="Reuse last filtered_cards.csv (skip Claude Haiku step)")
     parser.add_argument("--skip-prices", action="store_true",
-                        help="Skip price fetch and reuse last price_candidates.csv")
+                        help="Reuse last tcgplayer_prices.csv (skip PriceCharting fetch)")
     parser.add_argument("--skip-sheets", action="store_true")
     parser.add_argument("--skip-email", action="store_true")
     parser.add_argument("--min-graded-price", type=float, default=60.0,
                         help="Min PSA 9 or PSA 10 price to include a card (default: $60)")
     parser.add_argument("--min-roi", type=float, default=0.10,
-                        help="Min ROI after $25 grading fee (default: 0.10 = 10%%)")
+                        help="Min ROI after grading fee (default: 0.10 = 10%%)")
     parser.add_argument("--min-gem-rate", type=float, default=0.50,
                         help="Min gem rate to surface a card (default: 0.50 = 50%%)")
     args = parser.parse_args()
@@ -327,6 +370,8 @@ if __name__ == "__main__":
         target_sets=args.target_sets,
         era=args.era,
         sets=sets_list,
+        skip_discovery=args.skip_discovery,
+        skip_ai_filter=args.skip_ai_filter,
         skip_prices=args.skip_prices,
         skip_sheets=args.skip_sheets,
         skip_email=args.skip_email,
