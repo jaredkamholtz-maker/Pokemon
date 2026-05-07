@@ -16,28 +16,61 @@ import time
 from pathlib import Path
 
 import pandas as pd
-import requests
+
+try:
+    from curl_cffi import requests as cffi_requests
+    _SESSION = cffi_requests.Session(impersonate="chrome124")
+    _USE_CFFI = True
+except ImportError:
+    import requests as _req_fallback
+    _SESSION = _req_fallback.Session()
+    _USE_CFFI = False
 
 POKEDATA_BASE = "https://pokedata.io"
 OUTPUT_FILE = Path(".tmp/discovered_cards.csv")
 RATE_DELAY = 0.5
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 # Explicit aliases for sets whose names differ between our target_sets.csv
 # and PokeData.io's catalog. Add entries here when [SKIP] is logged.
 ALIASES: dict[str, list[str]] = {
-    "151":        ["Pokemon Card 151", "Scarlet & Violet 151", "Pokemon 151", "SV 151", "151"],
-    "Base Set 2": ["Base Set 2", "Base Set Two"],
+    "151":           ["Pokemon Card 151", "Scarlet & Violet 151", "Pokemon 151", "SV 151", "151"],
+    "Base Set 2":    ["Base Set 2", "Base Set Two"],
+    "XY":            ["XY Base Set", "XY"],
+    "BREAKthrough":  ["XY BREAKthrough", "BREAKthrough"],
+    "BREAKpoint":    ["XY BREAKpoint", "BREAKpoint"],
+    "Evolutions":    ["XY Evolutions", "Evolutions"],
+    "Generations":   ["XY Generations", "Generations"],
+    "Flashfire":     ["XY Flashfire", "Flashfire"],
+    "Furious Fists": ["XY Furious Fists", "Furious Fists"],
+    "Phantom Forces":["XY Phantom Forces", "Phantom Forces"],
+    "Primal Clash":  ["XY Primal Clash", "Primal Clash"],
+    "Roaring Skies": ["XY Roaring Skies", "Roaring Skies"],
+    "Ancient Origins":["XY Ancient Origins", "Ancient Origins"],
+    "Steam Siege":   ["XY Steam Siege", "Steam Siege"],
+    "Fates Collide": ["XY Fates Collide", "Fates Collide"],
 }
 
 
+def _get(url: str, params: dict | None = None):
+    try:
+        return _SESSION.get(url, params=params, headers=HEADERS, timeout=20, allow_redirects=True)
+    except Exception as e:
+        print(f"  Request error: {e}")
+        return None
+
+
 def get_all_sets() -> list[dict]:
-    resp = requests.get(f"{POKEDATA_BASE}/api/sets", headers=HEADERS, timeout=15)
-    resp.raise_for_status()
+    resp = _get(f"{POKEDATA_BASE}/api/sets")
+    if not resp:
+        raise RuntimeError("Failed to reach PokeData.io — no response")
+    if resp.status_code != 200:
+        raise RuntimeError(f"PokeData.io /api/sets returned {resp.status_code} — may be blocked")
     data = resp.json()
     return data if isinstance(data, list) else data.get("sets", data.get("data", []))
 
@@ -81,13 +114,9 @@ def find_set_id(target_name: str, all_sets: list[dict]) -> int | None:
 
 
 def get_cards_for_set(set_id: int) -> list[dict]:
-    resp = requests.get(
-        f"{POKEDATA_BASE}/api/cards",
-        params={"set_id": set_id, "limit": 1000},
-        headers=HEADERS,
-        timeout=20,
-    )
-    resp.raise_for_status()
+    resp = _get(f"{POKEDATA_BASE}/api/cards", params={"set_id": set_id, "limit": 1000})
+    if not resp or resp.status_code != 200:
+        return []
     data = resp.json()
     if isinstance(data, list):
         return data
@@ -101,7 +130,6 @@ def run(target_sets_path: str = "data/target_sets.csv",
     target_df = pd.read_csv(target_sets_path)
 
     if sets:
-        # Exact set names take priority
         target_df = target_df[target_df["set_name"].isin(sets)]
         if target_df.empty:
             raise ValueError(f"None of the requested sets found in {target_sets_path}: {sets}")
@@ -110,24 +138,24 @@ def run(target_sets_path: str = "data/target_sets.csv",
             raise ValueError(f"'era' column missing from {target_sets_path}")
         target_df = target_df[target_df["era"] == era]
         if target_df.empty:
-            available = target_df["era"].unique().tolist() if "era" in target_df.columns else []
-            raise ValueError(f"No sets found for era '{era}'. Available: {available}")
+            raise ValueError(f"No sets found for era '{era}'")
 
     set_names = target_df["set_name"].tolist()
 
-    print(f"Fetching PokeData.io set catalog...")
+    print(f"Fetching PokeData.io set catalog (curl_cffi={'yes' if _USE_CFFI else 'no'})...")
     all_sets = get_all_sets()
     print(f"  {len(all_sets)} sets in catalog")
 
     rows = []
+    skipped = []
     for set_name in set_names:
         set_id = find_set_id(set_name, all_sets)
         if not set_id:
-            # Show closest matches to help diagnose alias issues
             close = [s.get("name") for s in all_sets
                      if set_name.lower()[:4] in s.get("name", "").lower()][:5]
             hint = f" — closest: {close}" if close else ""
             print(f"  [SKIP] '{set_name}' not found in PokeData.io catalog{hint}")
+            skipped.append(set_name)
             continue
 
         print(f"  Fetching {set_name} (set_id={set_id})...", end=" ", flush=True)
@@ -144,10 +172,13 @@ def run(target_sets_path: str = "data/target_sets.csv",
         except Exception as e:
             print(f"ERROR: {e}")
 
-    df = pd.DataFrame(rows)
+    if skipped:
+        print(f"\n  {len(skipped)} sets skipped. Add aliases to ALIASES dict in discover_cards.py")
+
+    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["card_name", "set_name", "card_number"])
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_path, index=False)
-    print(f"\nDiscovered {len(df)} cards across {len(set_names)} target sets → {output_path}")
+    print(f"\nDiscovered {len(df)} cards across {len(set_names) - len(skipped)} sets → {output_path}")
     return df
 
 
@@ -156,7 +187,7 @@ if __name__ == "__main__":
     parser.add_argument("--target-sets", default="data/target_sets.csv")
     parser.add_argument("--output", default=str(OUTPUT_FILE))
     parser.add_argument("--era", default=None,
-                        help="Filter by era (vintage, sword-shield, scarlet-violet)")
+                        help="Filter by era (mega-evolution, sword-shield, scarlet-violet)")
     parser.add_argument("--sets", default=None,
                         help="Comma-separated set names, e.g. '151,Evolving Skies'")
     args = parser.parse_args()
