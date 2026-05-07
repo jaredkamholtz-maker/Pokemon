@@ -4,10 +4,10 @@ Full pipeline: fetch PokeData.io prices → scrape PSA population → filter →
 Steps:
   1. fetch_pokedata_prices: discover cards + get ungraded/PSA prices from PokeData.io
      Filter A: PSA 9 or PSA 10 > $60 (MIN_GRADED_PRICE)
-     Filter B: (best_graded - raw - grading_fee) / (raw + grading_fee) >= 50% (MIN_ROI)
+     Filter B: (best_graded - raw - grading_fee) / (raw + grading_fee) >= 10% (MIN_ROI)
   2. scrape_pokedata_population: get PSA submission counts and gem rate from 130point.com
   3. Filter C: gem rate (PSA 9+10 / total submitted) >= 50%
-  4. Email results: card name, raw price, PSA 9, PSA 10, gem rate, link
+  4. Email results: card name, raw price, PSA 9, PSA 10, profit %, gem rate, link
 
 Usage:
     python execution/run_analysis.py
@@ -104,7 +104,7 @@ def format_email_body(opportunities: pd.DataFrame, today: str) -> tuple[str, str
     if opportunities.empty:
         html = f"""<html><body style="font-family:sans-serif;color:#222;">
 <h2>{subject_line}</h2>
-<p>No cards met the criteria today (PSA 9/10 &gt; $60, ≥50% ROI after grading, and gem rate ≥ 50%).</p>
+<p>No cards met the criteria today (PSA 9/10 &gt; $60, ≥10% profit after grading, and gem rate ≥ 50%).</p>
 </body></html>"""
         plain = f"{subject_line}\n\nNo cards met the criteria today."
         return html, plain
@@ -117,6 +117,7 @@ def format_email_body(opportunities: pd.DataFrame, today: str) -> tuple[str, str
         raw = _fmt_price(row.get("raw_price"))
         psa9 = _fmt_price(row.get("psa9_price"))
         psa10 = _fmt_price(row.get("psa10_price"))
+        roi = _fmt_pct(row.get("roi_at_best_grade"))
         gem = _fmt_pct(row.get("gem_rate"))
         total = row.get("total_graded")
         total_str = f"{int(total):,}" if pd.notna(total) else "—"
@@ -130,6 +131,7 @@ def format_email_body(opportunities: pd.DataFrame, today: str) -> tuple[str, str
   <td style="padding:10px 14px;text-align:right;">{raw}</td>
   <td style="padding:10px 14px;text-align:right;">{psa9}</td>
   <td style="padding:10px 14px;text-align:right;font-weight:600;color:#15803d;">{psa10}</td>
+  <td style="padding:10px 14px;text-align:right;font-weight:700;color:#1d4ed8;">{roi}</td>
   <td style="padding:10px 14px;text-align:right;font-weight:700;color:#15803d;">{gem}</td>
   <td style="padding:10px 14px;text-align:right;color:#6b7280;">{total_str}</td>
 </tr>""")
@@ -137,12 +139,12 @@ def format_email_body(opportunities: pd.DataFrame, today: str) -> tuple[str, str
         link_text = f"\n  {url}" if url else ""
         rows_plain.append(
             f"#{rank} {name} | {set_name}\n"
-            f"  Raw: {raw}  PSA9: {psa9}  PSA10: {psa10}  Gem Rate: {gem}  "
+            f"  Raw: {raw}  PSA9: {psa9}  PSA10: {psa10}  Profit: {roi}  Gem Rate: {gem}  "
             f"Total Graded: {total_str}{link_text}"
         )
 
     table_rows = "\n".join(rows_html)
-    html = f"""<html><body style="font-family:sans-serif;color:#222;max-width:860px;margin:0 auto;">
+    html = f"""<html><body style="font-family:sans-serif;color:#222;max-width:900px;margin:0 auto;">
 <h2 style="color:#1e293b;">{subject_line}</h2>
 <p style="color:#64748b;">{count_summary}</p>
 <table style="width:100%;border-collapse:collapse;font-size:14px;">
@@ -152,6 +154,7 @@ def format_email_body(opportunities: pd.DataFrame, today: str) -> tuple[str, str
       <th style="padding:10px 14px;text-align:right;">Raw (Ungraded)</th>
       <th style="padding:10px 14px;text-align:right;">PSA 9</th>
       <th style="padding:10px 14px;text-align:right;">PSA 10</th>
+      <th style="padding:10px 14px;text-align:right;">Profit %</th>
       <th style="padding:10px 14px;text-align:right;">Gem Rate</th>
       <th style="padding:10px 14px;text-align:right;">Total Graded</th>
     </tr>
@@ -161,7 +164,8 @@ def format_email_body(opportunities: pd.DataFrame, today: str) -> tuple[str, str
   </tbody>
 </table>
 <p style="font-size:12px;color:#94a3b8;margin-top:24px;">
-  Gem Rate = % of all PSA submissions that graded 9 or 10. Only cards ≥ 50% shown.
+  Profit % = ROI after $25 grading fee vs best graded price &nbsp;|&nbsp;
+  Gem Rate = % of PSA submissions grading 9 or 10 (only ≥ 50% shown)
 </p>
 </body></html>"""
 
@@ -213,7 +217,7 @@ def run(
     skip_sheets: bool = False,
     skip_email: bool = False,
     min_graded_price: float = 60.0,
-    min_roi: float = 0.50,
+    min_roi: float = 0.10,
     min_gem_rate: float = 0.50,
 ):
     load_dotenv()
@@ -294,7 +298,8 @@ def run(
     if opportunities.empty:
         print("No cards met all criteria today.")
     else:
-        cols = ["card_name", "set_name", "raw_price", "psa9_price", "psa10_price", "gem_rate", "total_graded"]
+        cols = ["card_name", "set_name", "raw_price", "psa9_price", "psa10_price",
+                "roi_at_best_grade", "gem_rate", "total_graded"]
         print(opportunities[[c for c in cols if c in opportunities.columns]].to_string(index=False))
 
     print(f"\nFull results saved to: {OUTPUT_PATH}")
@@ -314,8 +319,8 @@ if __name__ == "__main__":
     parser.add_argument("--skip-email", action="store_true")
     parser.add_argument("--min-graded-price", type=float, default=60.0,
                         help="Min PSA 9 or PSA 10 price to include a card (default: $60)")
-    parser.add_argument("--min-roi", type=float, default=0.50,
-                        help="Min ROI after $25 grading fee (default: 0.50 = 50%%)")
+    parser.add_argument("--min-roi", type=float, default=0.10,
+                        help="Min ROI after $25 grading fee (default: 0.10 = 10%%)")
     parser.add_argument("--min-gem-rate", type=float, default=0.50,
                         help="Min gem rate to surface a card (default: 0.50 = 50%%)")
     args = parser.parse_args()
