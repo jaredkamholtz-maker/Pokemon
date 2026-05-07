@@ -82,41 +82,101 @@ def push_to_google_sheets(df: pd.DataFrame, spreadsheet_id: str, tab_name: str) 
 
 # ── Email ──────────────────────────────────────────────────────────────────────
 
-def format_email_body(opportunities: pd.DataFrame, all_analyzed: int, today: str) -> str:
-    lines = [
-        f"Pokemon Card Flip Opportunities — {today}",
-        f"Analyzed {all_analyzed} cards | {len(opportunities)} passed filters",
-        "=" * 60,
-        "",
-    ]
+def _fmt_price(val) -> str:
+    try:
+        return f"${float(val):.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _fmt_pct(val) -> str:
+    try:
+        return f"{float(val) * 100:.1f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def format_email_body(opportunities: pd.DataFrame, all_analyzed: int, today: str) -> tuple[str, str]:
+    """Return (html_body, plain_text_body) for the email."""
+    subject_line = f"Pokemon Card Flip Opportunities — {today}"
+    summary = f"Analyzed {all_analyzed} cards &nbsp;|&nbsp; <strong>{len(opportunities)} passed filters</strong>"
 
     if opportunities.empty:
-        lines.append("No cards met the ROI/gem-rate criteria today.")
-        return "\n".join(lines)
+        html = f"""<html><body style="font-family:sans-serif;color:#222;">
+<h2>{subject_line}</h2>
+<p>{summary}</p>
+<p>No cards met the ROI/gem-rate criteria today.</p>
+</body></html>"""
+        plain = f"{subject_line}\nAnalyzed {all_analyzed} cards | {len(opportunities)} passed filters\n\nNo cards met the ROI/gem-rate criteria today."
+        return html, plain
 
+    rows_html = []
+    rows_plain = []
     for rank, (_, row) in enumerate(opportunities.iterrows(), 1):
-        lines.append(f"#{rank}  {row.get('card_name', '?')}  |  {row.get('set_name', '?')}")
-        lines.append(
-            f"    Raw: ${row.get('raw_price', 0):.2f}  →  "
-            f"PSA9: ${row.get('psa9_price', 0):.2f}  "
-            f"PSA10: ${row.get('psa10_price', 0):.2f}"
+        name = row.get("card_name", "?")
+        set_name = row.get("set_name", "?")
+        raw = _fmt_price(row.get("raw_price"))
+        psa9 = _fmt_price(row.get("psa9_price"))
+        psa10 = _fmt_price(row.get("psa10_price"))
+        profit = _fmt_price(row.get("profit"))
+        roi = _fmt_pct(row.get("roi"))
+        gem = _fmt_pct(row.get("gem_rate"))
+        url = row.get("source_url") or ""
+        low = row.get("low_data")
+
+        name_cell = f'<a href="{url}" style="color:#1a73e8;text-decoration:none;">{name}</a>' if url else name
+        low_badge = ' <span style="color:#b45309;font-size:11px;">⚠ low data</span>' if low else ""
+
+        rows_html.append(f"""<tr style="border-bottom:1px solid #e5e7eb;">
+  <td style="padding:10px 14px;font-weight:500;">{rank}. {name_cell}{low_badge}<br>
+    <span style="font-size:12px;color:#6b7280;">{set_name}</span></td>
+  <td style="padding:10px 14px;text-align:right;">{raw}</td>
+  <td style="padding:10px 14px;text-align:right;">{psa9}</td>
+  <td style="padding:10px 14px;text-align:right;font-weight:600;color:#15803d;">{psa10}</td>
+  <td style="padding:10px 14px;text-align:right;">{gem}</td>
+  <td style="padding:10px 14px;text-align:right;font-weight:600;color:#15803d;">{profit}</td>
+  <td style="padding:10px 14px;text-align:right;font-weight:700;color:#15803d;">{roi}</td>
+</tr>""")
+
+        link_text = f"  {url}" if url else ""
+        low_note = "  ⚠ low data" if low else ""
+        rows_plain.append(
+            f"#{rank} {name} | {set_name}\n"
+            f"  Raw: {raw}  PSA9: {psa9}  PSA10: {psa10}  Gem: {gem}  Profit: {profit}  ROI: {roi}"
+            f"{low_note}{link_text}"
         )
-        lines.append(
-            f"    Gem rate: {float(row.get('gem_rate', 0)) * 100:.1f}%  |  "
-            f"Pop: {int(row.get('total_graded', 0)):,}  |  "
-            f"Expected profit: ${row.get('profit', 0):.2f}  |  "
-            f"ROI: {float(row.get('roi', 0)) * 100:.1f}%"
-        )
-        if row.get("low_data"):
-            lines.append("    ⚠ Low data (<50 graded) — gem rate may not be reliable")
-        if row.get("source_url"):
-            lines.append(f"    source: {row['source_url']}")
-        lines.append("")
 
-    return "\n".join(lines)
+    table_rows = "\n".join(rows_html)
+    html = f"""<html><body style="font-family:sans-serif;color:#222;max-width:900px;margin:0 auto;">
+<h2 style="color:#1e293b;">{subject_line}</h2>
+<p style="color:#64748b;">{summary}</p>
+<table style="width:100%;border-collapse:collapse;font-size:14px;">
+  <thead>
+    <tr style="background:#f1f5f9;text-align:left;">
+      <th style="padding:10px 14px;">Card</th>
+      <th style="padding:10px 14px;text-align:right;">Raw</th>
+      <th style="padding:10px 14px;text-align:right;">PSA 9</th>
+      <th style="padding:10px 14px;text-align:right;">PSA 10</th>
+      <th style="padding:10px 14px;text-align:right;">Gem Rate</th>
+      <th style="padding:10px 14px;text-align:right;">Profit</th>
+      <th style="padding:10px 14px;text-align:right;">ROI</th>
+    </tr>
+  </thead>
+  <tbody>
+{table_rows}
+  </tbody>
+</table>
+<p style="font-size:12px;color:#94a3b8;margin-top:24px;">
+  Raw = ungraded market price &nbsp;|&nbsp; Profit and ROI assume {_fmt_pct(os.environ.get('SELLING_FEE_RATE', 0.13))} selling fee + grading cost
+</p>
+</body></html>"""
+
+    plain = f"{subject_line}\nAnalyzed {all_analyzed} cards | {len(opportunities)} passed filters\n\n"
+    plain += "\n\n".join(rows_plain)
+    return html, plain
 
 
-def send_email(body: str, subject: str) -> bool:
+def send_email(html_body: str, plain_body: str, subject: str) -> bool:
     load_dotenv()
     smtp_host = os.environ.get("SMTP_HOST")
     smtp_port = int(os.environ.get("SMTP_PORT", 587))
@@ -135,7 +195,8 @@ def send_email(body: str, subject: str) -> bool:
     msg["Subject"] = subject
     msg["From"] = smtp_user
     msg["To"] = ", ".join(recipients)
-    msg.attach(MIMEText(body, "plain"))
+    msg.attach(MIMEText(plain_body, "plain"))
+    msg.attach(MIMEText(html_body, "html"))  # HTML part last — preferred by email clients
 
     try:
         with smtplib.SMTP(smtp_host, smtp_port) as server:
@@ -227,9 +288,9 @@ def run(
 
     # Email
     if not skip_email:
-        body = format_email_body(opportunities, len(all_df), today)
+        html_body, plain_body = format_email_body(opportunities, len(all_df), today)
         subject = f"[Pokemon Flip] {len(opportunities)} opportunities — {today}"
-        send_email(body, subject)
+        send_email(html_body, plain_body, subject)
 
     # Print top opportunities
     if opportunities.empty:
