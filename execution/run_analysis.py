@@ -97,14 +97,16 @@ def push_to_google_sheets(df: pd.DataFrame, spreadsheet_id: str, tab_name: str) 
 
 def _fmt_price(val) -> str:
     try:
-        return f"${float(val):.2f}"
+        f = float(val)
+        return "—" if f != f else f"${f:.2f}"  # f != f is True only for NaN
     except (TypeError, ValueError):
         return "—"
 
 
 def _fmt_pct(val) -> str:
     try:
-        return f"{float(val) * 100:.1f}%"
+        f = float(val)
+        return "—" if f != f else f"{f * 100:.1f}%"
     except (TypeError, ValueError):
         return "—"
 
@@ -134,10 +136,26 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         raw = _fmt_price(row.get("raw_price"))
         psa9 = _fmt_price(row.get("psa9_price"))
         psa10 = _fmt_price(row.get("psa10_price"))
-        gem = _fmt_pct(row.get("gem_rate"))
-        roi = _fmt_pct(row.get("roi"))
+        is_breakeven = row.get("track") == "breakeven"
+        # Gem rate: use historical data if available, else show breakeven threshold
+        gem_val = row.get("gem_rate")
+        if pd.notna(gem_val) and gem_val == gem_val:
+            gem = _fmt_pct(gem_val)
+        elif is_breakeven:
+            be = row.get("breakeven_gem_rate")
+            gem = f"BE ≤ {_fmt_pct(be)}" if pd.notna(be) and be == be else "No data"
+        else:
+            gem = "—"
+        # Profit %: use ROI if available, else label as breakeven opportunity
+        roi_val = row.get("roi")
+        if pd.notna(roi_val) and roi_val == roi_val:
+            roi = _fmt_pct(roi_val)
+        elif is_breakeven:
+            roi = "breakeven play"
+        else:
+            roi = "—"
         total = row.get("total_graded")
-        total_str = f"{int(total):,}" if pd.notna(total) else "—"
+        total_str = f"{int(total):,}" if pd.notna(total) and total == total else "No data"
         url = row.get("source_url") or ""
         ebay_url = row.get("ebay_listing_url") or ""
 
