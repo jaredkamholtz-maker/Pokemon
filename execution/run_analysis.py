@@ -472,7 +472,7 @@ def run(
     # Email
     if not skip_email:
         html_body, plain_body = format_email_body(final, today, has_image_analysis=has_image_analysis)
-        subject = f"[Pokemon Flip] {len(final)} opportunities — {today}"
+        subject = f"Your {today} Pokenalysis: {len(final)} Opportunit{'y' if len(final) == 1 else 'ies'} Found"
         send_email(html_body, plain_body, subject)
 
     # Print summary
