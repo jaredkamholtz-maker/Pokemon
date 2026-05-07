@@ -419,13 +419,36 @@ def run(
     if not skip_images and not opportunities.empty:
         print(f"[6/6] Analyzing eBay listing photos (top {image_top_n} cards, Claude Vision)...")
         shortlist = images_mod.run(input_path=OUTPUT_PATH, top_n=image_top_n)
+
+        # Always read analysis results to get specific eBay listing URLs
+        analysis_csv = Path(".tmp/image_analysis.csv")
+        if analysis_csv.exists():
+            analysis_df = pd.read_csv(analysis_csv)
+            # Build card → specific listing URL lookup from analysis
+            if "ebay_listing_url" in analysis_df.columns:
+                url_lookup = {
+                    (r["card_name"], r["set_name"]): r["ebay_listing_url"]
+                    for _, r in analysis_df.iterrows()
+                    if pd.notna(r.get("ebay_listing_url"))
+                }
+            else:
+                url_lookup = {}
+        else:
+            url_lookup = {}
+
         if not shortlist.empty:
             final = shortlist
             has_image_analysis = True
             Path(SHORTLIST_PATH).parent.mkdir(parents=True, exist_ok=True)
             shortlist.to_csv(SHORTLIST_PATH, index=False)
         else:
-            print("  No cards passed image analysis — falling back to full opportunity list.")
+            print("  No cards passed image analysis — using full opportunity list with best listing links.")
+            # Merge specific listing URLs into opportunities even for SKIP cards
+            final = opportunities.copy()
+            if url_lookup:
+                final["ebay_listing_url"] = final.apply(
+                    lambda r: url_lookup.get((r["card_name"], r["set_name"])), axis=1
+                )
         print()
     elif skip_images:
         print("[6/6] Skipping image analysis (--skip-images)\n")
