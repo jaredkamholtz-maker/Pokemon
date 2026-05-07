@@ -121,6 +121,7 @@ def format_email_body(opportunities: pd.DataFrame, today: str) -> tuple[str, str
         total_str = f"{int(total):,}" if pd.notna(total) else "—"
         url = row.get("source_url") or ""
 
+        roi = _fmt_pct(row.get("roi_at_best_grade"))
         name_cell = f'<a href="{url}" style="color:#1a73e8;text-decoration:none;">{name}</a>' if url else name
 
         rows_html.append(f"""<tr style="border-bottom:1px solid #e5e7eb;">
@@ -129,6 +130,7 @@ def format_email_body(opportunities: pd.DataFrame, today: str) -> tuple[str, str
   <td style="padding:10px 14px;text-align:right;">{raw}</td>
   <td style="padding:10px 14px;text-align:right;">{psa9}</td>
   <td style="padding:10px 14px;text-align:right;font-weight:600;color:#15803d;">{psa10}</td>
+  <td style="padding:10px 14px;text-align:right;font-weight:700;color:#1d4ed8;">{roi}</td>
   <td style="padding:10px 14px;text-align:right;font-weight:700;color:#15803d;">{gem}</td>
   <td style="padding:10px 14px;text-align:right;color:#6b7280;">{total_str}</td>
 </tr>""")
@@ -136,7 +138,7 @@ def format_email_body(opportunities: pd.DataFrame, today: str) -> tuple[str, str
         link_text = f"\n  {url}" if url else ""
         rows_plain.append(
             f"#{rank} {name} | {set_name}\n"
-            f"  Raw: {raw}  PSA9: {psa9}  PSA10: {psa10}  Gem Rate: {gem}  "
+            f"  Raw: {raw}  PSA9: {psa9}  PSA10: {psa10}  Profit: {roi}  Gem Rate: {gem}  "
             f"Total Graded: {total_str}{link_text}"
         )
 
@@ -151,6 +153,7 @@ def format_email_body(opportunities: pd.DataFrame, today: str) -> tuple[str, str
       <th style="padding:10px 14px;text-align:right;">Raw (Ungraded)</th>
       <th style="padding:10px 14px;text-align:right;">PSA 9</th>
       <th style="padding:10px 14px;text-align:right;">PSA 10</th>
+      <th style="padding:10px 14px;text-align:right;">Profit %</th>
       <th style="padding:10px 14px;text-align:right;">Gem Rate</th>
       <th style="padding:10px 14px;text-align:right;">Total Graded</th>
     </tr>
@@ -212,7 +215,7 @@ def run(
     skip_sheets: bool = False,
     skip_email: bool = False,
     min_graded_price: float = 60.0,
-    min_roi: float = 0.50,
+    min_roi: float = 0.10,
     min_gem_rate: float = 0.50,
 ):
     load_dotenv()
@@ -313,8 +316,8 @@ if __name__ == "__main__":
     parser.add_argument("--skip-email", action="store_true")
     parser.add_argument("--min-graded-price", type=float, default=60.0,
                         help="Min PSA 9 or PSA 10 price to include a card (default: $60)")
-    parser.add_argument("--min-roi", type=float, default=0.50,
-                        help="Min ROI after $25 grading fee (default: 0.50 = 50%%)")
+    parser.add_argument("--min-roi", type=float, default=0.10,
+                        help="Min ROI after $25 grading fee (default: 0.10 = 10%%)")
     parser.add_argument("--min-gem-rate", type=float, default=0.50,
                         help="Min gem rate to surface a card (default: 0.50 = 50%%)")
     args = parser.parse_args()

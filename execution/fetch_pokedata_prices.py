@@ -252,7 +252,7 @@ def run(
     sets: list[str] | None = None,
     min_graded_price: float = 60.0,
     grading_fee: float = 25.0,
-    min_roi: float = 0.50,
+    min_roi: float = 0.10,
     max_workers: int = 5,
 ) -> pd.DataFrame:
     load_dotenv()
@@ -343,8 +343,8 @@ if __name__ == "__main__":
                         help="Min PSA 9 or PSA 10 price to include a card (default: $60)")
     parser.add_argument("--grading-fee", type=float, default=25.0,
                         help="PSA grading fee in USD (default: $25)")
-    parser.add_argument("--min-roi", type=float, default=0.50,
-                        help="Min ROI after grading fee, e.g. 0.50 = 50%% (default: 0.50)")
+    parser.add_argument("--min-roi", type=float, default=0.10,
+                        help="Min ROI after grading fee, e.g. 0.10 = 10%% (default: 0.10)")
     args = parser.parse_args()
     sets_list = [s.strip() for s in args.sets.split(",")] if args.sets else None
     run(
