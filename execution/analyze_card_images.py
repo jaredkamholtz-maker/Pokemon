@@ -45,8 +45,9 @@ OUTPUT_SHORTLIST = Path(".tmp/final_shortlist.csv")
 DEBUG_DIR = Path(".tmp/debug_ebay")
 
 EBAY_SEARCH_URL = "https://www.ebay.com/sch/i.html"
-MAX_IMAGES = 5       # images to send to Claude per card
-RATE_DELAY = 1.5     # seconds between eBay requests
+MAX_IMAGES = 5          # images to send to Claude per card
+MAX_LISTINGS = 5        # eBay listings to evaluate per card
+RATE_DELAY = 1.5        # seconds between eBay requests
 MODEL = "claude-sonnet-4-6"
 
 GRADING_PROMPT = """You are an experienced PSA grader examining a Pokemon card listed for sale on eBay.
@@ -111,62 +112,89 @@ def _is_graded_title(title: str) -> bool:
     return any(kw in t for kw in ["psa ", "psa-", "bgs ", "cgc ", "sgc ", "graded", "gem mint"])
 
 
-def search_ebay_listing(card_name: str, set_name: str) -> dict | None:
+def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
     """
-    Search eBay for the cheapest active raw/ungraded Buy-It-Now listing.
-    Returns dict with keys: title, price, listing_url, image_urls  — or None.
+    Search eBay for raw/ungraded Buy-It-Now listings, sorted cheapest first.
+    Returns up to MAX_LISTINGS candidates, each with: title, price, url.
     """
     query = f"{card_name} {set_name} pokemon raw ungraded"
     params = {
         "_nkw": query,
-        "LH_BIN": "1",          # Buy It Now only
-        "_sop": "15",           # sort by lowest price + shipping
-        "LH_ItemCondition": "3000",  # Used condition
+        "LH_BIN": "1",
+        "_sop": "15",
+        "LH_ItemCondition": "3000",
     }
 
     resp = _get(EBAY_SEARCH_URL, params=params)
     if not resp or resp.status_code != 200:
-        return None
+        return []
 
     _save_debug(f"search_{re.sub(r'[^a-z0-9]', '_', card_name.lower())}.html", resp.text)
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    items = soup.select("li.s-item, div.s-item")
-
     candidates = []
-    for item in items:
+    for item in soup.select("li.s-item, div.s-item"):
         title_el = item.select_one(".s-item__title, h3.s-item__title")
         price_el = item.select_one(".s-item__price")
         link_el = item.select_one("a.s-item__link, a[href*='itm/']")
 
         if not title_el or not link_el:
             continue
-
         title = title_el.get_text(strip=True)
-        if _is_graded_title(title):
+        if _is_graded_title(title) or "shop on ebay" in title.lower():
             continue
-        if "shop on ebay" in title.lower():
-            continue
-
         href = link_el.get("href", "")
         if not href or "itm/" not in href:
             continue
 
         price = 0.0
         if price_el:
-            raw = price_el.get_text(strip=True).replace(",", "")
-            m = re.search(r"(\d+\.?\d*)", raw)
+            m = re.search(r"(\d+\.?\d*)", price_el.get_text(strip=True).replace(",", ""))
             if m:
                 price = float(m.group(1))
 
-        candidates.append({"title": title, "price": price, "url": href.split("?")[0]})
+        if price > 0:
+            candidates.append({"title": title, "price": price, "url": href.split("?")[0]})
 
-    if not candidates:
-        return None
+    # Return cheapest MAX_LISTINGS listings
+    candidates.sort(key=lambda c: c["price"])
+    return candidates[:MAX_LISTINGS]
 
-    # Pick cheapest listing that has a positive price
-    best = min((c for c in candidates if c["price"] > 0), key=lambda c: c["price"], default=candidates[0])
-    return best
+
+def pick_best_listing(card_name: str, set_name: str, listings: list[dict]) -> tuple[dict | None, dict]:
+    """
+    Analyze photos from each listing with Claude Vision and return the best one.
+    Best = highest psa9_or_better_probability among SUBMIT candidates.
+    Falls back to highest-scoring listing if none are SUBMIT.
+
+    Returns (winning_listing, analysis_dict).
+    """
+    best_listing = None
+    best_analysis: dict = {"recommendation": "SKIP"}
+    best_score = -1
+
+    for i, listing in enumerate(listings, 1):
+        print(f"  Listing {i}/{len(listings)} (${listing['price']:.2f})...", end=" ", flush=True)
+        time.sleep(RATE_DELAY)
+        image_urls = get_listing_images(listing["url"])
+        if not image_urls:
+            print("no images")
+            continue
+        print(f"{len(image_urls)} images → analyzing...", end=" ", flush=True)
+        analysis = analyze_images(card_name, set_name, image_urls)
+        rec = analysis.get("recommendation", "SKIP")
+        prob = analysis.get("psa9_or_better_probability") or 0
+        print(f"{rec} (PSA 9+ prob: {prob}%)")
+
+        # SUBMIT beats SKIP; within same recommendation, higher probability wins
+        submit_bonus = 1000 if rec == "SUBMIT" else 0
+        score = submit_bonus + prob
+        if score > best_score:
+            best_score = score
+            best_listing = listing
+            best_analysis = analysis
+
+    return best_listing, best_analysis
 
 
 def get_listing_images(listing_url: str) -> list[str]:
@@ -325,34 +353,27 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
             "error": None,
         }
 
-        # Step 1: Find eBay listing
+        # Step 1: Find eBay listings (up to MAX_LISTINGS cheapest raw copies)
         print(f"  Searching eBay...", end=" ", flush=True)
         time.sleep(RATE_DELAY)
-        listing = search_ebay_listing(card_name, set_name)
-        if not listing:
-            result["error"] = "No eBay listing found"
-            print("not found")
-            rows.append(result)
-            continue
-
-        result["ebay_listing_url"] = listing["url"]
-        result["ebay_price"] = listing["price"]
-        print(f"found at ${listing['price']:.2f}")
-
-        # Step 2: Get listing images
-        print(f"  Fetching images...", end=" ", flush=True)
-        image_urls = get_listing_images(listing["url"])
-        if not image_urls:
-            result["error"] = "No images found on listing page"
+        listings = search_ebay_listings(card_name, set_name)
+        if not listings:
+            result["error"] = "No eBay listings found"
             print("none found")
             rows.append(result)
             continue
-        print(f"{len(image_urls)} images")
+        print(f"{len(listings)} listings found (${listings[0]['price']:.2f}–${listings[-1]['price']:.2f})")
 
-        # Step 3: Analyze with Claude Vision
-        print(f"  Analyzing with Claude Vision...", end=" ", flush=True)
-        analysis = analyze_images(card_name, set_name, image_urls)
+        # Step 2 & 3: Fetch images for each listing and pick best via Claude Vision
+        best_listing, analysis = pick_best_listing(card_name, set_name, listings)
 
+        if not best_listing:
+            result["error"] = "No images found across any listing"
+            rows.append(result)
+            continue
+
+        result["ebay_listing_url"] = best_listing["url"]
+        result["ebay_price"] = best_listing["price"]
         result.update({
             "images_analyzed": analysis.get("images_analyzed", 0),
             "centering": analysis.get("centering"),
@@ -371,7 +392,7 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
         rec = result["recommendation"]
         grade = result.get("predicted_grade", "?")
         psa9p = result.get("psa9_or_better_probability", "?")
-        print(f"{rec} (predicted grade: {grade}, PSA 9+ probability: {psa9p}%)")
+        print(f"  → Best pick: ${best_listing['price']:.2f} | {rec} (predicted grade: {grade}, PSA 9+: {psa9p}%)")
 
         rows.append(result)
 
