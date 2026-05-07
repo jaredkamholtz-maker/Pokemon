@@ -183,7 +183,14 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         notes = row.get("notes") or ""
 
         card_link = f'<a href="{url}" style="color:#1a73e8;text-decoration:none;">{name}</a>' if url else name
-        ebay_link = f' <a href="{buy_url}" style="font-size:11px;color:#e67e00;font-weight:600;">[Buy on eBay]</a>'
+        if ebay_listing_url:
+            # Specific listing Claude analyzed + search fallback in case it sold
+            ebay_link = (
+                f' <a href="{ebay_listing_url}" style="font-size:11px;color:#e67e00;font-weight:600;">[Buy this listing]</a>'
+                f' <a href="{ebay_search_url}" style="font-size:11px;color:#6b7280;">[Search if sold]</a>'
+            )
+        else:
+            ebay_link = f' <a href="{ebay_search_url}" style="font-size:11px;color:#e67e00;font-weight:600;">[Find on eBay]</a>'
 
         image_cells = ""
         image_plain = ""
