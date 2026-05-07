@@ -8,7 +8,7 @@ Steps:
      Filter: PSA 9 or PSA 10 > $60 (configurable MIN_GRADED_PRICE)
   4. scrape_pokedata_population: get PSA submission counts and gem rate from 130point.com
   5. calculate_flip_ev: merge prices + population, calculate ROI
-     Filter: gem rate >= 50% AND ROI >= 10% after $25 grading fee
+     Filter: gem rate >= 35% AND ROI >= 10% after $25 grading fee
   6. analyze_card_images: find cheapest eBay raw listing per top-20 card, analyze photos
      with Claude Vision, keep only SUBMIT cards
   7. Email final shortlist: card, raw price, PSA 9/10, profit %, gem rate, predicted grade
@@ -116,12 +116,12 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         count_summary = (f"<strong>{len(opportunities)}</strong> cards passed all filters "
                          f"including eBay photo analysis (Claude Vision)")
     else:
-        count_summary = f"<strong>{len(opportunities)}</strong> cards with PSA gem rate ≥ 50% and ROI ≥ 10%"
+        count_summary = f"<strong>{len(opportunities)}</strong> cards with PSA gem rate ≥ 35% and ROI ≥ 10%"
 
     if opportunities.empty:
         html = f"""<html><body style="font-family:sans-serif;color:#222;">
 <h2>{subject_line}</h2>
-<p>No cards met the criteria today (PSA 9/10 &gt; $60, gem rate ≥ 50%, ROI ≥ 10%).</p>
+<p>No cards met the criteria today (PSA 9/10 &gt; $60, gem rate ≥ 35%, ROI ≥ 10%).</p>
 </body></html>"""
         plain = f"{subject_line}\n\nNo cards met the criteria today."
         return html, plain
@@ -271,7 +271,7 @@ def run(
     skip_email: bool = False,
     min_graded_price: float = 60.0,
     min_roi: float = 0.10,
-    min_gem_rate: float = 0.50,
+    min_gem_rate: float = 0.35,
     image_top_n: int = 20,
 ):
     load_dotenv()
@@ -449,7 +449,7 @@ if __name__ == "__main__":
     parser.add_argument("--min-roi", type=float, default=0.10,
                         help="Min ROI after grading fee (default: 0.10 = 10%%)")
     parser.add_argument("--min-gem-rate", type=float, default=0.50,
-                        help="Min gem rate to surface a card (default: 0.50 = 50%%)")
+                        help="Min gem rate to surface a card (default: 0.35 = 35%%)")
     args = parser.parse_args()
 
     sets_list = [s.strip() for s in args.sets.split(",")] if args.sets else None
