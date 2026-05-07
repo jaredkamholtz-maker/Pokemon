@@ -138,10 +138,17 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         psa9 = _fmt_price(row.get("psa9_price"))
         psa10 = _fmt_price(row.get("psa10_price"))
         is_breakeven = row.get("track") == "breakeven"
-        # Gem rate: use historical data if available, else show breakeven threshold
+        # Gem rate: show "52.5% (420 / 800)" for Track 1, "BE ≤ 8%" for Track 2
         gem_val = row.get("gem_rate")
+        total = row.get("total_graded")
+        psa9_count = row.get("psa9_count")
+        psa10_count = row.get("psa10_count")
         if pd.notna(gem_val) and gem_val == gem_val:
-            gem = _fmt_pct(gem_val)
+            pct = f"{gem_val * 100:.1f}%"
+            if pd.notna(psa9_count) and pd.notna(psa10_count) and pd.notna(total):
+                gem = f"{pct} ({int(psa9_count + psa10_count):,} / {int(total):,})"
+            else:
+                gem = pct
         elif is_breakeven:
             be = row.get("breakeven_gem_rate")
             gem = f"BE ≤ {_fmt_pct(be)}" if pd.notna(be) and be == be else "No data"
@@ -155,8 +162,6 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
             roi = "breakeven play"
         else:
             roi = "—"
-        total = row.get("total_graded")
-        total_str = f"{int(total):,}" if pd.notna(total) and total == total else "No data"
         url = row.get("source_url") or ""
         ebay_listing_url = row.get("ebay_listing_url") or ""
 
@@ -204,14 +209,13 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
   <td style="padding:10px 14px;text-align:right;font-weight:700;color:#1d4ed8;">{roi}</td>
   <td style="padding:10px 14px;text-align:right;font-weight:700;color:#15803d;">{gem}</td>
   {image_cells}
-  <td style="padding:10px 14px;text-align:right;color:#6b7280;">{total_str}</td>
 </tr>""")
 
         link_text = f"\n  Buy on eBay: {buy_url}" + (f"\n  PriceCharting: {url}" if url else "")
         rows_plain.append(
             f"#{rank} {name} | {set_name}\n"
-            f"  Raw: {raw}  PSA9: {psa9}  PSA10: {psa10}  Profit: {roi}  Gem Rate: {gem}  "
-            f"Total Graded: {total_str}{image_plain}{link_text}"
+            f"  Raw: {raw}  PSA9: {psa9}  PSA10: {psa10}  Profit: {roi}  Gem Rate: {gem}"
+            f"{image_plain}{link_text}"
         )
 
     image_headers = ""
@@ -235,9 +239,8 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
       <th style="padding:10px 14px;text-align:right;">PSA 9</th>
       <th style="padding:10px 14px;text-align:right;">PSA 10</th>
       <th style="padding:10px 14px;text-align:right;">Profit %</th>
-      <th style="padding:10px 14px;text-align:right;">Gem Rate</th>
+      <th style="padding:10px 14px;text-align:right;">Gem Rate (gem / total)</th>
       {image_headers}
-      <th style="padding:10px 14px;text-align:right;">Total Graded</th>
     </tr>
   </thead>
   <tbody>
@@ -245,7 +248,7 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
   </tbody>
 </table>
 <p style="font-size:12px;color:#94a3b8;margin-top:24px;">
-  Profit % = ROI after $25 grading fee. Gem Rate = % of PSA submissions grading 9 or 10.{image_footer}
+  Profit % = ROI after $25 grading fee. Gem Rate = % of all PSA submissions that came back 9 or 10 (gem count / total graded). BE ≤ X% = breakeven if at least X% grade gem.{image_footer}
 </p>
 </body></html>"""
 
