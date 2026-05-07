@@ -1,1 +1,329 @@
-"""\nFetch raw (ungraded) and PSA 9 / PSA 10 prices from PriceCharting.com.\n\nPriceCharting is a public price database for Pokemon cards (no API key needed).\nIt shows ungraded, PSA 9, and PSA 10 prices sourced from completed eBay sales.\n\nURL pattern (individual card page):\n  https://www.pricecharting.com/game/pokemon-{set-slug}/{card-slug}-{card-number}\n\nThe card number is critical — without it, PriceCharting returns a list/search\npage with only Grade 7 and Grade 8 columns, not the full per-grade detail page.\n\nWrites results to .tmp/tcgplayer_prices.csv (same filename for pipeline compat).\n\nUsage:\n    python execution/fetch_tcgplayer_prices.py --watchlist data/watchlist.csv\n    python execution/fetch_tcgplayer_prices.py\n"""\n\nimport argparse\nimport re\nimport threading\nimport time\nfrom concurrent.futures import ThreadPoolExecutor, as_completed\nfrom pathlib import Path\n\nimport pandas as pd\nfrom bs4 import BeautifulSoup\n\ntry:\n    from curl_cffi import requests as cffi_requests\n    _SESSION = cffi_requests.Session(impersonate=\"chrome124\")\n    _USE_CFFI = True\nexcept ImportError:\n    import requests as _requests_fallback\n    _SESSION = None\n    _USE_CFFI = False\n\nOUTPUT_FILE = Path(\".tmp/tcgplayer_prices.csv\")\nDEBUG_FILE = Path(\".tmp/debug_pricecharting_page.html\")\nBASE_URL = \"https://www.pricecharting.com\"\nRATE_DELAY = 1.5\n\nHEADERS = {\n    \"Accept\": \"text/html,application/xhtml+xml,*/*\",\n    \"Accept-Language\": \"en-US,en;q=0.9\",\n}\n\n\ndef slugify(text: str) -> str:\n    text = str(text).lower().encode(\"ascii\", \"ignore\").decode()\n    text = re.sub(r\"[^a-z0-9\\s\\-]\", \"\", text)\n    text = re.sub(r\"[\\s\\-]+\", \"-\", text.strip())\n    return text\n\n\ndef _card_number_slug(card_number: str) -> str:\n    \"\"\"Convert card number to URL-safe slug. '4/102' → '4', 'H29' → 'h29'.\"\"\"\n    if not card_number or card_number == \"nan\":\n        return \"\"\n    # Remove '/XXX' suffix (e.g. '4/102' → '4')\n    num = card_number.split(\"/\")[0].strip()\n    return slugify(num)\n\n\ndef _get_page(url: str):\n    try:\n        if _USE_CFFI:\n            resp = _SESSION.get(url, headers=HEADERS, timeout=15, allow_redirects=True)\n        else:\n            import requests as _req\n            resp = _req.get(url, headers=HEADERS, timeout=15, allow_redirects=True)\n        return resp\n    except Exception:\n        return None\n\n\ndef _is_list_page(soup: BeautifulSoup) -> bool:\n    \"\"\"Return True if the page is a search/list page rather than a card detail page.\"\"\"\n    title = soup.find(\"title\")\n    if title and \"| \" in title.get_text() and \"List\" in title.get_text():\n        return True\n    # List page has a #games_table with many rows; card page has #price-data table\n    if soup.find(id=\"games_table\") and not soup.find(id=\"price-data\"):\n        return True\n    return False\n\n\ndef _parse_price(text: str) -> float | None:\n    if not text:\n        return None\n    cleaned = text.strip().replace(\",\", \"\").replace(\"$\", \"\")\n    m = re.search(r\"(\\d+\\.?\\d*)\", cleaned)\n    if m:\n        val = float(m.group(1))\n        return val if val > 0 else None\n    return None\n\n\ndef _extract_prices_detail(soup: BeautifulSoup) -> dict:\n    \"\"\"\n    Extract prices from an individual card detail page.\n\n    PriceCharting card pages have a table with rows identified by id or class:\n      used_price / loose-price → Ungraded\n      grade-9 / psa-9         → PSA 9\n      grade-10 / psa-10       → PSA 10\n\n    Prices are in <span class=\"js-price\"> or <td class=\"price\">.\n    \"\"\"\n    prices: dict[str, float | None] = {}\n\n    # Strategy 1: look for rows by known id patterns\n    row_id_map = {\n        \"ungraded\": [\"used_price\", \"loose_price\", \"used-price\", \"loose-price\"],\n        \"grade_9\":  [\"grade-9\", \"grade-9-price\", \"psa-9\", \"psa-9-price\", \"graded-9\"],\n        \"grade_10\": [\"grade-10\", \"grade-10-price\", \"psa-10\", \"psa-10-price\", \"graded-10\"],\n    }\n    for key, ids in row_id_map.items():\n        for row_id in ids:\n            row = soup.find(id=row_id)\n            if row:\n                el = (\n                    row.find(class_=\"js-price\")\n                    or row.find(class_=\"price\")\n                    or row.find(\"td\", class_=re.compile(r\"price\"))\n                    or row.find(\"td\")\n                )\n                if el:\n                    val = _parse_price(el.get_text(strip=True))\n                    if val:\n                        prices[key] = val\n                        break\n\n    # Strategy 2: scan ALL table rows for grade labels\n    if len(prices) < 2:\n        for row in soup.find_all(\"tr\"):\n            cells = row.find_all([\"td\", \"th\"])\n            if len(cells) < 2:\n                continue\n            label = cells[0].get_text(\" \", strip=True).lower()\n            price_text = cells[-1].get_text(strip=True)\n\n            if any(kw in label for kw in (\"ungraded\", \"loose\", \"used\")) and \"ungraded\" not in prices:\n                val = _parse_price(price_text)\n                if val:\n                    prices[\"ungraded\"] = val\n            elif re.search(r\"\\bgrade\\s*9\\b|\\bpsa\\s*9\\b|\\b9\\s*grade\\b\", label) and \"grade_9\" not in prices:\n                val = _parse_price(price_text)\n                if val:\n                    prices[\"grade_9\"] = val\n            elif re.search(r\"\\bgrade\\s*10\\b|\\bpsa\\s*10\\b|\\bgem\\b|\\b10\\s*grade\\b\", label) and \"grade_10\" not in prices:\n                val = _parse_price(price_text)\n                if val:\n                    prices[\"grade_10\"] = val\n\n    return prices\n\n\ndef _find_best_list_link(soup: BeautifulSoup, card_name: str, set_name: str) -> str | None:\n    \"\"\"\n    From a PriceCharting search/list page, find the URL of the best-matching\n    individual card page by scoring rows on card name + set name similarity.\n    \"\"\"\n    best_url = None\n    best_score = -1\n\n    for row in soup.select(\"#games_table tbody tr, .product tbody tr, table tbody tr\"):\n        link = row.find(\"a\", href=re.compile(r\"/game/\"))\n        if not link:\n            continue\n        text = link.get_text(strip=True).lower()\n        # Also grab the console/set cell if present\n        console_el = row.find(class_=\"console\") or row.find(class_=\"set\")\n        console_text = console_el.get_text(strip=True).lower() if console_el else \"\"\n        combined = text + \" \" + console_text\n\n        score = 0\n        for word in card_name.lower().split():\n            if word in combined:\n                score += 1\n        for word in set_name.lower().split():\n            if word in combined:\n                score += 0.5\n\n        if score > best_score:\n            best_score = score\n            href = link.get(\"href\", \"\")\n            best_url = href if href.startswith(\"http\") else f\"{BASE_URL}{href}\"\n\n    return best_url if best_score > 0 else None\n\n\ndef fetch_card_prices(card_name: str, set_name: str, card_number: str) -> dict:\n    result = {\n        \"card_name\": card_name,\n        \"set_name\": set_name,\n        \"card_number\": card_number,\n        \"raw_price\": None,\n        \"psa9_price\": None,\n        \"psa10_price\": None,\n        \"source_url\": None,\n        \"error\": None,\n    }\n\n    set_slug = f\"pokemon-{slugify(set_name)}\"\n    card_slug = slugify(card_name)\n    num_slug = _card_number_slug(card_number)\n\n    # Build candidate URLs — try most-specific first\n    candidates = []\n    if num_slug:\n        candidates.append(f\"{BASE_URL}/game/{set_slug}/{card_slug}-{num_slug}\")\n    candidates.append(f\"{BASE_URL}/game/{set_slug}/{card_slug}\")\n\n    soup = None\n    used_url = None\n    for url in candidates:\n        resp = _get_page(url)\n        if resp is None:\n            continue\n        if resp.status_code == 200:\n            soup = BeautifulSoup(resp.text, \"html.parser\")\n            used_url = url\n            break\n        if resp.status_code == 403:\n            # Bot detection hit — back off and retry once\n            time.sleep(3)\n            resp = _get_page(url)\n            if resp and resp.status_code == 200:\n                soup = BeautifulSoup(resp.text, \"html.parser\")\n                used_url = url\n                break\n        # 404 / still 403 → try next candidate\n\n    if soup is None:\n        result[\"error\"] = f\"All URLs returned 404/403: {candidates}\"\n        return result\n\n    result[\"source_url\"] = used_url\n\n    # Save debug page on first card\n    if not DEBUG_FILE.exists():\n        DEBUG_FILE.parent.mkdir(parents=True, exist_ok=True)\n        DEBUG_FILE.write_text(soup.prettify())\n        print(f\"  Saved debug page → {DEBUG_FILE}\")\n\n    if _is_list_page(soup):\n        # Follow the best-matching link to the individual card detail page\n        detail_url = _find_best_list_link(soup, card_name, set_name)\n        if detail_url:\n            detail_resp = _get_page(detail_url)\n            if detail_resp and detail_resp.status_code == 403:\n                time.sleep(3)\n                detail_resp = _get_page(detail_url)\n            if detail_resp and detail_resp.status_code == 200:\n                soup = BeautifulSoup(detail_resp.text, \"html.parser\")\n                result[\"source_url\"] = detail_url\n                # Fall through to detail extraction below\n            else:\n                result[\"error\"] = f\"Found list link {detail_url} but it returned {detail_resp and detail_resp.status_code}\"\n                return result\n        else:\n            result[\"error\"] = f\"Landed on list page and no matching card link found. URL: {used_url}\"\n            return result\n\n    else:\n        prices = _extract_prices_detail(soup)\n        result[\"raw_price\"] = prices.get(\"ungraded\")\n        result[\"psa9_price\"] = prices.get(\"grade_9\")\n        result[\"psa10_price\"] = prices.get(\"grade_10\")\n\n        if not any(v is not None for v in [result[\"raw_price\"], result[\"psa9_price\"], result[\"psa10_price\"]]):\n            result[\"error\"] = f\"Detail page loaded but no prices parsed — check {DEBUG_FILE}\"\n\n    return result\n\n\ndef run(watchlist_path: str, max_workers: int = 3) -> pd.DataFrame:\n    watchlist = pd.read_csv(watchlist_path)\n    required_cols = {\"card_name\", \"set_name\", \"card_number\"}\n    missing = required_cols - set(watchlist.columns)\n    if missing:\n        raise ValueError(f\"watchlist.csv missing columns: {missing}\")\n\n    total = len(watchlist)\n    results: list = [None] * total\n    counter = {\"done\": 0}\n    lock = threading.Lock()\n\n    def _fetch(i: int, row) -> None:\n        prices = fetch_card_prices(\n            card_name=row[\"card_name\"],\n            set_name=row[\"set_name\"],\n            card_number=str(row.get(\"card_number\", \"\")),\n        )\n        results[i] = prices\n        with lock:\n            counter[\"done\"] += 1\n            if counter[\"done\"] % 50 == 0 or counter[\"done\"] == total:\n                print(f\"  [{counter['done']}/{total}] prices fetched\")\n\n    with ThreadPoolExecutor(max_workers=max_workers) as executor:\n        futures = [\n            executor.submit(_fetch, i, row)\n            for i, (_, row) in enumerate(watchlist.iterrows())\n        ]\n        for f in as_completed(futures):\n            f.result()  # re-raise any exception\n\n    df = pd.DataFrame(results)\n    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)\n    df.to_csv(OUTPUT_FILE, index=False)\n    print(f\"\\nSaved {len(df)} rows → {OUTPUT_FILE}\")\n\n    failed = df[df[\"error\"].notna()]\n    if not failed.empty:\n        print(f\"  {len(failed)} cards had errors:\")\n        for _, r in failed.iterrows():\n            print(f\"    - {r['card_name']}: {r['error']}\")\n\n    return df\n\n\nif __name__ == \"__main__\":\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"--watchlist\", default=\"data/watchlist.csv\")\n    args = parser.parse_args()\n    run(args.watchlist)\n
+"""
+Fetch raw (ungraded) and PSA 9 / PSA 10 prices from PriceCharting.com.
+
+PriceCharting is a public price database for Pokemon cards (no API key needed).
+It shows ungraded, PSA 9, and PSA 10 prices sourced from completed eBay sales.
+
+URL pattern (individual card page):
+  https://www.pricecharting.com/game/pokemon-{set-slug}/{card-slug}-{card-number}
+
+The card number is critical — without it, PriceCharting returns a list/search
+page with only Grade 7 and Grade 8 columns, not the full per-grade detail page.
+
+Writes results to .tmp/tcgplayer_prices.csv (same filename for pipeline compat).
+
+Usage:
+    python execution/fetch_tcgplayer_prices.py --watchlist data/watchlist.csv
+    python execution/fetch_tcgplayer_prices.py
+"""
+
+import argparse
+import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+import pandas as pd
+from bs4 import BeautifulSoup
+
+try:
+    from curl_cffi import requests as cffi_requests
+    _SESSION = cffi_requests.Session(impersonate="chrome124")
+    _USE_CFFI = True
+except ImportError:
+    import requests as _requests_fallback
+    _SESSION = None
+    _USE_CFFI = False
+
+OUTPUT_FILE = Path(".tmp/tcgplayer_prices.csv")
+DEBUG_FILE = Path(".tmp/debug_pricecharting_page.html")
+BASE_URL = "https://www.pricecharting.com"
+RATE_DELAY = 1.5
+
+HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def slugify(text: str) -> str:
+    text = str(text).lower().encode("ascii", "ignore").decode()
+    text = re.sub(r"[^a-z0-9\s\-]", "", text)
+    text = re.sub(r"[\s\-]+", "-", text.strip())
+    return text
+
+
+def _card_number_slug(card_number: str) -> str:
+    """Convert card number to URL-safe slug. '4/102' → '4', 'H29' → 'h29'."""
+    if not card_number or card_number == "nan":
+        return ""
+    # Remove '/XXX' suffix (e.g. '4/102' → '4')
+    num = card_number.split("/")[0].strip()
+    return slugify(num)
+
+
+def _get_page(url: str):
+    try:
+        if _USE_CFFI:
+            resp = _SESSION.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
+        else:
+            import requests as _req
+            resp = _req.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
+        return resp
+    except Exception:
+        return None
+
+
+def _is_list_page(soup: BeautifulSoup) -> bool:
+    """Return True if the page is a search/list page rather than a card detail page."""
+    title = soup.find("title")
+    if title and "| " in title.get_text() and "List" in title.get_text():
+        return True
+    # List page has a #games_table with many rows; card page has #price-data table
+    if soup.find(id="games_table") and not soup.find(id="price-data"):
+        return True
+    return False
+
+
+def _parse_price(text: str) -> float | None:
+    if not text:
+        return None
+    cleaned = text.strip().replace(",", "").replace("$", "")
+    m = re.search(r"(\d+\.?\d*)", cleaned)
+    if m:
+        val = float(m.group(1))
+        return val if val > 0 else None
+    return None
+
+
+def _extract_prices_detail(soup: BeautifulSoup) -> dict:
+    """
+    Extract prices from an individual card detail page.
+
+    PriceCharting card pages have a table with rows identified by id or class:
+      used_price / loose-price → Ungraded
+      grade-9 / psa-9         → PSA 9
+      grade-10 / psa-10       → PSA 10
+
+    Prices are in <span class="js-price"> or <td class="price">.
+    """
+    prices: dict[str, float | None] = {}
+
+    # Strategy 1: look for rows by known id patterns
+    row_id_map = {
+        "ungraded": ["used_price", "loose_price", "used-price", "loose-price"],
+        "grade_9":  ["grade-9", "grade-9-price", "psa-9", "psa-9-price", "graded-9"],
+        "grade_10": ["grade-10", "grade-10-price", "psa-10", "psa-10-price", "graded-10"],
+    }
+    for key, ids in row_id_map.items():
+        for row_id in ids:
+            row = soup.find(id=row_id)
+            if row:
+                el = (
+                    row.find(class_="js-price")
+                    or row.find(class_="price")
+                    or row.find("td", class_=re.compile(r"price"))
+                    or row.find("td")
+                )
+                if el:
+                    val = _parse_price(el.get_text(strip=True))
+                    if val:
+                        prices[key] = val
+                        break
+
+    # Strategy 2: scan ALL table rows for grade labels
+    if len(prices) < 2:
+        for row in soup.find_all("tr"):
+            cells = row.find_all(["td", "th"])
+            if len(cells) < 2:
+                continue
+            label = cells[0].get_text(" ", strip=True).lower()
+            price_text = cells[-1].get_text(strip=True)
+
+            if any(kw in label for kw in ("ungraded", "loose", "used")) and "ungraded" not in prices:
+                val = _parse_price(price_text)
+                if val:
+                    prices["ungraded"] = val
+            elif re.search(r"\bgrade\s*9\b|\bpsa\s*9\b|\b9\s*grade\b", label) and "grade_9" not in prices:
+                val = _parse_price(price_text)
+                if val:
+                    prices["grade_9"] = val
+            elif re.search(r"\bgrade\s*10\b|\bpsa\s*10\b|\bgem\b|\b10\s*grade\b", label) and "grade_10" not in prices:
+                val = _parse_price(price_text)
+                if val:
+                    prices["grade_10"] = val
+
+    return prices
+
+
+def _find_best_list_link(soup: BeautifulSoup, card_name: str, set_name: str) -> str | None:
+    """
+    From a PriceCharting search/list page, find the URL of the best-matching
+    individual card page by scoring rows on card name + set name similarity.
+    """
+    best_url = None
+    best_score = -1
+
+    for row in soup.select("#games_table tbody tr, .product tbody tr, table tbody tr"):
+        link = row.find("a", href=re.compile(r"/game/"))
+        if not link:
+            continue
+        text = link.get_text(strip=True).lower()
+        # Also grab the console/set cell if present
+        console_el = row.find(class_="console") or row.find(class_="set")
+        console_text = console_el.get_text(strip=True).lower() if console_el else ""
+        combined = text + " " + console_text
+
+        score = 0
+        for word in card_name.lower().split():
+            if word in combined:
+                score += 1
+        for word in set_name.lower().split():
+            if word in combined:
+                score += 0.5
+
+        if score > best_score:
+            best_score = score
+            href = link.get("href", "")
+            best_url = href if href.startswith("http") else f"{BASE_URL}{href}"
+
+    return best_url if best_score > 0 else None
+
+
+def fetch_card_prices(card_name: str, set_name: str, card_number: str) -> dict:
+    result = {
+        "card_name": card_name,
+        "set_name": set_name,
+        "card_number": card_number,
+        "raw_price": None,
+        "psa9_price": None,
+        "psa10_price": None,
+        "source_url": None,
+        "error": None,
+    }
+
+    set_slug = f"pokemon-{slugify(set_name)}"
+    card_slug = slugify(card_name)
+    num_slug = _card_number_slug(card_number)
+
+    # Build candidate URLs — try most-specific first
+    candidates = []
+    if num_slug:
+        candidates.append(f"{BASE_URL}/game/{set_slug}/{card_slug}-{num_slug}")
+    candidates.append(f"{BASE_URL}/game/{set_slug}/{card_slug}")
+
+    soup = None
+    used_url = None
+    for url in candidates:
+        resp = _get_page(url)
+        if resp is None:
+            continue
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            used_url = url
+            break
+        if resp.status_code == 403:
+            # Bot detection hit — back off and retry once
+            time.sleep(3)
+            resp = _get_page(url)
+            if resp and resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                used_url = url
+                break
+        # 404 / still 403 → try next candidate
+
+    if soup is None:
+        result["error"] = f"All URLs returned 404/403: {candidates}"
+        return result
+
+    result["source_url"] = used_url
+
+    # Save debug page on first card
+    if not DEBUG_FILE.exists():
+        DEBUG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DEBUG_FILE.write_text(soup.prettify())
+        print(f"  Saved debug page → {DEBUG_FILE}")
+
+    if _is_list_page(soup):
+        # Follow the best-matching link to the individual card detail page
+        detail_url = _find_best_list_link(soup, card_name, set_name)
+        if detail_url:
+            detail_resp = _get_page(detail_url)
+            if detail_resp and detail_resp.status_code == 403:
+                time.sleep(3)
+                detail_resp = _get_page(detail_url)
+            if detail_resp and detail_resp.status_code == 200:
+                soup = BeautifulSoup(detail_resp.text, "html.parser")
+                result["source_url"] = detail_url
+                # Fall through to detail extraction below
+            else:
+                result["error"] = f"Found list link {detail_url} but it returned {detail_resp and detail_resp.status_code}"
+                return result
+        else:
+            result["error"] = f"Landed on list page and no matching card link found. URL: {used_url}"
+            return result
+
+    else:
+        prices = _extract_prices_detail(soup)
+        result["raw_price"] = prices.get("ungraded")
+        result["psa9_price"] = prices.get("grade_9")
+        result["psa10_price"] = prices.get("grade_10")
+
+        if not any(v is not None for v in [result["raw_price"], result["psa9_price"], result["psa10_price"]]):
+            result["error"] = f"Detail page loaded but no prices parsed — check {DEBUG_FILE}"
+
+    return result
+
+
+def run(watchlist_path: str, max_workers: int = 3) -> pd.DataFrame:
+    watchlist = pd.read_csv(watchlist_path)
+    required_cols = {"card_name", "set_name", "card_number"}
+    missing = required_cols - set(watchlist.columns)
+    if missing:
+        raise ValueError(f"watchlist.csv missing columns: {missing}")
+
+    total = len(watchlist)
+    results: list = [None] * total
+    counter = {"done": 0}
+    lock = threading.Lock()
+
+    def _fetch(i: int, row) -> None:
+        prices = fetch_card_prices(
+            card_name=row["card_name"],
+            set_name=row["set_name"],
+            card_number=str(row.get("card_number", "")),
+        )
+        results[i] = prices
+        with lock:
+            counter["done"] += 1
+            if counter["done"] % 50 == 0 or counter["done"] == total:
+                print(f"  [{counter['done']}/{total}] prices fetched")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(_fetch, i, row)
+            for i, (_, row) in enumerate(watchlist.iterrows())
+        ]
+        for f in as_completed(futures):
+            f.result()  # re-raise any exception
+
+    df = pd.DataFrame(results)
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(OUTPUT_FILE, index=False)
+    print(f"\nSaved {len(df)} rows → {OUTPUT_FILE}")
+
+    failed = df[df["error"].notna()]
+    if not failed.empty:
+        print(f"  {len(failed)} cards had errors:")
+        for _, r in failed.iterrows():
+            print(f"    - {r['card_name']}: {r['error']}")
+
+    return df
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--watchlist", default="data/watchlist.csv")
+    args = parser.parse_args()
+    run(args.watchlist)
