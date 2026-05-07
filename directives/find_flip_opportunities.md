@@ -1,38 +1,92 @@
 # Find Pokemon Card Flip Opportunities
 
 ## Goal
-Identify Pokemon cards that can be profitably bought raw (ungraded), submitted to PSA for grading, and resold as PSA 9 or PSA 10 copies. Surface only cards where the math works: spread covers grading cost, gem rate is reliable, and expected ROI exceeds the threshold.
+Identify Pokemon cards that can be profitably bought raw (ungraded), submitted to PSA for grading, and resold as PSA 9 or PSA 10 copies. Broad market scan across configurable eras/sets — not a static watchlist. Surface only cards where the math works: spread covers grading cost, gem rate is reliable, and expected ROI exceeds the threshold.
 
 ## Inputs
-- `data/watchlist.csv` — cards to analyze: `card_name, set_name, card_number, tcgplayer_set_name`
+- `data/target_sets.csv` — sets to scan: `set_name, era, notes`
 - `.env` — all credentials and tunable parameters (see `.env.example`)
+- `ANTHROPIC_API_KEY` — required for AI pre-filter step (Claude Haiku)
+
+## Pipeline (5 Steps)
+
+```
+target_sets.csv
+      │
+      ▼
+[0] discover_cards.py      → .tmp/discovered_cards.csv    (~3,000 cards)
+      │
+      ▼
+[PRE] filter_cards_ai.py   → .tmp/filtered_cards.csv      (~400–600 cards)
+      │
+      ▼
+[1] fetch_tcgplayer_prices.py → .tmp/tcgplayer_prices.csv  (parallel, 8 workers)
+      │
+      ▼
+[2] scrape_pokedata_population.py → .tmp/pokedata_population.csv (parallel, 5 workers)
+      │
+      ▼
+[3] calculate_flip_ev.py   → .tmp/flip_opportunities.csv
+      │
+      ▼
+[OUT] Google Sheet + Email
+```
 
 ## Tools / Scripts
+
 | Script | What it does |
 |---|---|
-| `execution/auth_tcgplayer.py` | Fetches and caches TCGPlayer OAuth bearer token |
-| `execution/fetch_tcgplayer_prices.py` | Gets raw + PSA 9 + PSA 10 market prices from TCGPlayer API |
-| `execution/scrape_pokedata_population.py` | Scrapes grade population data from pokedata.io |
-| `execution/calculate_flip_ev.py` | Merges price + pop data, calculates EV, profit, ROI per card |
-| `execution/run_analysis.py` | Full pipeline: loads watchlist → calls above scripts → outputs results |
+| `execution/discover_cards.py` | Queries PokeData.io API for all cards in each target set; writes `discovered_cards.csv` |
+| `execution/filter_cards_ai.py` | Sends cards to Claude Haiku in batches of 300; drops commons/trainers/bulk; returns PSA-worthy candidates (~80% reduction) |
+| `execution/fetch_tcgplayer_prices.py` | Gets raw + PSA 9 + PSA 10 market prices from PriceCharting; parallel (8 workers) |
+| `execution/scrape_pokedata_population.py` | Scrapes grade population data from 130point.com; parallel (5 workers) |
+| `execution/calculate_flip_ev.py` | Merges price + pop data; two-track EV analysis (see below); outputs full analysis sorted by ROI |
+| `execution/run_analysis.py` | Orchestrates all steps end-to-end; supports era/set/watchlist filtering |
 
-## Outputs
-- **Google Sheet** (primary): all cards analyzed, full EV breakdown, sorted by ROI descending
-- **Email summary** (optional): top N cards above ROI threshold, with key numbers
+## Running It
 
-## Expected Value Formula
+```bash
+# Full market scan (all sets in target_sets.csv)
+python execution/run_analysis.py
 
+# Filter by era
+python execution/run_analysis.py --era mega-evolution
+python execution/run_analysis.py --era sword-shield
+python execution/run_analysis.py --era scarlet-violet
+
+# Filter to specific sets
+python execution/run_analysis.py --sets "151,Evolving Skies,Obsidian Flames"
+
+# Reuse last discovered cards (skip PokeData.io API call)
+python execution/run_analysis.py --skip-discovery
+
+# Fixed watchlist instead of discovery
+python execution/run_analysis.py --watchlist data/watchlist.csv
+
+# Skip outputs
+python execution/run_analysis.py --skip-sheets --skip-email
+```
+
+## GitHub Actions
+Trigger manually via **Actions → Pokemon Flip Analysis → Run workflow**:
+- **era**: dropdown (blank = full scan, or mega-evolution / sword-shield / scarlet-violet)
+- **sets**: comma-separated set names (overrides era)
+
+Scheduled runs: Monday and Friday at 8am ET.
+
+## Two-Track EV Analysis
+
+### Track 1 — Full EV (population data available)
 ```
 gem_rate         = (psa9_count + psa10_count) / total_graded
 
-# Revenue weighted by probability of each outcome
 psa10_rate       = psa10_count / total_graded
 psa9_rate        = psa9_count / total_graded
 below_gem_rate   = 1 - gem_rate
 
 expected_revenue = (psa10_rate * psa10_price)
                  + (psa9_rate  * psa9_price)
-                 + (below_gem_rate * below_gem_price)  # raw price used as proxy
+                 + (below_gem_rate * raw_price)   # raw price used as proxy for below-gem
 
 cost             = raw_price + grading_fee
 selling_fee      = expected_revenue * SELLING_FEE_RATE  # default 0.13 (TCGPlayer/eBay)
@@ -41,32 +95,75 @@ profit           = expected_revenue - cost - selling_fee
 roi              = profit / cost
 ```
 
+### Track 2 — Breakeven gem rate (no population data)
+When PSA submission counts are unavailable, compute the minimum gem rate needed to break even. Cards requiring < `MAX_BREAKEVEN_GEM_RATE` (default 15%) are surfaced as low-bar opportunities.
+```
+breakeven_gem_rate = (cost / (1 - selling_fee_rate) - raw_price) / (psa_weighted - raw_price)
+# where psa_weighted = 0.6 * psa10_price + 0.4 * psa9_price (assumed 60/40 split)
+```
+
 ## Decision Criteria — All must pass to surface a card
+
+### Track 1 (population data available)
 | Filter | Default | Env var | Rationale |
 |---|---|---|---|
 | `roi >= MIN_ROI` | 0.20 (20%) | `MIN_ROI` | Minimum acceptable return |
 | `gem_rate >= MIN_GEM_RATE` | 0.30 | `MIN_GEM_RATE` | Need reasonable odds of hitting 9/10 |
-| `total_graded >= MIN_POP` | 50 | `MIN_POP_COUNT` | Small samples make gem rate unreliable |
+| `total_graded >= MIN_POP_COUNT` | 50 | `MIN_POP_COUNT` | Small samples make gem rate unreliable |
 | `psa10_price > raw_price + grading_fee * 2` | — | — | Meaningful spread must exist |
 | `raw_price <= MAX_RAW_PRICE` | 500.00 | `MAX_RAW_PRICE` | Cap exposure per card |
 
+### Track 2 (no population data)
+| Filter | Default | Env var |
+|---|---|---|
+| `breakeven_gem_rate <= MAX_BREAKEVEN_GEM_RATE` | 0.15 | `MAX_BREAKEVEN_GEM_RATE` |
+| `psa10_price > raw_price + grading_fee * 2` | — | — |
+| `raw_price <= MAX_RAW_PRICE` | 500.00 | `MAX_RAW_PRICE` |
+
+## Eras and Sets
+`data/target_sets.csv` defines all sets with an `era` column for scoped runs:
+- **mega-evolution**: 13 XY-era sets (2014–2016) — Mega EX cards, BREAKs
+- **sword-shield**: 10 sets (2020–2023) — VMAX, VSTAR, GX reprints
+- **scarlet-violet**: 7 sets (2023–2024) — ex, special illustration rares (SIR)
+
+To add a set: append a row to `target_sets.csv`. If PokeData.io uses a different name, add an alias to the `ALIASES` dict in `discover_cards.py`.
+
+## AI Pre-Filter (Claude Haiku)
+Cuts scraping from ~3,000 cards to ~400–600 by dropping:
+- Commons and uncommons
+- Basic Energy cards
+- Trainers/Supporters/Stadiums (except full art / secret rare)
+- Standard rares without meaningful grading premium
+
+Keeps: holo rares, full arts, alt arts, VMAX/VSTAR/ex/GX, secret rares, high-demand Pokemon (Charizard, Pikachu, Mewtwo, Umbreon, Eevee, Rayquaza, Lugia, etc.)
+
+- Batches of 300 cards per API call
+- Prompt caching on system prompt (saves tokens across batches)
+- On any API error: keeps entire batch (never silently drops cards)
+- Falls back to full card list if `ANTHROPIC_API_KEY` is missing
+
 ## Edge Cases
-- **Card not found on TCGPlayer**: log warning, skip card, continue
-- **No graded listing on TCGPlayer**: mark `psa9_price` / `psa10_price` as `null`, skip EV calc
-- **pokedata.io rate limit / 429**: sleep 5s, retry up to 3× with exponential backoff; log failure after 3rd
-- **Total graded < MIN_POP_COUNT**: still calculate but flag as `low_data = True` in output
-- **TCGPlayer token expires**: `auth_tcgplayer.py` caches expiry timestamp and auto-refreshes before the call fails
-- **No `.env` file**: script should fail loudly with a clear message listing missing vars
+- **Set not found on PokeData.io**: logs `[SKIP]` with closest-match hints; add alias to `ALIASES` dict in `discover_cards.py`
+- **Card not found on PriceCharting**: logs warning, `raw_price` = null, skipped in EV calc
+- **No graded listings**: `psa9_price`/`psa10_price` null → falls through to Track 2 (breakeven)
+- **130point.com rate limit / 403**: logs error per card, population data absent → Track 2 for that card
+- **Total graded < MIN_POP_COUNT**: still calculates but flags `low_data = True` in output
+- **No `.env` file**: scripts fail loudly listing missing vars
 
 ## Tuning Notes
-- PSA regular grading fee (~$25–50) changes — update `GRADING_FEE` in `.env` accordingly
-- `SELLING_FEE_RATE` of 0.13 covers ~10% platform fee + ~3% payment processing; adjust for venue
+- PSA regular grading fee (~$25–50) changes — update `GRADING_FEE` in `.env`
+- `SELLING_FEE_RATE` of 0.13 covers ~10% platform fee + ~3% payment processing
 - A **high gem rate + low PSA 10 premium** = bad flip. Gem rate alone is not enough; spread matters.
-- A **low gem rate + huge PSA 10 premium** can still be good if you are selective about the raw condition you buy (near-mint only). The population gem rate reflects *all* submissions, not just careful buyers.
-- Run daily or on-demand; prices move fast on hype cycles
-- Add new cards to watchlist as sets release; remove cards with stale/thin markets
+- A **low gem rate + huge PSA 10 premium** can still be good if you cherry-pick near-mint raw copies. Population gem rate reflects *all* submissions, not just selective buyers.
+- Run on Monday/Friday; prices move fast on hype cycles
 
 ## Self-Annealing Log
 | Date | Issue | Fix Applied |
 |---|---|---|
-| — | — | — |
+| 2026-05 | Static watchlist couldn't scale to broad market scan | Replaced with `discover_cards.py` querying PokeData.io API + `data/target_sets.csv` |
+| 2026-05 | ~3,000 discovered cards made scraping too slow (~2–3 hrs) | Added Claude Haiku AI pre-filter to cut to ~400–600 cards before expensive scraping |
+| 2026-05 | Sequential HTTP requests were bottleneck | Added `ThreadPoolExecutor` (8 workers for prices, 5 for population) |
+| 2026-05 | `pd.concat` of EV dict with merged df created duplicate `gem_rate`/`total_graded` columns | Removed those keys from EV return dicts; they come from the merged population data directly |
+| 2026-05 | `.tmp/` artifact not uploaded by GitHub Actions | Added `include-hidden-files: true` to upload-artifact step |
+| 2026-05 | PokeData.io calls set "151" → "Pokemon Card 151" | Added `"Pokemon Card 151"` to `ALIASES["151"]`; added closest-match debug hint to `[SKIP]` log |
+| 2026-05 | `run_analysis.py` on main lacked AI filter after partial push overwrote it | Always verify key files on main after any push; never push partial file sets |
