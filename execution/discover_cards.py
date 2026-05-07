@@ -32,8 +32,7 @@ HEADERS = {
 # Explicit aliases for sets whose names differ between our target_sets.csv
 # and PokeData.io's catalog. Add entries here when [SKIP] is logged.
 ALIASES: dict[str, list[str]] = {
-    "151":        ["Scarlet & Violet 151", "Pokemon 151", "SV 151", "151",
-                   "Pokémon Card 151", "SV3.5", "sv3.5"],
+    "151":        ["Pokemon Card 151", "Scarlet & Violet 151", "Pokemon 151", "SV 151", "151"],
     "Base Set 2": ["Base Set 2", "Base Set Two"],
 }
 
