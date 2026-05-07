@@ -46,7 +46,7 @@ target_sets.csv
 
 | Script | What it does |
 |---|---|
-| `execution/discover_cards.py` | Queries PokeData.io API for all cards in each target set; writes `discovered_cards.csv` |
+| `execution/discover_cards.py` | Queries Pokemon TCG API (`api.pokemontcg.io/v2/cards`) for all cards; no bot detection; optional `POKEMONTCG_API_KEY` raises rate limit 1k→20k req/day; set IDs hardcoded in `SET_ID_MAP` |
 | `execution/filter_cards_ai.py` | Sends cards to Claude Haiku in batches of 300; drops commons/trainers/bulk; returns PSA-worthy candidates (~80% reduction) |
 | `execution/fetch_tcgplayer_prices.py` | Gets raw + PSA 9 + PSA 10 market prices from PriceCharting; parallel (3 workers); uses `curl_cffi` with `impersonate="chrome124"` to bypass Cloudflare bot detection |
 | `execution/scrape_pokedata_population.py` | Scrapes grade population data from 130point.com; parallel (5 workers) |
@@ -185,5 +185,6 @@ Keeps: holo rares, full arts, alt arts, VMAX/VSTAR/ex/GX, secret rares, high-dem
 | 2026-05 | Redesigned pipeline to use PokeData.io for prices — returned 0 cards | PokeData.io `/api/cards` endpoint returns only card metadata (no prices). Reverted to PriceCharting for prices; PokeData.io used only for card discovery. |
 | 2026-05 | AI pre-filter step missing after pipeline redesign | Restored `filter_cards_ai.py` in `run_analysis.py`; it is step 2 and required for performance (cuts scraping 3,000 → 400-600 cards) |
 | 2026-05 | Added eBay image analysis as step 6 | `analyze_card_images.py` scrapes eBay for cheapest raw listing per top-N card, downloads photos, sends to Claude Vision for PSA grade prediction; `--skip-images` bypasses step for faster runs |
-| 2026-05 | `discover_cards.py` used standard `requests` — PokeData.io (Cloudflare) returned 0 cards | Switched to `curl_cffi` with `impersonate="chrome124"` matching pattern used in all other scrapers |
+| 2026-05 | `discover_cards.py` used standard `requests` — PokeData.io (Cloudflare) returned 0 cards | Switched to Pokemon TCG API (`api.pokemontcg.io`) — free, no bot detection, no Cloudflare; set IDs hardcoded in `SET_ID_MAP` |
+| 2026-05 | Final filter required `gem_rate` to be present — cards with no 130point data produced 0 results | Added Track-2 (breakeven) path: cards without population data are surfaced if `breakeven_gem_rate ≤ 15%` (spread so good you'd profit even at low gem rates) |
 | 2026-05 | PriceCharting URL slug for "151" set was wrong (`pokemon-151` vs actual `pokemon-scarlet-&-violet-151`) | Added `SET_SLUG_OVERRIDES` dict in `fetch_tcgplayer_prices.py`; added overrides for 151, BREAKthrough, BREAKpoint, and all scarlet-violet sets |

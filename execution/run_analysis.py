@@ -2,7 +2,7 @@
 Full pipeline: discover → AI filter → prices → PSA population → EV → image analysis → email
 
 Steps:
-  1. discover_cards: query PokeData.io for all cards in target sets (~3,000 cards)
+  1. discover_cards: query Pokemon TCG API for all cards in target sets (~3,000 cards)
   2. filter_cards_ai: Claude Haiku pre-filter → holos, full arts, chase rares (~400-600)
   3. fetch_tcgplayer_prices: get raw + PSA 9 + PSA 10 prices from PriceCharting
      Filter: PSA 9 or PSA 10 > $60 (configurable MIN_GRADED_PRICE)
@@ -285,10 +285,10 @@ def run(
     # Step 1: Discover cards from PokeData.io
     if skip_discovery and Path(DISCOVERED_PATH).exists():
         n = len(pd.read_csv(DISCOVERED_PATH))
-        print(f"[1/5] Reusing {n} discovered cards from {DISCOVERED_PATH}")
+        print(f"[1/6] Reusing {n} discovered cards from {DISCOVERED_PATH}")
     else:
         scope = f"era={era}" if era else (f"sets={sets}" if sets else "all sets")
-        print(f"[1/5] Discovering cards from PokeData.io ({scope})...")
+        print(f"[1/6] Discovering cards via Pokemon TCG API ({scope})...")
         discover_mod.run(target_sets_path=target_sets, era=era, sets=sets)
 
     discovered_df = pd.read_csv(DISCOVERED_PATH)
@@ -297,7 +297,7 @@ def run(
     # Step 2: AI pre-filter (Claude Haiku)
     if skip_ai_filter and Path(FILTERED_PATH).exists():
         n = len(pd.read_csv(FILTERED_PATH))
-        print(f"[2/5] Reusing {n} AI-filtered cards from {FILTERED_PATH}")
+        print(f"[2/6] Reusing {n} AI-filtered cards from {FILTERED_PATH}")
     else:
         print(f"[2/5] AI pre-filtering {len(discovered_df)} cards (Claude Haiku)...")
         filtered_df = ai_filter_mod.filter_cards(discovered_df)
@@ -314,9 +314,9 @@ def run(
     # Step 3: Fetch prices from PriceCharting
     if skip_prices and Path(PRICES_PATH).exists():
         n = len(pd.read_csv(PRICES_PATH))
-        print(f"[3/5] Reusing {n} price records from {PRICES_PATH}")
+        print(f"[3/6] Reusing {n} price records from {PRICES_PATH}")
     else:
-        print(f"[3/5] Fetching prices from PriceCharting ({len(filtered_df)} cards, "
+        print(f"[3/6] Fetching prices from PriceCharting ({len(filtered_df)} cards, "
               f"PSA 9/10 > ${min_graded_price:.0f})...")
         prices_mod.run(watchlist_path=FILTERED_PATH)
 
@@ -335,30 +335,49 @@ def run(
         return pd.DataFrame()
 
     # Step 4: Scrape PSA population data from 130point.com
-    print(f"[4/5] Scraping PSA population from 130point.com ({len(prices_df)} cards)...")
+    print(f"[4/6] Scraping PSA population from 130point.com ({len(prices_df)} cards)...")
     pop_mod.run(PRICES_PATH)
     print()
 
     # Step 5: Calculate EV
-    print(f"[5/5] Calculating flip EV...")
+    print(f"[5/6] Calculating flip EV...")
     df = ev_mod.run(grading_fee=grading_fee, min_roi=min_roi)
 
-    # Apply final filters: gem rate >= 50% AND ROI >= 10%
+    # Track 1: population data available — gem rate >= 50% AND roi >= 10%
     has_pop = df["gem_rate"].notna() & df["roi"].notna()
-    opportunities = df[
+    track1 = df[
         has_pop &
         (df["gem_rate"] >= min_gem_rate) &
         (df["roi"] >= min_roi)
     ].copy()
-    opportunities = opportunities.sort_values("roi", ascending=False)
+    track1["track"] = "population"
+
+    # Track 2: no population data, but spread is so good breakeven is very low
+    # Surface cards where you'd break even needing < 15% gem rate — attractive even blind
+    max_breakeven = float(os.environ.get("MAX_BREAKEVEN_GEM_RATE", 0.15))
+    has_breakeven = ("breakeven_gem_rate" in df.columns) and df["breakeven_gem_rate"].notna()
+    track2 = df[
+        has_breakeven &
+        ~has_pop &
+        (df["breakeven_gem_rate"] <= max_breakeven)
+    ].copy()
+    track2["track"] = "breakeven"
+
+    opportunities = pd.concat([track1, track2], ignore_index=True)
+    opportunities = opportunities.sort_values(
+        ["roi", "breakeven_gem_rate"],
+        ascending=[False, True],
+        na_position="last",
+    )
 
     # Save filtered results
     Path(OUTPUT_PATH).parent.mkdir(parents=True, exist_ok=True)
     opportunities.to_csv(OUTPUT_PATH, index=False)
 
     print(f"\n{'='*60}")
-    print(f"{len(opportunities)} opportunities (gem rate ≥ {min_gem_rate*100:.0f}%, "
-          f"ROI ≥ {min_roi*100:.0f}%) out of {len(prices_df)} price candidates")
+    print(f"{len(track1)} Track-1 cards (gem rate ≥ {min_gem_rate*100:.0f}%, ROI ≥ {min_roi*100:.0f}%)")
+    print(f"{len(track2)} Track-2 cards (breakeven gem rate ≤ {max_breakeven*100:.0f}%, no pop data)")
+    print(f"{len(opportunities)} total opportunities out of {len(prices_df)} price candidates")
     print(f"{'='*60}\n")
 
     # Step 6: eBay image analysis (final filter on top N)
