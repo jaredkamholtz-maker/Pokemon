@@ -6,7 +6,7 @@ For each set in target_sets.csv:
   2. For each card, fetches price data (ungraded, PSA 9, PSA 10) from the card detail API
   3. Filters to cards passing BOTH:
        a. PSA 9 or PSA 10 price > MIN_GRADED_PRICE ($60 default)
-       b. (best_graded_price - raw - grading_fee) / (raw + grading_fee) >= MIN_ROI (50% default)
+       b. (best_graded_price - raw - grading_fee) / (raw + grading_fee) >= MIN_ROI (10% default)
 
 Output: .tmp/price_candidates.csv
   card_name, set_name, card_number, card_id, raw_price, psa9_price, psa10_price,
@@ -16,7 +16,7 @@ Usage:
     python execution/fetch_pokedata_prices.py
     python execution/fetch_pokedata_prices.py --era scarlet-violet
     python execution/fetch_pokedata_prices.py --sets "151,Evolving Skies"
-    python execution/fetch_pokedata_prices.py --min-graded-price 60 --min-roi 0.50
+    python execution/fetch_pokedata_prices.py --min-graded-price 60 --min-roi 0.10
 """
 
 import argparse
@@ -254,7 +254,7 @@ def run(
     sets: list[str] | None = None,
     min_graded_price: float = 60.0,
     grading_fee: float = 25.0,
-    min_roi: float = 0.50,
+    min_roi: float = 0.10,
     max_workers: int = 5,
 ) -> pd.DataFrame:
     load_dotenv()
@@ -345,8 +345,8 @@ if __name__ == "__main__":
                         help="Min PSA 9 or PSA 10 price to include a card (default: $60)")
     parser.add_argument("--grading-fee", type=float, default=25.0,
                         help="PSA grading fee in USD (default: $25)")
-    parser.add_argument("--min-roi", type=float, default=0.50,
-                        help="Min ROI after grading fee, e.g. 0.50 = 50%% (default: 0.50)")
+    parser.add_argument("--min-roi", type=float, default=0.10,
+                        help="Min ROI after grading fee, e.g. 0.10 = 10%% (default: 0.10)")
     args = parser.parse_args()
     sets_list = [s.strip() for s in args.sets.split(",")] if args.sets else None
     run(
