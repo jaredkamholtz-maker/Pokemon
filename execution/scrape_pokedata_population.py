@@ -62,6 +62,7 @@ def _save_debug(name: str, content: str) -> None:
     if not path.exists():
         DEBUG_DIR.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+        print(f"  Saved debug → {path}")
 
 
 def _score_link(text: str, href: str, card_name: str, set_name: str, num: str) -> float:
@@ -78,6 +79,7 @@ def _parse_grade_table(html: str) -> dict[int, int]:
     soup = BeautifulSoup(html, "html.parser")
     grade_counts: dict[int, int] = {}
 
+    # Strategy 1: table rows where first cell is a grade number
     for row in soup.find_all("tr"):
         cells = row.find_all(["td", "th"])
         if not cells:
@@ -100,6 +102,7 @@ def _parse_grade_table(html: str) -> dict[int, int]:
     if grade_counts:
         return grade_counts
 
+    # Strategy 2: look for labeled grade elements
     for el in soup.find_all(class_=re.compile(r"grade|pop|count|psa", re.I)):
         text = el.get_text(" ", strip=True)
         for m in re.finditer(r"\b(10|[1-9])\b[^\d]*?(\d[\d,]*)", text):
@@ -123,24 +126,39 @@ def _make_session():
 
 
 def _search_130point(card_name: str, set_name: str, num: str) -> tuple[str, str]:
+    """
+    Search 130point.com and return (best_card_url, search_html).
+    Tries multiple URL patterns.
+    """
     session = _make_session()
 
-    search_queries = [f"{card_name} {set_name}", card_name]
+    # Try multiple search approaches
+    search_queries = [
+        f"{card_name} {set_name}",
+        card_name,
+    ]
     if num:
         search_queries.insert(0, f"{card_name} {num} {set_name}")
 
     for query in search_queries:
         try:
-            resp = session.get(f"{BASE_URL}/", params={"q": query}, timeout=15)
+            resp = session.get(
+                f"{BASE_URL}/",
+                params={"q": query},
+                timeout=15,
+            )
         except Exception as e:
+            print(f"  Request failed: {e}")
             continue
 
         if resp.status_code != 200:
+            print(f"  130point.com returned {resp.status_code}")
             continue
 
         _save_debug("pop_search.html", resp.text)
         soup = BeautifulSoup(resp.text, "html.parser")
 
+        # Score all result links
         best_href = ""
         best_score = -1.0
         for a in soup.find_all("a", href=True):
@@ -189,6 +207,7 @@ def fetch_population(card_name: str, set_name: str, card_number: str) -> dict:
 
         base["source_url"] = card_url
 
+        # Fetch the card's grade breakdown page
         session = _make_session()
         pop_resp = session.get(card_url, timeout=15)
         _save_debug("pop_card_page.html", pop_resp.text)

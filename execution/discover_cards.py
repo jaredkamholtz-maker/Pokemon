@@ -37,6 +37,8 @@ OUTPUT_FILE = Path(".tmp/discovered_cards.csv")
 PAGE_SIZE = 250
 RATE_DELAY = 0.3
 
+# Maps our set_name → Pokemon TCG API set ID.
+# Full list at: https://api.pokemontcg.io/v2/sets
 SET_ID_MAP: dict[str, str] = {
     # XY era
     "XY":               "xy1",

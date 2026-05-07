@@ -84,6 +84,7 @@ def filter_cards(df: pd.DataFrame) -> pd.DataFrame:
             response = client.messages.create(
                 model=MODEL,
                 max_tokens=1024,
+                # Cache system prompt across all batches — saves tokens and latency
                 system=[{"type": "text", "text": SYSTEM_PROMPT,
                           "cache_control": {"type": "ephemeral"}}],
                 messages=[{"role": "user", "content": card_list}],
@@ -98,6 +99,7 @@ def filter_cards(df: pd.DataFrame) -> pd.DataFrame:
             print(f"    Batch {batch_num + 1}/{total_batches}: "
                   f"kept {len(valid)}/{len(batch_rows)}")
         except Exception as e:
+            # On any error, keep the whole batch — never silently drop cards
             print(f"    Batch {batch_num + 1}/{total_batches}: error ({e}) — keeping all")
             keep_indices.extend(batch_df.index.tolist())
 

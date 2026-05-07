@@ -46,12 +46,30 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+# Maps our set_name → exact PriceCharting URL slug (where auto-slugify gets it wrong).
+# Standard slugify works for most sets; only add overrides where needed.
+SET_SLUG_OVERRIDES: dict[str, str] = {
+    "151":              "scarlet-&-violet-151",
+    "Paldea Evolved":   "paldea-evolved",
+    "Paradox Rift":     "paradox-rift",
+    "Temporal Forces":  "temporal-forces",
+    "Twilight Masquerade": "twilight-masquerade",
+    "Surging Sparks":   "surging-sparks",
+    "BREAKthrough":     "breakthrough",
+    "BREAKpoint":       "breakpoint",
+}
+
 
 def slugify(text: str) -> str:
     text = str(text).lower().encode("ascii", "ignore").decode()
     text = re.sub(r"[^a-z0-9\s\-]", "", text)
     text = re.sub(r"[\s\-]+", "-", text.strip())
     return text
+
+
+def set_slug(set_name: str) -> str:
+    """Return the PriceCharting URL slug for a set, using overrides where needed."""
+    return SET_SLUG_OVERRIDES.get(set_name, slugify(set_name))
 
 
 def _card_number_slug(card_number: str) -> str:
@@ -203,15 +221,15 @@ def fetch_card_prices(card_name: str, set_name: str, card_number: str) -> dict:
         "error": None,
     }
 
-    set_slug = f"pokemon-{slugify(set_name)}"
+    sslug = f"pokemon-{set_slug(set_name)}"
     card_slug = slugify(card_name)
     num_slug = _card_number_slug(card_number)
 
     # Build candidate URLs — try most-specific first
     candidates = []
     if num_slug:
-        candidates.append(f"{BASE_URL}/game/{set_slug}/{card_slug}-{num_slug}")
-    candidates.append(f"{BASE_URL}/game/{set_slug}/{card_slug}")
+        candidates.append(f"{BASE_URL}/game/{sslug}/{card_slug}-{num_slug}")
+    candidates.append(f"{BASE_URL}/game/{sslug}/{card_slug}")
 
     soup = None
     used_url = None

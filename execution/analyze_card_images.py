@@ -45,8 +45,8 @@ OUTPUT_SHORTLIST = Path(".tmp/final_shortlist.csv")
 DEBUG_DIR = Path(".tmp/debug_ebay")
 
 EBAY_SEARCH_URL = "https://www.ebay.com/sch/i.html"
-MAX_IMAGES = 5
-RATE_DELAY = 1.5
+MAX_IMAGES = 5       # images to send to Claude per card
+RATE_DELAY = 1.5     # seconds between eBay requests
 MODEL = "claude-sonnet-4-6"
 
 GRADING_PROMPT = """You are an experienced PSA grader examining a Pokemon card listed for sale on eBay.
@@ -87,6 +87,8 @@ HEADERS = {
 }
 
 
+# ── eBay search ────────────────────────────────────────────────────────────────
+
 def _get(url: str, params: dict | None = None) -> object | None:
     try:
         if _USE_CFFI:
@@ -104,17 +106,22 @@ def _save_debug(filename: str, content: str) -> None:
 
 
 def _is_graded_title(title: str) -> bool:
+    """Return True if the listing title suggests a graded copy (PSA/BGS/CGC)."""
     t = title.lower()
     return any(kw in t for kw in ["psa ", "psa-", "bgs ", "cgc ", "sgc ", "graded", "gem mint"])
 
 
 def search_ebay_listing(card_name: str, set_name: str) -> dict | None:
+    """
+    Search eBay for the cheapest active raw/ungraded Buy-It-Now listing.
+    Returns dict with keys: title, price, listing_url, image_urls  — or None.
+    """
     query = f"{card_name} {set_name} pokemon raw ungraded"
     params = {
         "_nkw": query,
-        "LH_BIN": "1",
-        "_sop": "15",
-        "LH_ItemCondition": "3000",
+        "LH_BIN": "1",          # Buy It Now only
+        "_sop": "15",           # sort by lowest price + shipping
+        "LH_ItemCondition": "3000",  # Used condition
     }
 
     resp = _get(EBAY_SEARCH_URL, params=params)
@@ -157,11 +164,16 @@ def search_ebay_listing(card_name: str, set_name: str) -> dict | None:
     if not candidates:
         return None
 
+    # Pick cheapest listing that has a positive price
     best = min((c for c in candidates if c["price"] > 0), key=lambda c: c["price"], default=candidates[0])
     return best
 
 
 def get_listing_images(listing_url: str) -> list[str]:
+    """
+    Fetch an eBay listing page and extract up to MAX_IMAGES photo URLs.
+    Returns a list of image URLs (full-resolution where possible).
+    """
     time.sleep(RATE_DELAY)
     resp = _get(listing_url)
     if not resp or resp.status_code != 200:
@@ -172,14 +184,18 @@ def get_listing_images(listing_url: str) -> list[str]:
 
     image_urls: list[str] = []
 
+    # Strategy 1: eBay embeds image data as JSON in a script tag
     for script in BeautifulSoup(html, "html.parser").find_all("script"):
         text = script.string or ""
+        # Look for image URL arrays in the page JSON
         matches = re.findall(r'"(?:originalImg|maxImageUrl|imageUrl|PictureURL)":\s*"(https://i\.ebayimg\.com[^"]+)"', text)
         for url in matches:
+            # Prefer s-l1600 (highest res); fall back to what we find
             clean = re.sub(r"s-l\d+", "s-l1600", url)
             if clean not in image_urls:
                 image_urls.append(clean)
 
+    # Strategy 2: img tags pointing to ebayimg.com
     if not image_urls:
         soup = BeautifulSoup(html, "html.parser")
         for img in soup.find_all("img"):
@@ -193,6 +209,7 @@ def get_listing_images(listing_url: str) -> list[str]:
 
 
 def download_image_b64(url: str) -> str | None:
+    """Download an image and return base64-encoded content, or None on failure."""
     try:
         resp = _get(url)
         if resp and resp.status_code == 200:
@@ -202,7 +219,13 @@ def download_image_b64(url: str) -> str | None:
     return None
 
 
+# ── Claude Vision analysis ─────────────────────────────────────────────────────
+
 def analyze_images(card_name: str, set_name: str, image_urls: list[str]) -> dict:
+    """
+    Send listing images to Claude Vision and return the grade assessment dict.
+    Returns a dict with assessment keys, plus an 'error' key on failure.
+    """
     load_dotenv()
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -213,6 +236,7 @@ def analyze_images(card_name: str, set_name: str, image_urls: list[str]) -> dict
     except ImportError:
         return {"error": "anthropic not installed", "recommendation": "SKIP"}
 
+    # Download images
     images_b64 = []
     for url in image_urls:
         b64 = download_image_b64(url)
@@ -224,6 +248,7 @@ def analyze_images(card_name: str, set_name: str, image_urls: list[str]) -> dict
         return {"error": "No images could be downloaded", "recommendation": "SKIP",
                 "photo_quality": "INSUFFICIENT"}
 
+    # Build content blocks: one image block per photo
     content = []
     for b64 in images_b64:
         content.append({
@@ -243,6 +268,7 @@ def analyze_images(card_name: str, set_name: str, image_urls: list[str]) -> dict
             messages=[{"role": "user", "content": content}],
         )
         raw = response.content[0].text.strip()
+        # Extract JSON even if Claude adds extra text
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         if m:
             result = json.loads(m.group())
@@ -253,6 +279,8 @@ def analyze_images(card_name: str, set_name: str, image_urls: list[str]) -> dict
         return {"error": str(e), "recommendation": "SKIP"}
 
 
+# ── Main run ───────────────────────────────────────────────────────────────────
+
 def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
     load_dotenv()
 
@@ -261,6 +289,7 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
         print("No flip opportunities to analyze.")
         return pd.DataFrame()
 
+    # Take top N by ROI (already sorted, but be safe)
     sort_col = "roi" if "roi" in df.columns else df.columns[0]
     candidates = df.sort_values(sort_col, ascending=False).head(top_n).copy()
     print(f"Analyzing top {len(candidates)} cards from {input_path}...\n")
@@ -296,6 +325,7 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
             "error": None,
         }
 
+        # Step 1: Find eBay listing
         print(f"  Searching eBay...", end=" ", flush=True)
         time.sleep(RATE_DELAY)
         listing = search_ebay_listing(card_name, set_name)
@@ -309,6 +339,7 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
         result["ebay_price"] = listing["price"]
         print(f"found at ${listing['price']:.2f}")
 
+        # Step 2: Get listing images
         print(f"  Fetching images...", end=" ", flush=True)
         image_urls = get_listing_images(listing["url"])
         if not image_urls:
@@ -318,6 +349,7 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
             continue
         print(f"{len(image_urls)} images")
 
+        # Step 3: Analyze with Claude Vision
         print(f"  Analyzing with Claude Vision...", end=" ", flush=True)
         analysis = analyze_images(card_name, set_name, image_urls)
 
@@ -366,7 +398,9 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Analyze eBay card images with Claude Vision")
-    parser.add_argument("--input", default=str(INPUT_FILE))
-    parser.add_argument("--top", type=int, default=20)
+    parser.add_argument("--input", default=str(INPUT_FILE),
+                        help="Flip opportunities CSV to pull candidates from")
+    parser.add_argument("--top", type=int, default=20,
+                        help="Number of top candidates to analyze (default: 20)")
     args = parser.parse_args()
     run(input_path=args.input, top_n=args.top)
