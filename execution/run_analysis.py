@@ -1,14 +1,18 @@
 """
-Full pipeline: discover cards → fetch prices → scrape population → calculate EV
-              → push to Google Sheet → send email summary.
+Full pipeline: fetch PokeData.io prices → scrape PSA population → filter → email
 
-Runs card discovery from data/target_sets.csv by default (full market scan).
-Pass --watchlist to analyze a specific list of cards instead.
+Steps:
+  1. fetch_pokedata_prices: discover cards + get ungraded/PSA prices from PokeData.io
+     Filter: PSA 9 or PSA 10 > $60 (configurable MIN_GRADED_PRICE)
+  2. scrape_pokedata_population: get PSA submission counts and gem rate from 130point.com
+  3. Filter: gem rate (PSA 9+10 / total) >= 50%
+  4. Email results: card name, raw price, PSA 9, PSA 10, gem rate, link
 
 Usage:
-    python execution/run_analysis.py                          # full market scan
-    python execution/run_analysis.py --skip-discovery         # reuse last discovered_cards.csv
-    python execution/run_analysis.py --watchlist data/watchlist.csv  # fixed card list
+    python execution/run_analysis.py
+    python execution/run_analysis.py --era scarlet-violet
+    python execution/run_analysis.py --sets "151,Evolving Skies"
+    python execution/run_analysis.py --skip-prices   # reuse last price_candidates.csv
     python execution/run_analysis.py --skip-sheets --skip-email
 """
 
@@ -26,13 +30,12 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-import discover_cards as discover_mod
-import fetch_tcgplayer_prices as prices_mod
+import fetch_pokedata_prices as prices_mod
 import scrape_pokedata_population as pop_mod
-import calculate_flip_ev as ev_mod
-import filter_cards_ai as ai_mod
 
-DISCOVERED_PATH = ".tmp/discovered_cards.csv"
+PRICES_PATH = ".tmp/price_candidates.csv"
+POP_PATH = ".tmp/pokedata_population.csv"
+OUTPUT_PATH = ".tmp/flip_opportunities.csv"
 
 
 # ── Google Sheets ──────────────────────────────────────────────────────────────
@@ -45,7 +48,6 @@ def push_to_google_sheets(df: pd.DataFrame, spreadsheet_id: str, tab_name: str) 
 
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = None
-
         if Path("token.json").exists():
             creds = Credentials.from_authorized_user_file("token.json", scopes)
         if not creds or not creds.valid:
@@ -53,27 +55,24 @@ def push_to_google_sheets(df: pd.DataFrame, spreadsheet_id: str, tab_name: str) 
                 creds.refresh(Request())
             else:
                 print("  Google credentials not set up — skipping Sheets output.")
-                print("  Run: python execution/setup_google_auth.py to authenticate.")
                 return None
 
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(spreadsheet_id)
-
         try:
             ws = sh.worksheet(tab_name)
             ws.clear()
         except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(title=tab_name, rows=500, cols=30)
+            ws = sh.add_worksheet(title=tab_name, rows=500, cols=20)
 
         df_out = df.copy().fillna("")
         ws.update([df_out.columns.tolist()] + df_out.values.tolist())
-
         url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
         print(f"  Pushed {len(df)} rows to Google Sheets: {url}")
         return url
 
     except ImportError:
-        print("  gspread not installed — skipping. Run: pip install gspread google-auth")
+        print("  gspread not installed — skipping.")
         return None
     except Exception as e:
         print(f"  Google Sheets error: {e}")
@@ -96,18 +95,17 @@ def _fmt_pct(val) -> str:
         return "—"
 
 
-def format_email_body(opportunities: pd.DataFrame, all_analyzed: int, today: str) -> tuple[str, str]:
-    """Return (html_body, plain_text_body) for the email."""
+def format_email_body(opportunities: pd.DataFrame, today: str) -> tuple[str, str]:
+    """Return (html_body, plain_body)."""
     subject_line = f"Pokemon Card Flip Opportunities — {today}"
-    summary = f"Analyzed {all_analyzed} cards &nbsp;|&nbsp; <strong>{len(opportunities)} passed filters</strong>"
+    count_summary = f"<strong>{len(opportunities)}</strong> cards with PSA gem rate ≥ 50%"
 
     if opportunities.empty:
         html = f"""<html><body style="font-family:sans-serif;color:#222;">
 <h2>{subject_line}</h2>
-<p>{summary}</p>
-<p>No cards met the ROI/gem-rate criteria today.</p>
+<p>No cards met the criteria today (PSA 9/10 &gt; $60 and gem rate ≥ 50%).</p>
 </body></html>"""
-        plain = f"{subject_line}\nAnalyzed {all_analyzed} cards | {len(opportunities)} passed filters\n\nNo cards met the ROI/gem-rate criteria today."
+        plain = f"{subject_line}\n\nNo cards met the criteria today."
         return html, plain
 
     rows_html = []
@@ -118,48 +116,43 @@ def format_email_body(opportunities: pd.DataFrame, all_analyzed: int, today: str
         raw = _fmt_price(row.get("raw_price"))
         psa9 = _fmt_price(row.get("psa9_price"))
         psa10 = _fmt_price(row.get("psa10_price"))
-        profit = _fmt_price(row.get("profit"))
-        roi = _fmt_pct(row.get("roi"))
         gem = _fmt_pct(row.get("gem_rate"))
+        total = row.get("total_graded")
+        total_str = f"{int(total):,}" if pd.notna(total) else "—"
         url = row.get("source_url") or ""
-        low = row.get("low_data")
 
         name_cell = f'<a href="{url}" style="color:#1a73e8;text-decoration:none;">{name}</a>' if url else name
-        low_badge = ' <span style="color:#b45309;font-size:11px;">⚠ low data</span>' if low else ""
 
         rows_html.append(f"""<tr style="border-bottom:1px solid #e5e7eb;">
-  <td style="padding:10px 14px;font-weight:500;">{rank}. {name_cell}{low_badge}<br>
+  <td style="padding:10px 14px;font-weight:500;">{rank}. {name_cell}<br>
     <span style="font-size:12px;color:#6b7280;">{set_name}</span></td>
   <td style="padding:10px 14px;text-align:right;">{raw}</td>
   <td style="padding:10px 14px;text-align:right;">{psa9}</td>
   <td style="padding:10px 14px;text-align:right;font-weight:600;color:#15803d;">{psa10}</td>
-  <td style="padding:10px 14px;text-align:right;">{gem}</td>
-  <td style="padding:10px 14px;text-align:right;font-weight:600;color:#15803d;">{profit}</td>
-  <td style="padding:10px 14px;text-align:right;font-weight:700;color:#15803d;">{roi}</td>
+  <td style="padding:10px 14px;text-align:right;font-weight:700;color:#15803d;">{gem}</td>
+  <td style="padding:10px 14px;text-align:right;color:#6b7280;">{total_str}</td>
 </tr>""")
 
-        link_text = f"  {url}" if url else ""
-        low_note = "  ⚠ low data" if low else ""
+        link_text = f"\n  {url}" if url else ""
         rows_plain.append(
             f"#{rank} {name} | {set_name}\n"
-            f"  Raw: {raw}  PSA9: {psa9}  PSA10: {psa10}  Gem: {gem}  Profit: {profit}  ROI: {roi}"
-            f"{low_note}{link_text}"
+            f"  Raw: {raw}  PSA9: {psa9}  PSA10: {psa10}  Gem Rate: {gem}  "
+            f"Total Graded: {total_str}{link_text}"
         )
 
     table_rows = "\n".join(rows_html)
-    html = f"""<html><body style="font-family:sans-serif;color:#222;max-width:900px;margin:0 auto;">
+    html = f"""<html><body style="font-family:sans-serif;color:#222;max-width:860px;margin:0 auto;">
 <h2 style="color:#1e293b;">{subject_line}</h2>
-<p style="color:#64748b;">{summary}</p>
+<p style="color:#64748b;">{count_summary}</p>
 <table style="width:100%;border-collapse:collapse;font-size:14px;">
   <thead>
     <tr style="background:#f1f5f9;text-align:left;">
       <th style="padding:10px 14px;">Card</th>
-      <th style="padding:10px 14px;text-align:right;">Raw</th>
+      <th style="padding:10px 14px;text-align:right;">Raw (Ungraded)</th>
       <th style="padding:10px 14px;text-align:right;">PSA 9</th>
       <th style="padding:10px 14px;text-align:right;">PSA 10</th>
       <th style="padding:10px 14px;text-align:right;">Gem Rate</th>
-      <th style="padding:10px 14px;text-align:right;">Profit</th>
-      <th style="padding:10px 14px;text-align:right;">ROI</th>
+      <th style="padding:10px 14px;text-align:right;">Total Graded</th>
     </tr>
   </thead>
   <tbody>
@@ -167,11 +160,11 @@ def format_email_body(opportunities: pd.DataFrame, all_analyzed: int, today: str
   </tbody>
 </table>
 <p style="font-size:12px;color:#94a3b8;margin-top:24px;">
-  Raw = ungraded market price &nbsp;|&nbsp; Profit and ROI assume {_fmt_pct(os.environ.get('SELLING_FEE_RATE', 0.13))} selling fee + grading cost
+  Gem Rate = % of all PSA submissions that graded 9 or 10. Only cards ≥ 50% shown.
 </p>
 </body></html>"""
 
-    plain = f"{subject_line}\nAnalyzed {all_analyzed} cards | {len(opportunities)} passed filters\n\n"
+    plain = f"{subject_line}\n{len(opportunities)} cards with gem rate ≥ 50%\n\n"
     plain += "\n\n".join(rows_plain)
     return html, plain
 
@@ -185,18 +178,16 @@ def send_email(html_body: str, plain_body: str, subject: str) -> bool:
     email_to = os.environ.get("EMAIL_TO")
 
     if not all([smtp_host, smtp_user, smtp_pass, email_to]):
-        print("  Email not configured — skipping. Set SMTP_HOST, SMTP_USER, SMTP_PASS, EMAIL_TO in .env")
+        print("  Email not configured — skipping.")
         return False
 
-    # EMAIL_TO supports comma-separated addresses: you@example.com,client@example.com
-    recipients = [addr.strip() for addr in email_to.split(",") if addr.strip()]
-
+    recipients = [a.strip() for a in email_to.split(",") if a.strip()]
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = smtp_user
     msg["To"] = ", ".join(recipients)
     msg.attach(MIMEText(plain_body, "plain"))
-    msg.attach(MIMEText(html_body, "html"))  # HTML part last — preferred by email clients
+    msg.attach(MIMEText(html_body, "html"))
 
     try:
         with smtplib.SMTP(smtp_host, smtp_port) as server:
@@ -214,13 +205,15 @@ def send_email(html_body: str, plain_body: str, subject: str) -> bool:
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def run(
-    watchlist: str | None = None,
     target_sets: str = "data/target_sets.csv",
     era: str | None = None,
     sets: list[str] | None = None,
-    skip_discovery: bool = False,
+    skip_prices: bool = False,
     skip_sheets: bool = False,
     skip_email: bool = False,
+    min_graded_price: float = 60.0,
+    min_roi: float = 0.50,
+    min_gem_rate: float = 0.50,
 ):
     load_dotenv()
     today = date.today().isoformat()
@@ -229,120 +222,112 @@ def run(
     print(f"Pokemon Flip Analysis  —  {today}")
     print(f"{'='*60}\n")
 
-    # Determine card source: fixed watchlist or market discovery (full / filtered)
-    if watchlist:
-        card_source = watchlist
-        print(f"[MODE] Fixed watchlist: {watchlist}")
+    # Step 1: Fetch prices from PokeData.io and apply price filter
+    if skip_prices and Path(PRICES_PATH).exists():
+        n = len(pd.read_csv(PRICES_PATH))
+        print(f"[1/2] Reusing {n} price candidates from {PRICES_PATH}")
     else:
-        card_source = DISCOVERED_PATH
-        scope = f"era={era}" if era else (f"sets={sets}" if sets else "full universe")
-        if skip_discovery and Path(DISCOVERED_PATH).exists():
-            n = len(pd.read_csv(DISCOVERED_PATH))
-            print(f"[MODE] Market scan ({scope}) — reusing {n} previously discovered cards")
-        else:
-            print(f"[0/?] Discovering cards ({scope}) from {target_sets}...")
-            discover_mod.run(target_sets_path=target_sets, output_path=DISCOVERED_PATH,
-                             era=era, sets=sets)
-            n = len(pd.read_csv(DISCOVERED_PATH))
-            print(f"  → {n} cards discovered\n")
+        scope = f"era={era}" if era else (f"sets={sets}" if sets else "all sets")
+        grading_fee = float(os.environ.get("GRADING_FEE", 25.0))
+        print(f"[1/2] Fetching PokeData.io prices ({scope}, "
+              f"PSA 9/10 > ${min_graded_price:.0f}, ≥{min_roi*100:.0f}% ROI after ${grading_fee:.0f} grading fee)...")
+        prices_mod.run(
+            target_sets_path=target_sets,
+            output_path=PRICES_PATH,
+            era=era,
+            sets=sets,
+            min_graded_price=min_graded_price,
+            grading_fee=grading_fee,
+            min_roi=min_roi,
+        )
 
-    # AI pre-filter: drop commons/trainers/bulk before expensive scraping
-    print("[PRE] AI filtering for PSA flip candidates...")
-    card_df = pd.read_csv(card_source)
-    filtered_df = ai_mod.filter_cards(card_df)
-    filtered_path = ".tmp/filtered_cards.csv"
-    filtered_df.to_csv(filtered_path, index=False)
-    card_source = filtered_path
+    price_df = pd.read_csv(PRICES_PATH)
+    if price_df.empty:
+        print("\nNo cards passed the price filter — nothing to analyze.")
+        return pd.DataFrame()
 
-    total_cards = len(filtered_df)
-    print(f"Analyzing {total_cards} cards...\n")
+    print(f"  → {len(price_df)} candidates\n")
 
-    # Step 1: Prices
-    print("[1/3] Fetching prices from PriceCharting (parallel)...")
-    prices_df = prices_mod.run(card_source)
+    # Step 2: Scrape population data for candidates
+    print(f"[2/2] Scraping PSA population from 130point.com ({len(price_df)} cards)...")
+    pop_mod.run(PRICES_PATH)
 
-    # Step 2: Population
-    print("\n[2/3] Scraping population data from 130point.com (parallel)...")
-    pop_df = pop_mod.run(card_source)
-
-    # Step 3: EV calculation
-    print("\n[3/3] Calculating expected value...")
-    all_df = ev_mod.run(
-        grading_fee=float(os.environ.get("GRADING_FEE", 25.0)),
-        selling_fee_rate=float(os.environ.get("SELLING_FEE_RATE", 0.13)),
+    # Join prices + population
+    pop_df = pd.read_csv(POP_PATH)
+    df = pd.merge(
+        price_df,
+        pop_df[["card_name", "set_name", "card_number", "total_graded", "psa9_count", "psa10_count", "gem_rate"]],
+        on=["card_name", "set_name", "card_number"],
+        how="left",
     )
-    opportunities = ev_mod.get_opportunities(all_df)
+
+    # Filter: gem rate >= 50%
+    has_gem = df["gem_rate"].notna()
+    opportunities = df[has_gem & (df["gem_rate"] >= min_gem_rate)].copy()
+    opportunities = opportunities.sort_values("gem_rate", ascending=False)
+
+    # Save full results
+    Path(OUTPUT_PATH).parent.mkdir(parents=True, exist_ok=True)
+    opportunities.to_csv(OUTPUT_PATH, index=False)
 
     print(f"\n{'='*60}")
-    print(f"{len(opportunities)} opportunities found out of {len(all_df)} analyzed")
+    print(f"{len(opportunities)} opportunities (gem rate ≥ {min_gem_rate*100:.0f}%) "
+          f"out of {len(price_df)} price candidates")
     print(f"{'='*60}\n")
 
     # Google Sheets
     if not skip_sheets:
         spreadsheet_id = os.environ.get("GOOGLE_SPREADSHEET_ID")
         if spreadsheet_id:
-            tab_name = f"Flip Analysis {today}"
-            push_to_google_sheets(all_df, spreadsheet_id, tab_name)
+            push_to_google_sheets(opportunities, spreadsheet_id, f"Flip Analysis {today}")
         else:
             print("  GOOGLE_SPREADSHEET_ID not set — skipping Sheets output.")
 
     # Email
     if not skip_email:
-        html_body, plain_body = format_email_body(opportunities, len(all_df), today)
+        html_body, plain_body = format_email_body(opportunities, today)
         subject = f"[Pokemon Flip] {len(opportunities)} opportunities — {today}"
         send_email(html_body, plain_body, subject)
 
-    # Print top opportunities
+    # Print summary
     if opportunities.empty:
-        print("No cards passed all filters today.")
+        print("No cards met all criteria today.")
     else:
-        print(f"Top opportunities (sorted by ROI):\n")
-        cols = ["card_name", "set_name", "raw_price", "psa10_price",
-                "gem_rate", "total_graded", "profit", "roi"]
+        cols = ["card_name", "set_name", "raw_price", "psa9_price", "psa10_price", "gem_rate", "total_graded"]
         print(opportunities[[c for c in cols if c in opportunities.columns]].to_string(index=False))
 
-    print(f"\nFull analysis saved to: .tmp/flip_opportunities.csv")
+    print(f"\nFull results saved to: {OUTPUT_PATH}")
     return opportunities
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run Pokemon card flip analysis")
-    parser.add_argument(
-        "--watchlist",
-        default=None,
-        help="Path to a fixed card list CSV. Omit for full market scan (uses target_sets.csv).",
-    )
-    parser.add_argument(
-        "--target-sets",
-        default="data/target_sets.csv",
-        help="Sets to scan for full market mode (default: data/target_sets.csv)",
-    )
-    parser.add_argument(
-        "--era",
-        default=None,
-        help="Filter discovery to one era: vintage, sword-shield, scarlet-violet",
-    )
-    parser.add_argument(
-        "--sets",
-        default=None,
-        help="Comma-separated set names to scan, e.g. '151,Evolving Skies,Obsidian Flames'",
-    )
-    parser.add_argument(
-        "--skip-discovery",
-        action="store_true",
-        help="Skip card discovery and reuse the last .tmp/discovered_cards.csv",
-    )
-    parser.add_argument("--skip-sheets", action="store_true", help="Skip Google Sheets output")
-    parser.add_argument("--skip-email", action="store_true", help="Skip email notification")
+    parser = argparse.ArgumentParser(description="Pokemon card flip analysis")
+    parser.add_argument("--target-sets", default="data/target_sets.csv")
+    parser.add_argument("--era", default=None,
+                        help="Filter to one era: mega-evolution, sword-shield, scarlet-violet")
+    parser.add_argument("--sets", default=None,
+                        help="Comma-separated set names, e.g. '151,Evolving Skies'")
+    parser.add_argument("--skip-prices", action="store_true",
+                        help="Skip price fetch and reuse last price_candidates.csv")
+    parser.add_argument("--skip-sheets", action="store_true")
+    parser.add_argument("--skip-email", action="store_true")
+    parser.add_argument("--min-graded-price", type=float, default=60.0,
+                        help="Min PSA 9 or PSA 10 price to include a card (default: $60)")
+    parser.add_argument("--min-roi", type=float, default=0.50,
+                        help="Min ROI after $25 grading fee (default: 0.50 = 50%%)")
+    parser.add_argument("--min-gem-rate", type=float, default=0.50,
+                        help="Min gem rate to surface a card (default: 0.50 = 50%%)")
     args = parser.parse_args()
 
     sets_list = [s.strip() for s in args.sets.split(",")] if args.sets else None
     run(
-        watchlist=args.watchlist,
         target_sets=args.target_sets,
         era=args.era,
         sets=sets_list,
-        skip_discovery=args.skip_discovery,
+        skip_prices=args.skip_prices,
         skip_sheets=args.skip_sheets,
         skip_email=args.skip_email,
+        min_graded_price=args.min_graded_price,
+        min_roi=args.min_roi,
+        min_gem_rate=args.min_gem_rate,
     )
