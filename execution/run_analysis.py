@@ -1,5 +1,5 @@
 """
-Full pipeline: discover cards → AI filter → fetch prices → scrape PSA population → email
+Full pipeline: discover → AI filter → prices → PSA population → EV → image analysis → email
 
 Steps:
   1. discover_cards: query PokeData.io for all cards in target sets (~3,000 cards)
@@ -8,8 +8,10 @@ Steps:
      Filter: PSA 9 or PSA 10 > $60 (configurable MIN_GRADED_PRICE)
   4. scrape_pokedata_population: get PSA submission counts and gem rate from 130point.com
   5. calculate_flip_ev: merge prices + population, calculate ROI
-  6. Filter: gem rate >= 50% AND ROI >= 10% after $25 grading fee
-  7. Email results: card name, raw price, PSA 9, PSA 10, profit %, gem rate, link
+     Filter: gem rate >= 50% AND ROI >= 10% after $25 grading fee
+  6. analyze_card_images: find cheapest eBay raw listing per top-20 card, analyze photos
+     with Claude Vision, keep only SUBMIT cards
+  7. Email final shortlist: card, raw price, PSA 9/10, profit %, gem rate, predicted grade
 
 Usage:
     python execution/run_analysis.py
@@ -17,6 +19,7 @@ Usage:
     python execution/run_analysis.py --sets "151,Evolving Skies"
     python execution/run_analysis.py --skip-discovery  # reuse last discovered_cards.csv
     python execution/run_analysis.py --skip-prices     # reuse last tcgplayer_prices.csv
+    python execution/run_analysis.py --skip-images     # skip eBay image analysis step
     python execution/run_analysis.py --skip-sheets --skip-email
 """
 
@@ -39,12 +42,14 @@ import filter_cards_ai as ai_filter_mod
 import fetch_tcgplayer_prices as prices_mod
 import scrape_pokedata_population as pop_mod
 import calculate_flip_ev as ev_mod
+import analyze_card_images as images_mod
 
 DISCOVERED_PATH = ".tmp/discovered_cards.csv"
 FILTERED_PATH = ".tmp/filtered_cards.csv"
 PRICES_PATH = ".tmp/tcgplayer_prices.csv"
 POP_PATH = ".tmp/pokedata_population.csv"
 OUTPUT_PATH = ".tmp/flip_opportunities.csv"
+SHORTLIST_PATH = ".tmp/final_shortlist.csv"
 
 
 # ── Google Sheets ──────────────────────────────────────────────────────────────
@@ -104,10 +109,14 @@ def _fmt_pct(val) -> str:
         return "—"
 
 
-def format_email_body(opportunities: pd.DataFrame, today: str) -> tuple[str, str]:
+def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysis: bool = False) -> tuple[str, str]:
     """Return (html_body, plain_body)."""
     subject_line = f"Pokemon Card Flip Opportunities — {today}"
-    count_summary = f"<strong>{len(opportunities)}</strong> cards with PSA gem rate ≥ 50% and ROI ≥ 10%"
+    if has_image_analysis:
+        count_summary = (f"<strong>{len(opportunities)}</strong> cards passed all filters "
+                         f"including eBay photo analysis (Claude Vision)")
+    else:
+        count_summary = f"<strong>{len(opportunities)}</strong> cards with PSA gem rate ≥ 50% and ROI ≥ 10%"
 
     if opportunities.empty:
         html = f"""<html><body style="font-family:sans-serif;color:#222;">
@@ -130,29 +139,62 @@ def format_email_body(opportunities: pd.DataFrame, today: str) -> tuple[str, str
         total = row.get("total_graded")
         total_str = f"{int(total):,}" if pd.notna(total) else "—"
         url = row.get("source_url") or ""
+        ebay_url = row.get("ebay_listing_url") or ""
 
-        name_cell = f'<a href="{url}" style="color:#1a73e8;text-decoration:none;">{name}</a>' if url else name
+        # Image analysis columns (only present when step 6 ran)
+        pred_grade = row.get("predicted_grade")
+        psa9p = row.get("psa9_or_better_probability")
+        notes = row.get("notes") or ""
+
+        card_link = f'<a href="{url}" style="color:#1a73e8;text-decoration:none;">{name}</a>' if url else name
+        ebay_link = (f' <a href="{ebay_url}" style="font-size:11px;color:#6b7280;">[eBay listing]</a>'
+                     if ebay_url else "")
+
+        image_cells = ""
+        image_plain = ""
+        if has_image_analysis:
+            pred_str = f"PSA {int(pred_grade)}" if pd.notna(pred_grade) else "—"
+            prob_str = f"{int(psa9p)}%" if pd.notna(psa9p) else "—"
+            image_cells = (
+                f'<td style="padding:10px 14px;text-align:right;font-weight:700;color:#7c3aed;">{pred_str}</td>'
+                f'<td style="padding:10px 14px;text-align:right;color:#7c3aed;">{prob_str}</td>'
+            )
+            image_plain = f"  Predicted: {pred_str}  PSA9+ Probability: {prob_str}"
+            if notes:
+                image_plain += f"\n  Note: {notes}"
 
         rows_html.append(f"""<tr style="border-bottom:1px solid #e5e7eb;">
-  <td style="padding:10px 14px;font-weight:500;">{rank}. {name_cell}<br>
-    <span style="font-size:12px;color:#6b7280;">{set_name}</span></td>
+  <td style="padding:10px 14px;font-weight:500;">{rank}. {card_link}{ebay_link}<br>
+    <span style="font-size:12px;color:#6b7280;">{set_name}</span>
+    {"<br><span style='font-size:11px;color:#9ca3af;font-style:italic;'>" + notes + "</span>" if has_image_analysis and notes else ""}
+  </td>
   <td style="padding:10px 14px;text-align:right;">{raw}</td>
   <td style="padding:10px 14px;text-align:right;">{psa9}</td>
   <td style="padding:10px 14px;text-align:right;font-weight:600;color:#15803d;">{psa10}</td>
   <td style="padding:10px 14px;text-align:right;font-weight:700;color:#1d4ed8;">{roi}</td>
   <td style="padding:10px 14px;text-align:right;font-weight:700;color:#15803d;">{gem}</td>
+  {image_cells}
   <td style="padding:10px 14px;text-align:right;color:#6b7280;">{total_str}</td>
 </tr>""")
 
-        link_text = f"\n  {url}" if url else ""
+        link_text = f"\n  eBay: {ebay_url}" if ebay_url else (f"\n  {url}" if url else "")
         rows_plain.append(
             f"#{rank} {name} | {set_name}\n"
             f"  Raw: {raw}  PSA9: {psa9}  PSA10: {psa10}  Profit: {roi}  Gem Rate: {gem}  "
-            f"Total Graded: {total_str}{link_text}"
+            f"Total Graded: {total_str}{image_plain}{link_text}"
         )
 
+    image_headers = ""
+    image_footer = ""
+    if has_image_analysis:
+        image_headers = (
+            '<th style="padding:10px 14px;text-align:right;">Predicted Grade</th>'
+            '<th style="padding:10px 14px;text-align:right;">PSA 9+ Probability</th>'
+        )
+        image_footer = " Cards shown passed eBay photo analysis (Claude Vision)."
+
     table_rows = "\n".join(rows_html)
-    html = f"""<html><body style="font-family:sans-serif;color:#222;max-width:860px;margin:0 auto;">
+    html = f"""<html><body style="font-family:sans-serif;color:#222;max-width:960px;margin:0 auto;">
 <h2 style="color:#1e293b;">{subject_line}</h2>
 <p style="color:#64748b;">{count_summary}</p>
 <table style="width:100%;border-collapse:collapse;font-size:14px;">
@@ -164,6 +206,7 @@ def format_email_body(opportunities: pd.DataFrame, today: str) -> tuple[str, str
       <th style="padding:10px 14px;text-align:right;">PSA 10</th>
       <th style="padding:10px 14px;text-align:right;">Profit %</th>
       <th style="padding:10px 14px;text-align:right;">Gem Rate</th>
+      {image_headers}
       <th style="padding:10px 14px;text-align:right;">Total Graded</th>
     </tr>
   </thead>
@@ -172,11 +215,11 @@ def format_email_body(opportunities: pd.DataFrame, today: str) -> tuple[str, str
   </tbody>
 </table>
 <p style="font-size:12px;color:#94a3b8;margin-top:24px;">
-  Profit % = ROI after $25 grading fee vs best graded price. Gem Rate = % of all PSA submissions grading 9 or 10. Only cards ≥ 50% gem rate shown.
+  Profit % = ROI after $25 grading fee. Gem Rate = % of PSA submissions grading 9 or 10.{image_footer}
 </p>
 </body></html>"""
 
-    plain = f"{subject_line}\n{len(opportunities)} cards with gem rate ≥ 50% and ROI ≥ 10%\n\n"
+    plain = f"{subject_line}\n{len(opportunities)} cards\n\n"
     plain += "\n\n".join(rows_plain)
     return html, plain
 
@@ -223,11 +266,13 @@ def run(
     skip_discovery: bool = False,
     skip_ai_filter: bool = False,
     skip_prices: bool = False,
+    skip_images: bool = False,
     skip_sheets: bool = False,
     skip_email: bool = False,
     min_graded_price: float = 60.0,
     min_roi: float = 0.10,
     min_gem_rate: float = 0.50,
+    image_top_n: int = 20,
 ):
     load_dotenv()
     today = date.today().isoformat()
@@ -316,30 +361,49 @@ def run(
           f"ROI ≥ {min_roi*100:.0f}%) out of {len(prices_df)} price candidates")
     print(f"{'='*60}\n")
 
+    # Step 6: eBay image analysis (final filter on top N)
+    final = opportunities
+    has_image_analysis = False
+    if not skip_images and not opportunities.empty:
+        print(f"[6/6] Analyzing eBay listing photos (top {image_top_n} cards, Claude Vision)...")
+        shortlist = images_mod.run(input_path=OUTPUT_PATH, top_n=image_top_n)
+        if not shortlist.empty:
+            final = shortlist
+            has_image_analysis = True
+            Path(SHORTLIST_PATH).parent.mkdir(parents=True, exist_ok=True)
+            shortlist.to_csv(SHORTLIST_PATH, index=False)
+        else:
+            print("  No cards passed image analysis — falling back to full opportunity list.")
+        print()
+    elif skip_images:
+        print("[6/6] Skipping image analysis (--skip-images)\n")
+
     # Google Sheets
     if not skip_sheets:
         spreadsheet_id = os.environ.get("GOOGLE_SPREADSHEET_ID")
         if spreadsheet_id:
-            push_to_google_sheets(opportunities, spreadsheet_id, f"Flip Analysis {today}")
+            tab = f"Flip Analysis {today}" + (" (Vision)" if has_image_analysis else "")
+            push_to_google_sheets(final, spreadsheet_id, tab)
         else:
             print("  GOOGLE_SPREADSHEET_ID not set — skipping Sheets output.")
 
     # Email
     if not skip_email:
-        html_body, plain_body = format_email_body(opportunities, today)
-        subject = f"[Pokemon Flip] {len(opportunities)} opportunities — {today}"
+        html_body, plain_body = format_email_body(final, today, has_image_analysis=has_image_analysis)
+        subject = f"[Pokemon Flip] {len(final)} opportunities — {today}"
         send_email(html_body, plain_body, subject)
 
     # Print summary
-    if opportunities.empty:
+    if final.empty:
         print("No cards met all criteria today.")
     else:
         cols = ["card_name", "set_name", "raw_price", "psa9_price", "psa10_price",
-                "gem_rate", "roi", "total_graded"]
-        print(opportunities[[c for c in cols if c in opportunities.columns]].to_string(index=False))
+                "gem_rate", "roi", "predicted_grade", "psa9_or_better_probability"]
+        print(final[[c for c in cols if c in final.columns]].to_string(index=False))
 
-    print(f"\nFull results saved to: {OUTPUT_PATH}")
-    return opportunities
+    out = SHORTLIST_PATH if has_image_analysis else OUTPUT_PATH
+    print(f"\nFinal results saved to: {out}")
+    return final
 
 
 if __name__ == "__main__":
@@ -355,6 +419,10 @@ if __name__ == "__main__":
                         help="Reuse last filtered_cards.csv (skip Claude Haiku step)")
     parser.add_argument("--skip-prices", action="store_true",
                         help="Reuse last tcgplayer_prices.csv (skip PriceCharting fetch)")
+    parser.add_argument("--skip-images", action="store_true",
+                        help="Skip eBay image analysis step (faster, no Claude Vision credits)")
+    parser.add_argument("--image-top-n", type=int, default=20,
+                        help="Number of top cards to analyze with Claude Vision (default: 20)")
     parser.add_argument("--skip-sheets", action="store_true")
     parser.add_argument("--skip-email", action="store_true")
     parser.add_argument("--min-graded-price", type=float, default=60.0,
@@ -373,9 +441,11 @@ if __name__ == "__main__":
         skip_discovery=args.skip_discovery,
         skip_ai_filter=args.skip_ai_filter,
         skip_prices=args.skip_prices,
+        skip_images=args.skip_images,
         skip_sheets=args.skip_sheets,
         skip_email=args.skip_email,
         min_graded_price=args.min_graded_price,
         min_roi=args.min_roi,
         min_gem_rate=args.min_gem_rate,
+        image_top_n=args.image_top_n,
     )

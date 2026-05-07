@@ -8,7 +8,7 @@ Identify Pokemon cards that can be profitably bought raw (ungraded), submitted t
 - `.env` — all credentials and tunable parameters (see `.env.example`)
 - `ANTHROPIC_API_KEY` — required for AI pre-filter step (Claude Haiku)
 
-## Pipeline (5 Steps)
+## Pipeline (6 Steps)
 
 ```
 target_sets.csv
@@ -31,7 +31,15 @@ target_sets.csv
      → Filter applied: gem_rate >= 50% AND ROI >= 10% after $25 grading fee
       │
       ▼
-[OUT] Google Sheet + HTML Email (card, raw, PSA 9, PSA 10, profit %, gem rate)
+[6] analyze_card_images.py → .tmp/final_shortlist.csv      (top 20 cards only)
+     → Finds cheapest eBay raw listing per card (curl_cffi scraping)
+     → Downloads up to 5 listing photos
+     → Sends to Claude Vision for PSA grade assessment
+     → Keeps only SUBMIT cards (predicted PSA 9/10 candidate)
+      │
+      ▼
+[OUT] Google Sheet + HTML Email (card, raw, PSA 9, PSA 10, profit %, gem rate,
+                                  predicted grade, PSA 9+ probability, eBay link)
 ```
 
 ## Tools / Scripts
@@ -43,7 +51,8 @@ target_sets.csv
 | `execution/fetch_tcgplayer_prices.py` | Gets raw + PSA 9 + PSA 10 market prices from PriceCharting; parallel (3 workers); uses `curl_cffi` with `impersonate="chrome124"` to bypass Cloudflare bot detection |
 | `execution/scrape_pokedata_population.py` | Scrapes grade population data from 130point.com; parallel (5 workers) |
 | `execution/calculate_flip_ev.py` | Merges price + pop data; two-track EV analysis (see below); outputs full analysis sorted by ROI |
-| `execution/run_analysis.py` | Orchestrates all 5 steps end-to-end; supports era/set filtering and skip flags |
+| `execution/analyze_card_images.py` | Takes top N flip candidates; finds cheapest eBay raw listing per card; downloads photos; sends to Claude Vision for PSA grade prediction; outputs SUBMIT/SKIP recommendation |
+| `execution/run_analysis.py` | Orchestrates all 6 steps end-to-end; supports era/set filtering and skip flags |
 
 ## Running It
 
@@ -63,6 +72,10 @@ python execution/run_analysis.py --sets "151,Evolving Skies,Obsidian Flames"
 python execution/run_analysis.py --skip-discovery   # reuse .tmp/discovered_cards.csv
 python execution/run_analysis.py --skip-ai-filter   # reuse .tmp/filtered_cards.csv
 python execution/run_analysis.py --skip-prices      # reuse .tmp/tcgplayer_prices.csv
+python execution/run_analysis.py --skip-images      # skip eBay image analysis (no Claude Vision credits)
+
+# Analyze more or fewer cards with Claude Vision (default: top 20)
+python execution/run_analysis.py --image-top-n 10
 
 # Skip outputs
 python execution/run_analysis.py --skip-sheets --skip-email
@@ -171,3 +184,4 @@ Keeps: holo rares, full arts, alt arts, VMAX/VSTAR/ex/GX, secret rares, high-dem
 | 2026-05 | 290/299 PriceCharting cards returned 403 (Cloudflare bot detection) | Switched `fetch_tcgplayer_prices.py` to `curl_cffi` with `impersonate="chrome124"`; reduced workers 8→3; added 3s backoff+retry on 403 |
 | 2026-05 | Redesigned pipeline to use PokeData.io for prices — returned 0 cards | PokeData.io `/api/cards` endpoint returns only card metadata (no prices). Reverted to PriceCharting for prices; PokeData.io used only for card discovery. |
 | 2026-05 | AI pre-filter step missing after pipeline redesign | Restored `filter_cards_ai.py` in `run_analysis.py`; it is step 2 and required for performance (cuts scraping 3,000 → 400-600 cards) |
+| 2026-05 | Added eBay image analysis as step 6 | `analyze_card_images.py` scrapes eBay for cheapest raw listing per top-N card, downloads photos, sends to Claude Vision for PSA grade prediction; `--skip-images` bypasses step for faster runs |
