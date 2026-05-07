@@ -1,105 +1,130 @@
 """
-Discover all Pokemon cards across target sets using PokeData.io.
+Discover all Pokemon cards across target sets using the Pokemon TCG API.
 
-Reads data/target_sets.csv, queries PokeData.io for every card in each set,
-and writes .tmp/discovered_cards.csv with columns: card_name, set_name, card_number.
+api.pokemontcg.io is a free, public API with no bot detection and no API key
+required (though adding one via POKEMONTCG_API_KEY raises rate limits from
+1,000 to 20,000 req/day). It returns clean card data including name, number,
+rarity — exactly what we need to feed into the AI pre-filter.
 
-This replaces the static watchlist for broad market scanning.
+Reads data/target_sets.csv, queries the API for every card in each set,
+and writes .tmp/discovered_cards.csv: card_name, set_name, card_number, rarity.
 
 Usage:
     python execution/discover_cards.py
-    python execution/discover_cards.py --era vintage
-    python execution/discover_cards.py --sets "151,Evolving Skies,Obsidian Flames"
-    python execution/discover_cards.py --target-sets data/target_sets.csv
+    python execution/discover_cards.py --era scarlet-violet
+    python execution/discover_cards.py --sets "151,Evolving Skies"
 """
 
 import argparse
+import os
 import time
 from pathlib import Path
 
 import pandas as pd
-import requests
+from dotenv import load_dotenv
 
-POKEDATA_BASE = "https://pokedata.io"
+try:
+    from curl_cffi import requests as cffi_requests
+    _SESSION = cffi_requests.Session(impersonate="chrome124")
+    _USE_CFFI = True
+except ImportError:
+    import requests as _req_fallback
+    _SESSION = _req_fallback.Session()
+    _USE_CFFI = False
+
+API_BASE = "https://api.pokemontcg.io/v2"
 OUTPUT_FILE = Path(".tmp/discovered_cards.csv")
-RATE_DELAY = 0.5
+PAGE_SIZE = 250
+RATE_DELAY = 0.3
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "application/json",
+SET_ID_MAP: dict[str, str] = {
+    # XY era
+    "XY":               "xy1",
+    "Flashfire":        "xy2",
+    "Furious Fists":    "xy3",
+    "Phantom Forces":   "xy4",
+    "Primal Clash":     "xy5",
+    "Roaring Skies":    "xy6",
+    "Ancient Origins":  "xy7",
+    "BREAKthrough":     "xy8",
+    "BREAKpoint":       "xy9",
+    "Generations":      "g1",
+    "Fates Collide":    "xy10",
+    "Steam Siege":      "xy11",
+    "Evolutions":       "xy12",
+    # Sword & Shield era
+    "Darkness Ablaze":  "swsh3",
+    "Vivid Voltage":    "swsh4",
+    "Celebrations":     "cel25",
+    "Evolving Skies":   "swsh7",
+    "Fusion Strike":    "swsh8",
+    "Brilliant Stars":  "swsh9",
+    "Lost Origin":      "swsh11",
+    "Silver Tempest":   "swsh12",
+    "Crown Zenith":     "swsh12pt5",
+    # Scarlet & Violet era
+    "Paldea Evolved":       "sv2",
+    "Obsidian Flames":      "sv3",
+    "151":                  "sv3pt5",
+    "Paradox Rift":         "sv4",
+    "Temporal Forces":      "sv5",
+    "Twilight Masquerade":  "sv6",
+    "Surging Sparks":       "sv8",
 }
 
-# Explicit aliases for sets whose names differ between our target_sets.csv
-# and PokeData.io's catalog. Add entries here when [SKIP] is logged.
-ALIASES: dict[str, list[str]] = {
-    "151":        ["Pokemon Card 151", "Scarlet & Violet 151", "Pokemon 151", "SV 151", "151"],
-    "Base Set 2": ["Base Set 2", "Base Set Two"],
-}
+
+def _get_headers() -> dict:
+    load_dotenv()
+    headers = {"Accept": "application/json"}
+    api_key = os.environ.get("POKEMONTCG_API_KEY")
+    if api_key:
+        headers["X-Api-Key"] = api_key
+    return headers
 
 
-def get_all_sets() -> list[dict]:
-    resp = requests.get(f"{POKEDATA_BASE}/api/sets", headers=HEADERS, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    return data if isinstance(data, list) else data.get("sets", data.get("data", []))
+def get_cards_for_set(set_id: str) -> list[dict]:
+    """Fetch all cards for a set ID, handling pagination."""
+    headers = _get_headers()
+    cards = []
+    page = 1
+    while True:
+        try:
+            resp = _SESSION.get(
+                f"{API_BASE}/cards",
+                params={"q": f"set.id:{set_id}", "pageSize": PAGE_SIZE, "page": page,
+                        "select": "id,name,number,rarity"},
+                headers=headers,
+                timeout=20,
+            )
+        except Exception as e:
+            print(f"  Request error on page {page}: {e}")
+            break
 
-
-def find_set_id(target_name: str, all_sets: list[dict]) -> int | None:
-    """
-    Find PokeData.io set ID for a target set name.
-    Tries exact match first, then aliases, then length-ratio fuzzy match.
-    Penalises candidates that are shorter than the target to avoid
-    'Base Set' (8 chars) winning over 'Base Set 2' (10 chars).
-    """
-    target = target_name.lower().strip()
-    set_by_name = {s.get("name", "").lower().strip(): s["id"] for s in all_sets}
-
-    # 1. Exact match
-    if target in set_by_name:
-        return set_by_name[target]
-
-    # 2. Known aliases
-    for alias in ALIASES.get(target_name, []):
-        alias_lower = alias.lower().strip()
-        if alias_lower in set_by_name:
-            return set_by_name[alias_lower]
-
-    # 3. Fuzzy ratio match — require candidate length >= target length * 0.9
-    #    to avoid shorter subsets winning (e.g. 'Base Set' for target 'Base Set 2')
-    best_id = None
-    best_score = 0.0
-    for name, sid in set_by_name.items():
-        if len(name) < len(target) * 0.9:
-            continue  # candidate too short, likely a subset
-        ratio = min(len(target), len(name)) / max(len(target), len(name), 1)
-        if ratio < 0.75:
+        if resp.status_code == 429:
+            print(f"  Rate limited — waiting 10s...")
+            time.sleep(10)
             continue
-        score = ratio + (0.2 if target in name else 0.0)
-        if score > best_score:
-            best_score = score
-            best_id = sid
+        if resp.status_code != 200:
+            print(f"  API returned {resp.status_code}: {resp.text[:100]}")
+            break
 
-    return best_id
+        data = resp.json()
+        batch = data.get("data", [])
+        cards.extend(batch)
+        total = data.get("totalCount", len(cards))
+        if len(cards) >= total or not batch:
+            break
+        page += 1
+        time.sleep(RATE_DELAY)
 
-
-def get_cards_for_set(set_id: int) -> list[dict]:
-    resp = requests.get(
-        f"{POKEDATA_BASE}/api/cards",
-        params={"set_id": set_id, "limit": 1000},
-        headers=HEADERS,
-        timeout=20,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if isinstance(data, list):
-        return data
-    return data.get("cards", data.get("data", []))
+    return cards
 
 
 def run(target_sets_path: str = "data/target_sets.csv",
         output_path: str = str(OUTPUT_FILE),
         era: str | None = None,
         sets: list[str] | None = None) -> pd.DataFrame:
+    load_dotenv()
     target_df = pd.read_csv(target_sets_path)
 
     if sets:
@@ -111,53 +136,52 @@ def run(target_sets_path: str = "data/target_sets.csv",
             raise ValueError(f"'era' column missing from {target_sets_path}")
         target_df = target_df[target_df["era"] == era]
         if target_df.empty:
-            available = target_df["era"].unique().tolist() if "era" in target_df.columns else []
-            raise ValueError(f"No sets found for era '{era}'. Available: {available}")
+            raise ValueError(f"No sets found for era '{era}'")
 
     set_names = target_df["set_name"].tolist()
 
-    print(f"Fetching PokeData.io set catalog...")
-    all_sets = get_all_sets()
-    print(f"  {len(all_sets)} sets in catalog")
+    has_key = bool(os.environ.get("POKEMONTCG_API_KEY"))
+    print(f"Querying Pokemon TCG API (api_key={'yes' if has_key else 'no — 1k req/day limit'})")
 
     rows = []
+    skipped = []
     for set_name in set_names:
-        set_id = find_set_id(set_name, all_sets)
+        set_id = SET_ID_MAP.get(set_name)
         if not set_id:
-            # Show closest matches to help diagnose alias issues
-            close = [s.get("name") for s in all_sets
-                     if set_name.lower()[:4] in s.get("name", "").lower()][:5]
-            hint = f" — closest: {close}" if close else ""
-            print(f"  [SKIP] '{set_name}' not found in PokeData.io catalog{hint}")
+            print(f"  [SKIP] '{set_name}' — no set ID mapping. Add to SET_ID_MAP in discover_cards.py")
+            skipped.append(set_name)
             continue
 
-        print(f"  Fetching {set_name} (set_id={set_id})...", end=" ", flush=True)
-        try:
-            cards = get_cards_for_set(set_id)
-            print(f"{len(cards)} cards")
-            for card in cards:
-                rows.append({
-                    "card_name": card.get("name", ""),
-                    "set_name": set_name,
-                    "card_number": card.get("number", ""),
-                })
-            time.sleep(RATE_DELAY)
-        except Exception as e:
-            print(f"ERROR: {e}")
+        print(f"  {set_name} ({set_id})...", end=" ", flush=True)
+        cards = get_cards_for_set(set_id)
+        print(f"{len(cards)} cards")
 
-    df = pd.DataFrame(rows)
+        for card in cards:
+            rows.append({
+                "card_name":   card.get("name", ""),
+                "set_name":    set_name,
+                "card_number": card.get("number", ""),
+                "rarity":      card.get("rarity", ""),
+            })
+        time.sleep(RATE_DELAY)
+
+    if skipped:
+        print(f"\n  {len(skipped)} sets skipped (no ID mapping): {skipped}")
+
+    df = pd.DataFrame(rows) if rows else pd.DataFrame(
+        columns=["card_name", "set_name", "card_number", "rarity"])
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_path, index=False)
-    print(f"\nDiscovered {len(df)} cards across {len(set_names)} target sets → {output_path}")
+    print(f"\nDiscovered {len(df)} cards across {len(set_names) - len(skipped)} sets → {output_path}")
     return df
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Discover all cards in target sets")
+    parser = argparse.ArgumentParser(description="Discover all cards in target sets via Pokemon TCG API")
     parser.add_argument("--target-sets", default="data/target_sets.csv")
     parser.add_argument("--output", default=str(OUTPUT_FILE))
     parser.add_argument("--era", default=None,
-                        help="Filter by era (vintage, sword-shield, scarlet-violet)")
+                        help="Filter by era (mega-evolution, sword-shield, scarlet-violet)")
     parser.add_argument("--sets", default=None,
                         help="Comma-separated set names, e.g. '151,Evolving Skies'")
     args = parser.parse_args()
