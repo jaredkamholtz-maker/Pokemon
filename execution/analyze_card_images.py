@@ -3,21 +3,20 @@ Final filter: find cheapest eBay raw listings for each top flip candidate,
 analyze listing photos with Claude Vision, and pick the best quality copy.
 
 Design principles:
-  - Cheapest listing URL is ALWAYS saved before image analysis runs.
-    The email always has a direct eBay link, even if image analysis fails.
+  - Only real seller photos are accepted. Stock photos, fakes, and altered
+    cards are auto-disqualified and NEVER used as the listing URL.
+  - If ALL listings for a card are disqualified, no specific URL is set and
+    the email shows a generic eBay search link instead.
   - Images come exclusively from the eBay Browse API response.
-    No listing-page scraping — nothing to block, nothing to break.
-  - Stock photos, fake indicators, and altered cards are auto-skipped.
   - Image analysis is additive: Claude's grade prediction and PSA 9+
-    probability are bonus info. They never block a card from getting a link.
+    probability are bonus info on top of the EV math.
 
 Steps per card:
   1. Search eBay Browse API for cheapest ungraded listings (up to MAX_LISTINGS)
-  2. Save cheapest listing URL immediately as the fallback buy link
-  3. For each listing: download the API-provided image, send to Claude Vision
-  4. Skip listings with stock photos, fakes, or critical red flags
-  5. Pick the listing with highest PSA 9+ probability among valid photos
-  6. Update result with winning listing URL + Claude's grade assessment
+  2. For each listing: download the API-provided image, send to Claude Vision
+  3. Skip listings with stock photos, fakes, or critical red flags
+  4. Pick the listing with highest PSA 9+ probability among valid photos
+  5. Only set ebay_listing_url if at least one listing passed analysis
 
 Output:
   .tmp/image_analysis.csv   — full results for all analyzed cards
@@ -80,7 +79,7 @@ PREDICTED GRADE RANGE:
 Based on what's visible, estimate the most likely PSA grade range (e.g., low: 8, high: 9). Use 0 for both if ungradeable (creases, bends, water damage).
 
 RED FLAGS — check each and report true/false with reasoning:
-- stock_photo_suspected: photos look like generic/database images, not this specific card
+- stock_photo_suspected: photos look like generic/database images, not this specific card being sold by this seller
 - back_not_shown: no clear photo of card back
 - glare_obscures_detail: critical areas hidden by reflection
 - altered_appearance: signs of trimming, recoloring, or surface treatment
@@ -112,7 +111,7 @@ Return ONLY valid JSON, no other text:
   "summary": "2-3 sentence overall assessment"
 }"""
 
-# Red flags that auto-disqualify a listing regardless of grade
+# Red flags that auto-disqualify a listing
 _CRITICAL_FLAGS = {"stock_photo_suspected", "fake_indicators", "altered_appearance"}
 
 
@@ -220,13 +219,13 @@ def download_image_b64(url: str) -> str | None:
 
 def _derive_from_analysis(parsed: dict) -> dict:
     """
-    Convert the detailed nested analysis JSON into flat fields used by the
-    rest of the pipeline: recommendation, predicted_grade,
-    psa9_or_better_probability, photo_quality, notes, red_flags_active.
+    Convert the detailed nested analysis JSON into flat pipeline fields.
+    Returns recommendation, predicted_grade, psa9_or_better_probability,
+    photo_quality, notes, red_flags_active.
     """
     red_flags = parsed.get("red_flags", {})
 
-    # Critical flags → auto-SKIP
+    # Critical flags → auto-disqualify
     active_critical = [f for f in _CRITICAL_FLAGS
                        if isinstance(red_flags.get(f), dict) and red_flags[f].get("flag")]
     if active_critical:
@@ -235,11 +234,11 @@ def _derive_from_analysis(parsed: dict) -> dict:
             "predicted_grade": None,
             "psa9_or_better_probability": 0,
             "photo_quality": "disqualified",
-            "notes": f"Auto-skip: {', '.join(active_critical)}",
+            "notes": f"Disqualified: {', '.join(active_critical)}",
             "red_flags_active": ", ".join(active_critical),
         }
 
-    photo_q_info = parsed.get("overall_photo_quality", {})
+    photo_q_info  = parsed.get("overall_photo_quality", {})
     photo_quality = photo_q_info.get("rating", "fair") if isinstance(photo_q_info, dict) else "fair"
     if photo_quality == "poor":
         return {
@@ -251,12 +250,12 @@ def _derive_from_analysis(parsed: dict) -> dict:
             "red_flags_active": None,
         }
 
-    grade_info  = parsed.get("predicted_grade_range", {})
-    grade_low   = grade_info.get("low", 0)  if isinstance(grade_info, dict) else 0
-    grade_high  = grade_info.get("high", 0) if isinstance(grade_info, dict) else 0
-    grade_conf  = grade_info.get("confidence", 0.5) if isinstance(grade_info, dict) else 0.5
+    grade_info = parsed.get("predicted_grade_range", {})
+    grade_low  = grade_info.get("low",  0)   if isinstance(grade_info, dict) else 0
+    grade_high = grade_info.get("high", 0)   if isinstance(grade_info, dict) else 0
+    grade_conf = grade_info.get("confidence", 0.5) if isinstance(grade_info, dict) else 0.5
 
-    if grade_high == 0:  # ungradeable
+    if grade_high == 0:
         return {
             "recommendation": "SKIP",
             "predicted_grade": None,
@@ -274,8 +273,8 @@ def _derive_from_analysis(parsed: dict) -> dict:
         prob = int(min(85, 60 + 25 * grade_conf))
     elif grade_high >= 9:
         range_size = max(grade_high - grade_low, 1)
-        overlap = (grade_high - 9 + 1) / (range_size + 1)
-        prob = int(overlap * 70 * grade_conf)
+        overlap    = (grade_high - 9 + 1) / (range_size + 1)
+        prob       = int(overlap * 70 * grade_conf)
     else:
         prob = 0
 
@@ -288,15 +287,15 @@ def _derive_from_analysis(parsed: dict) -> dict:
                   and isinstance(info, dict) and info.get("flag")]
 
     summary = parsed.get("summary", "")
-    notes = (f"⚠️ {', '.join(soft_flags)}. " if soft_flags else "") + summary
+    notes   = (f"⚠️ {', '.join(soft_flags)}. " if soft_flags else "") + summary
 
     return {
-        "recommendation": "SUBMIT" if grade_high >= 9 and prob >= 30 else "SKIP",
-        "predicted_grade": predicted_grade,
+        "recommendation":           "SUBMIT" if grade_high >= 9 and prob >= 30 else "SKIP",
+        "predicted_grade":          predicted_grade,
         "psa9_or_better_probability": prob,
-        "photo_quality": photo_quality,
-        "notes": notes,
-        "red_flags_active": ", ".join(soft_flags) if soft_flags else None,
+        "photo_quality":            photo_quality,
+        "notes":                    notes,
+        "red_flags_active":         ", ".join(soft_flags) if soft_flags else None,
     }
 
 
@@ -332,7 +331,7 @@ def analyze_image(card_name: str, set_name: str, card_number: str, image_b64: st
             max_tokens=1024,
             messages=[{"role": "user", "content": content}],
         )
-        raw = response.content[0].text.strip()
+        raw       = response.content[0].text.strip()
         raw_clean = re.sub(r"```(?:json)?\s*", "", raw).strip()
 
         start = raw_clean.find("{")
@@ -344,8 +343,7 @@ def analyze_image(card_name: str, set_name: str, card_number: str, image_b64: st
         if not isinstance(parsed, dict):
             return {"error": "Response was not a JSON object", "recommendation": "SKIP"}
 
-        parsed = {k.strip().strip('"').strip("'"): v for k, v in parsed.items()}
-
+        parsed  = {k.strip().strip('"').strip("'"): v for k, v in parsed.items()}
         derived = _derive_from_analysis(parsed)
         return {
             **derived,
@@ -354,8 +352,8 @@ def analyze_image(card_name: str, set_name: str, card_number: str, image_b64: st
             "edges":           _get_dim_rating(parsed, "edges"),
             "surface_front":   _get_dim_rating(parsed, "surface_front"),
             "holo_condition":  _get_dim_rating(parsed, "holo_condition"),
-            "grade_low":       parsed.get("predicted_grade_range", {}).get("low")  if isinstance(parsed.get("predicted_grade_range"), dict) else None,
-            "grade_high":      parsed.get("predicted_grade_range", {}).get("high") if isinstance(parsed.get("predicted_grade_range"), dict) else None,
+            "grade_low":  parsed.get("predicted_grade_range", {}).get("low")  if isinstance(parsed.get("predicted_grade_range"), dict) else None,
+            "grade_high": parsed.get("predicted_grade_range", {}).get("high") if isinstance(parsed.get("predicted_grade_range"), dict) else None,
         }
 
     except json.JSONDecodeError as e:
@@ -365,10 +363,16 @@ def analyze_image(card_name: str, set_name: str, card_number: str, image_b64: st
 
 
 def pick_best_listing(card_name: str, set_name: str, card_number: str,
-                      listings: list[dict]) -> tuple[dict, dict]:
-    best_listing  = listings[0]
-    best_analysis: dict = {}
-    best_score    = -1
+                      listings: list[dict]) -> tuple[dict | None, dict]:
+    """
+    Analyze each listing photo with Claude Vision.
+    Returns (best_listing, analysis) where best_listing is None if every
+    listing was disqualified (stock photo / fake / altered).
+    Never falls back to a disqualified listing.
+    """
+    best_listing:  dict | None = None   # None = all disqualified
+    best_analysis: dict        = {}
+    best_score = -1
 
     for i, listing in enumerate(listings, 1):
         image_url = listing.get("image_url")
@@ -385,13 +389,13 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
 
         print("analyzing...", end=" ", flush=True)
         analysis = analyze_image(card_name, set_name, card_number, b64)
-        rec   = analysis.get("recommendation", "SKIP")
-        prob  = analysis.get("psa9_or_better_probability") or 0
-        flags = analysis.get("red_flags_active") or ""
+        rec      = analysis.get("recommendation", "SKIP")
+        prob     = analysis.get("psa9_or_better_probability") or 0
+        flags    = analysis.get("red_flags_active") or ""
         flag_str = f" [{flags}]" if flags else ""
         print(f"{rec} (PSA 9+: {prob}%){flag_str}")
 
-        # Disqualified (stock photo / fake / altered) → never pick this listing
+        # Disqualified listings are never used, even as fallback
         if analysis.get("photo_quality") == "disqualified":
             continue
 
@@ -401,6 +405,9 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
             best_score    = score
             best_listing  = listing
             best_analysis = analysis
+
+    if best_listing is None:
+        print("  All listings disqualified (stock photos / fakes) — no URL set")
 
     return best_listing, best_analysis
 
@@ -428,11 +435,12 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
 
         result = {
             "card_name": card_name, "set_name": set_name, "card_number": card_number,
-            "raw_price":  card.get("raw_price"),  "psa9_price":  card.get("psa9_price"),
-            "psa10_price": card.get("psa10_price"), "gem_rate":   card.get("gem_rate"),
+            "raw_price":   card.get("raw_price"),   "psa9_price":  card.get("psa9_price"),
+            "psa10_price": card.get("psa10_price"), "gem_rate":    card.get("gem_rate"),
             "total_graded": card.get("total_graded"), "psa9_count": card.get("psa9_count"),
-            "psa10_count": card.get("psa10_count"),  "roi":        card.get("roi"),
+            "psa10_count":  card.get("psa10_count"),  "roi":        card.get("roi"),
             "track": card.get("track"), "breakeven_gem_rate": card.get("breakeven_gem_rate"),
+            # URL fields start as None — only set if a real photo listing passes analysis
             "ebay_listing_url": None, "ebay_price": None,
             "centering_front": None, "corners": None, "edges": None,
             "surface_front": None, "holo_condition": None,
@@ -457,14 +465,13 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
         )
         print(f"{len(listings)} listings ({price_range})")
 
-        result["ebay_listing_url"] = listings[0]["url"]
-        result["ebay_price"]       = listings[0]["price"]
-
         try:
             best_listing, analysis = pick_best_listing(card_name, set_name, card_number, listings)
 
-            result["ebay_listing_url"] = best_listing["url"]
-            result["ebay_price"]       = best_listing["price"]
+            # Only set URL if a real (non-stock-photo) listing was found
+            if best_listing is not None:
+                result["ebay_listing_url"] = best_listing["url"]
+                result["ebay_price"]       = best_listing["price"]
 
             if analysis and isinstance(analysis, dict):
                 for field in ("recommendation", "predicted_grade", "psa9_or_better_probability",
@@ -480,8 +487,9 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
         rec   = result.get("recommendation", "NO_DATA")
         grade = result.get("predicted_grade", "?")
         prob  = result.get("psa9_or_better_probability", "?")
-        print(f"  → {result.get('ebay_listing_url', 'no url')}")
-        print(f"  → ${result.get('ebay_price', 0):.2f} | {rec} | predicted PSA {grade} | PSA 9+: {prob}%\n")
+        url   = result.get("ebay_listing_url") or "[no valid listing — search link will be used]"
+        print(f"  → {url}")
+        print(f"  → ${result.get('ebay_price') or 0:.2f} | {rec} | predicted PSA {grade} | PSA 9+: {prob}%\n")
 
         rows.append(result)
 
@@ -497,7 +505,7 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
     found  = (analysis_df["ebay_listing_url"].notna()).sum()
     submit = len(shortlist)
     print(f"\n{'='*60}")
-    print(f"eBay listings found: {found}/{total}")
+    print(f"Real photo listings found: {found}/{total}")
     print(f"SUBMIT (PSA 9/10 candidate): {submit}/{found}")
     print(f"{'='*60}\n")
 
