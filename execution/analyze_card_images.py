@@ -376,16 +376,17 @@ def analyze_image(card_name: str, set_name: str, card_number: str, image_b64: st
     except ImportError:
         return {"error": "anthropic not installed", "recommendation": "SKIP"}
 
-    content = [
-        {"type": "image",
-         "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
-        {"type": "text",
-         "text": GRADING_PROMPT.format(card_name=card_name, set_name=set_name,
-                                       card_number=card_number or "unknown")},
-    ]
-
     raw = ""
     try:
+        prompt_text = (GRADING_PROMPT
+                       .replace("{card_name}", card_name)
+                       .replace("{set_name}", set_name)
+                       .replace("{card_number}", card_number or "unknown"))
+        content = [
+            {"type": "image",
+             "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
+            {"type": "text", "text": prompt_text},
+        ]
         client = Anthropic(api_key=api_key)
         response = client.messages.create(
             model=MODEL,
