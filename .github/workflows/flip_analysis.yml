@@ -55,14 +55,13 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          INPUT_SETS: ${{ github.event.inputs.sets }}
+          INPUT_ERA: ${{ github.event.inputs.era }}
         run: |
-          ARGS=""
-          if [ -n "${{ github.event.inputs.sets }}" ]; then
-            ARGS="--sets '${{ github.event.inputs.sets }}'"
-          elif [ -n "${{ github.event.inputs.era }}" ]; then
-            ARGS="--era ${{ github.event.inputs.era }}"
-          fi
-          python execution/run_analysis.py $ARGS
+          ARGS=()
+          [ -n "$INPUT_SETS" ] && ARGS+=(--sets "$INPUT_SETS")
+          [ -n "$INPUT_ERA" ] && ARGS+=(--era "$INPUT_ERA")
+          python execution/run_analysis.py "${ARGS[@]}"
 
       - name: Upload results
         if: always()

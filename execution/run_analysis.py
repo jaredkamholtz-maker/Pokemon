@@ -453,14 +453,10 @@ def run(
             Path(SHORTLIST_PATH).parent.mkdir(parents=True, exist_ok=True)
             shortlist.to_csv(SHORTLIST_PATH, index=False)
         elif analysis_csv.exists():
-            # No SUBMIT cards — show only the analyzed cards that got a real eBay URL
+            # No SUBMIT cards — show all analyzed cards; email filter drops any without a URL
             print("  No SUBMIT cards from image analysis — showing analyzed cards with eBay links.")
-            analysis_df = pd.read_csv(analysis_csv)
-            final = analysis_df[
-                analysis_df["ebay_listing_url"].notna() &
-                (analysis_df["ebay_listing_url"] != "")
-            ].copy()
-            has_image_analysis = bool(len(final) > 0)
+            final = pd.read_csv(analysis_csv)
+            has_image_analysis = True
         print()
     elif skip_images:
         print("[6/6] Skipping image analysis (--skip-images)\n")
