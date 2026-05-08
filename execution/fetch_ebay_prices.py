@@ -1,10 +1,11 @@
 """
-Fetch raw (ungraded) and PSA 9 / PSA 10 prices from eBay completed sales.
+Fetch raw (ungraded) and PSA 9 / PSA 10 prices from eBay active listings.
 
-Uses the eBay Finding API findCompletedItems with SoldItemsOnly=true.
-Makes ONE API call per card (not 3), then buckets results by grade from
-the title. This keeps total calls to ~300 per run instead of ~900,
-avoiding the soft rate-limit that causes HTTP 500 responses.
+Uses the eBay Browse API (OAuth) — modern, no aggressive rate limits.
+findCompletedItems (Finding API) is rate-limited to ~5 calls total per day,
+making it unusable at 300+ cards. Browse API handles 5,000+ calls/day.
+
+Makes ONE API call per card (50 results), buckets by grade from title.
 
 Output: .tmp/ebay_prices.csv  (card_name, set_name, card_number, raw_price,
                                 psa9_price, psa10_price, raw_sales_count,
@@ -16,6 +17,7 @@ Usage:
 """
 
 import argparse
+import base64
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -33,55 +35,63 @@ except ImportError:
     import requests as _req_fallback
     _SESSION = _req_fallback.Session()
 
-EBAY_FINDING_URL = "https://svcs.ebay.com/services/search/FindingService/v1"
-INPUT_FILE  = Path(".tmp/filtered_cards.csv")
-OUTPUT_FILE = Path(".tmp/ebay_prices.csv")
+BROWSE_URL      = "https://api.ebay.com/buy/browse/v1/item_summary/search"
+EBAY_TOKEN_URL  = "https://api.ebay.com/identity/v1/oauth2/token"
+INPUT_FILE      = Path(".tmp/filtered_cards.csv")
+OUTPUT_FILE     = Path(".tmp/ebay_prices.csv")
 
-MAX_WORKERS = 2    # parallel threads
-RATE_DELAY  = 1.5  # seconds between requests per thread
-MAX_RETRIES = 3    # retries on HTTP 500
+MAX_WORKERS = 3
+RATE_DELAY  = 1.0
+
+_token_cache: dict = {"token": None, "expires_at": 0.0}
+_token_lock = threading.Lock()
 
 
-_debug_logged = False
-
-
-def _get(params: dict) -> dict | None:
-    """Call the eBay Finding API. On HTTP 500 retry once after 5s, then give up."""
-    global _debug_logged
-    for attempt in range(1, 3):
+def _get_oauth_token(app_id: str, cert_id: str) -> str | None:
+    with _token_lock:
+        if _token_cache["token"] and time.time() < _token_cache["expires_at"] - 60:
+            return _token_cache["token"]
+        credentials = base64.b64encode(f"{app_id}:{cert_id}".encode()).decode()
         try:
-            resp = _SESSION.get(EBAY_FINDING_URL, params=params, timeout=20)
-            if not _debug_logged:
-                _debug_logged = True
-                print(f"  [API DEBUG] status={resp.status_code}")
-                if resp.status_code == 200:
-                    try:
-                        d = resp.json()
-                        r0 = d.get("findCompletedItemsResponse", [{}])[0]
-                        ack = r0.get("ack", ["?"])[0]
-                        total = (r0.get("paginationOutput", [{}])[0]
-                                   .get("totalEntries", ["?"])[0])
-                        items_n = len(r0.get("searchResult", [{}])[0].get("item", []))
-                        print(f"  [API DEBUG] ack={ack} totalEntries={total} items_returned={items_n}")
-                        if ack != "Success":
-                            err = r0.get("errorMessage", [{}])[0].get("error", [{}])[0]
-                            print(f"  [API DEBUG] error: {err.get('message', ['?'])[0]}")
-                    except Exception as de:
-                        print(f"  [API DEBUG] parse error: {de} | raw: {resp.text[:400]}")
-                else:
-                    print(f"  [API DEBUG] non-200 body: {resp.text[:400]}")
+            resp = _SESSION.post(
+                EBAY_TOKEN_URL,
+                headers={
+                    "Authorization": f"Basic {credentials}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                data="grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope",
+                timeout=15,
+            )
             if resp.status_code == 200:
-                return resp.json()
-            if resp.status_code == 500 and attempt == 1:
-                time.sleep(5)
-                continue
+                data = resp.json()
+                _token_cache["token"] = data["access_token"]
+                _token_cache["expires_at"] = time.time() + data.get("expires_in", 7200)
+                print(f"  [OAuth] token acquired")
+                return _token_cache["token"]
+            print(f"  [OAuth] status={resp.status_code} body={resp.text[:200]}")
         except Exception as e:
-            if not _debug_logged:
-                _debug_logged = True
-                print(f"  [API DEBUG] exception on attempt {attempt}: {e}")
-            if attempt == 1:
-                time.sleep(5)
+            print(f"  [OAuth] error: {e}")
     return None
+
+
+def _search_browse(keywords: str, token: str, limit: int = 50) -> list[dict]:
+    try:
+        resp = _SESSION.get(
+            BROWSE_URL,
+            params={"q": keywords, "limit": limit},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+                "X-EBAY-C-ENDUSERCTX": "contextualLocation=country%3DUS",
+            },
+            timeout=20,
+        )
+        if resp.status_code == 200:
+            return resp.json().get("itemSummaries", [])
+        print(f"  [Browse] status={resp.status_code}")
+    except Exception as e:
+        print(f"  [Browse] error: {e}")
+    return []
 
 
 def _is_raw(title: str) -> bool:
@@ -105,54 +115,27 @@ def _median(prices: list[float]) -> float | None:
 
 
 def fetch_card_prices(card_name: str, set_name: str,
-                      card_number: str, app_id: str) -> dict:
-    """
-    One API call per card: fetch last 30 completed sold listings and
-    bucket them into raw / PSA 9 / PSA 10 by title.
-    """
+                      card_number: str, token: str) -> dict:
     time.sleep(RATE_DELAY)
     keywords = f"{card_name} {set_name} pokemon"
 
-    params = {
-        "OPERATION-NAME":                  "findCompletedItems",
-        "SERVICE-VERSION":                 "1.13.0",
-        "SECURITY-APPNAME":                app_id,
-        "RESPONSE-DATA-FORMAT":            "JSON",
-        "keywords":                        keywords,
-        "itemFilter(0).name":              "SoldItemsOnly",
-        "itemFilter(0).value":             "true",
-        "sortOrder":                       "StartTimeNewest",
-        "paginationInput.entriesPerPage":  "30",
-    }
-
-    data = _get(params)
-
     raw_prices, psa9_prices, psa10_prices = [], [], []
 
-    if data:
-        items = (data
-                 .get("findCompletedItemsResponse", [{}])[0]
-                 .get("searchResult", [{}])[0]
-                 .get("item", []))
-
-        for item in items:
-            title = item.get("title", [""])[0]
-            price_str = (item.get("sellingStatus", [{}])[0]
-                            .get("convertedCurrentPrice", [{}])[0]
-                            .get("__value__", "0"))
-            try:
-                price = float(price_str)
-            except (ValueError, TypeError):
-                continue
-            if price <= 0:
-                continue
-
-            if _has_grade(title, 10):
-                psa10_prices.append(price)
-            elif _has_grade(title, 9):
-                psa9_prices.append(price)
-            elif _is_raw(title):
-                raw_prices.append(price)
+    items = _search_browse(keywords, token, limit=50)
+    for item in items:
+        title = item.get("title", "")
+        try:
+            price = float(item.get("price", {}).get("value", 0))
+        except (ValueError, TypeError):
+            continue
+        if price <= 0:
+            continue
+        if _has_grade(title, 10):
+            psa10_prices.append(price)
+        elif _has_grade(title, 9):
+            psa9_prices.append(price)
+        elif _is_raw(title):
+            raw_prices.append(price)
 
     return {
         "card_name":         card_name,
@@ -166,8 +149,7 @@ def fetch_card_prices(card_name: str, set_name: str,
         "psa10_sales_count": len(psa10_prices),
         "source_url": (
             "https://www.ebay.com/sch/i.html?"
-            + urllib.parse.urlencode({"_nkw": keywords,
-                                      "LH_Complete": "1", "LH_Sold": "1"})
+            + urllib.parse.urlencode({"_nkw": keywords, "LH_Complete": "1", "LH_Sold": "1"})
         ),
     }
 
@@ -176,14 +158,21 @@ def run(input_path: str = str(INPUT_FILE),
         output_path: str = str(OUTPUT_FILE),
         workers: int = MAX_WORKERS) -> pd.DataFrame:
     load_dotenv()
-    app_id = os.environ.get("EBAY_APP_ID")
+    app_id  = os.environ.get("EBAY_APP_ID")
+    cert_id = os.environ.get("EBAY_CERT_ID")
     if not app_id:
         raise RuntimeError("EBAY_APP_ID not set — cannot fetch eBay prices")
+    if not cert_id:
+        raise RuntimeError("EBAY_CERT_ID not set — Browse API requires OAuth (EBAY_CERT_ID)")
+
+    token = _get_oauth_token(app_id, cert_id)
+    if not token:
+        raise RuntimeError("Failed to get eBay OAuth token — check EBAY_APP_ID and EBAY_CERT_ID")
 
     cards_df = pd.read_csv(input_path)
     total = len(cards_df)
-    print(f"Fetching eBay sold prices for {total} cards "
-          f"(1 call/card, {workers} workers, {RATE_DELAY}s delay)...")
+    print(f"Fetching eBay prices for {total} cards "
+          f"(Browse API, {workers} workers, {RATE_DELAY}s delay)...")
 
     results = []
     completed = 0
@@ -194,7 +183,7 @@ def run(input_path: str = str(INPUT_FILE),
             str(row.get("card_name", "")).strip(),
             str(row.get("set_name", "")).strip(),
             str(row.get("card_number", "")).strip(),
-            app_id,
+            token,
         )
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -235,7 +224,7 @@ def run(input_path: str = str(INPUT_FILE),
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fetch eBay sold prices for filtered cards")
+    parser = argparse.ArgumentParser(description="Fetch eBay prices for filtered cards")
     parser.add_argument("--input",   default=str(INPUT_FILE))
     parser.add_argument("--output",  default=str(OUTPUT_FILE))
     parser.add_argument("--workers", type=int, default=MAX_WORKERS)
