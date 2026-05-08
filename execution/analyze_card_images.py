@@ -108,14 +108,9 @@ def _is_graded_title(title: str) -> bool:
     return any(kw in t for kw in ["psa ", "psa-", "bgs ", "cgc ", "sgc ", "graded", "gem mint"])
 
 
-# ── eBay search ────────────────────────────────────────────────────────────────
+# ── eBay search ──────────────────────────────────────────────────────────────────────────────
 
 def _search_browse_api(card_name: str, set_name: str, access_token: str) -> list[dict]:
-    """
-    Search active eBay listings via the Browse API (recommended replacement for
-    the Finding API's findItemsByKeywords operation).
-    Returns candidates list in the same format as search_ebay_listings.
-    """
     try:
         resp = _SESSION.get(
             "https://api.ebay.com/buy/browse/v1/item_summary/search",
@@ -157,8 +152,6 @@ def _search_browse_api(card_name: str, set_name: str, access_token: str) -> list
 
 
 def _get_browse_token(client_id: str, client_secret: str) -> str | None:
-    """Get an OAuth application token for the eBay Browse API."""
-    import base64
     try:
         creds = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
         resp = _SESSION.post(
@@ -176,11 +169,6 @@ def _get_browse_token(client_id: str, client_secret: str) -> str | None:
 
 
 def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
-    """
-    Search active eBay listings for cheapest ungraded copies.
-    Tries the Browse API first (recommended), falls back to Finding API.
-    Returns up to MAX_LISTINGS candidates sorted by price: {title, price, url, image_url}
-    """
     load_dotenv()
     app_id = os.environ.get("EBAY_APP_ID")
     cert_id = os.environ.get("EBAY_CERT_ID")
@@ -189,7 +177,6 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
         print("  EBAY_APP_ID not set — skipping eBay search")
         return []
 
-    # ── Try Browse API first (OAuth, not deprecated) ──────────────────────────
     if cert_id:
         token = _get_browse_token(app_id, cert_id)
         if token:
@@ -200,8 +187,6 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
         else:
             print("  Browse API token failed, falling back to Finding API...", end=" ", flush=True)
 
-    # ── Fall back to Finding API (findItemsByKeywords) ────────────────────────
-    # Use minimal params — complex filters can trigger HTTP 500 on some app tiers
     params = {
         "OPERATION-NAME": "findItemsByKeywords",
         "SERVICE-VERSION": "1.13.0",
@@ -276,10 +261,9 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
         return []
 
 
-# ── Claude Vision analysis ─────────────────────────────────────────────────────
+# ── Claude Vision analysis ─────────────────────────────────────────────────────────────────────────────
 
 def download_image_b64(url: str) -> str | None:
-    """Download an image URL and return base64-encoded bytes, or None on failure."""
     try:
         resp = _get(url)
         if resp and resp.status_code == 200 and resp.content:
@@ -290,10 +274,6 @@ def download_image_b64(url: str) -> str | None:
 
 
 def analyze_image(card_name: str, set_name: str, image_b64: str) -> dict:
-    """
-    Send a single listing image to Claude Vision for PSA grade assessment.
-    Returns the parsed assessment dict, or a SKIP dict on any failure.
-    """
     load_dotenv()
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -315,6 +295,7 @@ def analyze_image(card_name: str, set_name: str, image_b64: str) -> dict:
         },
     ]
 
+    raw = ""
     try:
         client = Anthropic(api_key=api_key)
         response = client.messages.create(
@@ -332,27 +313,24 @@ def analyze_image(card_name: str, set_name: str, image_b64: str) -> dict:
         if start == -1 or end == 0:
             return {"error": f"No JSON in response: {raw[:100]}", "recommendation": "SKIP"}
 
-        result = json.loads(raw_clean[start:end])
-        if not isinstance(result, dict):
+        parsed = json.loads(raw_clean[start:end])
+        if not isinstance(parsed, dict):
             return {"error": "Response was not a JSON object", "recommendation": "SKIP"}
 
-        return result
+        # Normalise keys: strip whitespace and quotes so "\n  \"centering\"" → "centering"
+        clean = {}
+        for k, v in parsed.items():
+            clean_key = k.strip().strip('"').strip("'")
+            clean[clean_key] = v
+        return clean
 
     except json.JSONDecodeError as e:
-        return {"error": f"JSON parse error: {e}", "recommendation": "SKIP"}
+        return {"error": f"JSON parse error: {e} | raw: {raw[:200]}", "recommendation": "SKIP"}
     except Exception as e:
         return {"error": str(e), "recommendation": "SKIP"}
 
 
 def pick_best_listing(card_name: str, set_name: str, listings: list[dict]) -> tuple[dict, dict]:
-    """
-    Analyze the API-provided image for each listing with Claude Vision.
-    Returns (best_listing, analysis_dict).
-
-    best_listing always defaults to listings[0] (cheapest) so there is always
-    a direct eBay URL regardless of whether image analysis succeeds.
-    Best = highest psa9_or_better_probability, preferring SUBMIT over SKIP.
-    """
     best_listing = listings[0]   # cheapest — guaranteed fallback URL
     best_analysis: dict = {}
     best_score = -1
@@ -386,7 +364,7 @@ def pick_best_listing(card_name: str, set_name: str, listings: list[dict]) -> tu
     return best_listing, best_analysis
 
 
-# ── Main run ───────────────────────────────────────────────────────────────────
+# ── Main run ───────────────────────────────────────────────────────────────────────────────────
 
 def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
     load_dotenv()
@@ -456,32 +434,36 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
         result["ebay_price"] = listings[0]["price"]
 
         # Step 3: Analyze images, pick the best quality listing
-        best_listing, analysis = pick_best_listing(card_name, set_name, listings)
+        try:
+            best_listing, analysis = pick_best_listing(card_name, set_name, listings)
 
-        # Update to best listing (may be same as cheapest if analysis picked it or failed)
-        result["ebay_listing_url"] = best_listing["url"]
-        result["ebay_price"] = best_listing["price"]
+            # Update to best listing (may be same as cheapest if analysis picked it or failed)
+            result["ebay_listing_url"] = best_listing["url"]
+            result["ebay_price"] = best_listing["price"]
 
-        if analysis:
-            result.update({
-                "centering":                  analysis.get("centering"),
-                "corners":                    analysis.get("corners"),
-                "edges":                      analysis.get("edges"),
-                "surface":                    analysis.get("surface"),
-                "predicted_grade":            analysis.get("predicted_grade"),
-                "psa10_probability":          analysis.get("psa10_probability"),
-                "psa9_or_better_probability": analysis.get("psa9_or_better_probability"),
-                "recommendation":             analysis.get("recommendation", "SKIP"),
-                "photo_quality":              analysis.get("photo_quality"),
-                "notes":                      analysis.get("notes"),
-                "error":                      analysis.get("error"),
-            })
+            if analysis and isinstance(analysis, dict):
+                result.update({
+                    "centering":                  analysis.get("centering"),
+                    "corners":                    analysis.get("corners"),
+                    "edges":                      analysis.get("edges"),
+                    "surface":                    analysis.get("surface"),
+                    "predicted_grade":            analysis.get("predicted_grade"),
+                    "psa10_probability":          analysis.get("psa10_probability"),
+                    "psa9_or_better_probability": analysis.get("psa9_or_better_probability"),
+                    "recommendation":             analysis.get("recommendation", "SKIP"),
+                    "photo_quality":              analysis.get("photo_quality"),
+                    "notes":                      analysis.get("notes"),
+                    "error":                      analysis.get("error"),
+                })
+        except Exception as e:
+            print(f"  [analysis error] {e}")
+            result["error"] = str(e)
 
-        rec = result["recommendation"]
+        rec = result.get("recommendation", "NO_DATA")
         grade = result.get("predicted_grade", "?")
         prob = result.get("psa9_or_better_probability", "?")
-        print(f"  → {best_listing['url']}")
-        print(f"  → ${best_listing['price']:.2f} | {rec} | predicted PSA {grade} | PSA 9+: {prob}%\n")
+        print(f"  → {result.get('ebay_listing_url', 'no url')}")
+        print(f"  → ${result.get('ebay_price', 0):.2f} | {rec} | predicted PSA {grade} | PSA 9+: {prob}%\n")
 
         rows.append(result)
 
@@ -502,3 +484,11 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
     print(f"{'='*60}\n")
 
     return shortlist
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", default=str(INPUT_FILE))
+    parser.add_argument("--top", type=int, default=20)
+    args = parser.parse_args()
+    run(input_path=args.input, top_n=args.top)
