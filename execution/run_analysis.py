@@ -129,6 +129,13 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         plain = f"{subject_line}\n\nNo cards met the criteria today."
         return html, plain
 
+    # Only include cards with a specific listing URL — skip generic "Find on eBay" cards
+    if has_image_analysis:
+        opportunities = opportunities[
+            opportunities["ebay_listing_url"].notna() &
+            (opportunities["ebay_listing_url"] != "")
+        ].copy()
+
     rows_html = []
     rows_plain = []
     for rank, (_, row) in enumerate(opportunities.iterrows(), 1):
