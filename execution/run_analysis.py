@@ -316,7 +316,7 @@ def run(
     min_graded_price: float = 60.0,
     min_roi: float = 0.10,
     min_gem_rate: float = 0.35,
-    image_top_n: int = 20,
+    image_top_n: int = 5,
 ):
     load_dotenv()
     today = date.today().isoformat()
