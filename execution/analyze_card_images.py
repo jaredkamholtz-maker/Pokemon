@@ -380,16 +380,22 @@ def analyze_image(card_name: str, set_name: str, card_number: str, image_b64: st
 
 
 def pick_best_listing(card_name: str, set_name: str, card_number: str,
-                      listings: list[dict]) -> tuple[dict | None, dict]:
+                      listings: list[dict]) -> tuple[dict, dict]:
     """
     Analyze each listing photo with Claude Vision.
-    Returns (best_listing, analysis) where best_listing is None if every
-    listing was disqualified (stock photo / fake / altered).
-    Never falls back to a disqualified listing.
+    Returns (best_listing, analysis).
+
+    Always returns listings[0] as a minimum fallback (cheapest single-card
+    listing — already filtered for graded/lot/pick listings at search time).
+    If a non-disqualified listing is found, that takes priority.
+    If a SUBMIT listing is found, that wins.
     """
-    best_listing:  dict | None = None   # None = all disqualified
-    best_analysis: dict        = {}
+    # Cheapest listing is always the fallback — it's already filtered for
+    # graded/lot/multi-card titles, so it's a real single-card listing
+    best_listing  = listings[0]
+    best_analysis: dict = {"recommendation": "SKIP", "notes": "photo unverified"}
     best_score = -1
+    any_non_disqualified = False
 
     for i, listing in enumerate(listings, 1):
         image_url = listing.get("image_url")
@@ -412,10 +418,12 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
         flag_str = f" [{flags}]" if flags else ""
         print(f"{rec} (PSA 9+: {prob}%){flag_str}")
 
-        # Disqualified listings are never used, even as fallback
+        # Disqualified (stock photo / fake) listings never win, but cheapest
+        # non-disqualified listing upgrades the fallback
         if analysis.get("photo_quality") == "disqualified":
             continue
 
+        any_non_disqualified = True
         submit_bonus = 1000 if rec == "SUBMIT" else 0
         score = submit_bonus + prob
         if score > best_score:
@@ -423,8 +431,8 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
             best_listing  = listing
             best_analysis = analysis
 
-    if best_listing is None:
-        print("  All listings disqualified (stock photos / fakes) — no URL set")
+    if not any_non_disqualified:
+        print("  All listings had stock/unverifiable photos — using cheapest listing URL as fallback")
 
     return best_listing, best_analysis
 
@@ -485,10 +493,9 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
         try:
             best_listing, analysis = pick_best_listing(card_name, set_name, card_number, listings)
 
-            # Only set URL if a real (non-stock-photo) listing was found
-            if best_listing is not None:
-                result["ebay_listing_url"] = best_listing["url"]
-                result["ebay_price"]       = best_listing["price"]
+            # Always set URL — pick_best_listing guarantees a listing (cheapest fallback)
+            result["ebay_listing_url"] = best_listing["url"]
+            result["ebay_price"]       = best_listing["price"]
 
             if analysis and isinstance(analysis, dict):
                 for field in ("recommendation", "predicted_grade", "psa9_or_better_probability",
