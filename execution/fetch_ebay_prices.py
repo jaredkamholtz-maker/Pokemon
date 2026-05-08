@@ -42,8 +42,8 @@ INPUT_FILE  = Path(".tmp/filtered_cards.csv")
 OUTPUT_FILE = Path(".tmp/ebay_prices.csv")
 
 SAMPLE_SIZE  = 20   # sold listings to sample per price bucket
-MAX_WORKERS  = 3    # parallel threads (stay well within eBay rate limits)
-RATE_DELAY   = 0.3  # seconds between requests per thread
+MAX_WORKERS  = 2    # parallel threads — keep low to preserve rate limit for step 6
+RATE_DELAY   = 1.0  # seconds between requests per thread (3 calls/card × 2 workers = ~6 req/s max)
 
 
 def _get(params: dict) -> dict | None:
