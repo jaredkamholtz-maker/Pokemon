@@ -53,7 +53,7 @@ OUTPUT_PATH = ".tmp/flip_opportunities.csv"
 SHORTLIST_PATH = ".tmp/final_shortlist.csv"
 
 
-# ── Google Sheets ──────────────────────────────────────────────────────────────
+# ── Google Sheets ──────────────────────────────────────────────────────────────────────────────
 
 def push_to_google_sheets(df: pd.DataFrame, spreadsheet_id: str, tab_name: str) -> str | None:
     try:
@@ -94,7 +94,7 @@ def push_to_google_sheets(df: pd.DataFrame, spreadsheet_id: str, tab_name: str) 
         return None
 
 
-# ── Email ──────────────────────────────────────────────────────────────────────
+# ── Email ──────────────────────────────────────────────────────────────────────────────────
 
 def _fmt_price(val) -> str:
     try:
@@ -301,7 +301,7 @@ def send_email(html_body: str, plain_body: str, subject: str) -> bool:
         return False
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────────────────────
 
 def run(
     target_sets: str = "data/target_sets.csv",
@@ -316,7 +316,7 @@ def run(
     min_graded_price: float = 60.0,
     min_roi: float = 0.10,
     min_gem_rate: float = 0.35,
-    image_top_n: int = 20,
+    image_top_n: int = 5,
 ):
     load_dotenv()
     today = date.today().isoformat()
@@ -430,7 +430,7 @@ def run(
     final = opportunities
     has_image_analysis = False
     if not skip_images and not opportunities.empty:
-        # Brief cooldown so step 3's ~1,500 API calls don't exhaust the rate limit
+        # Brief cooldown so step 3's API calls don't exhaust the rate limit
         # right before step 6 needs to call the same eBay app_id
         import time as _time
         print("[6/6] Waiting 30s for eBay API rate limit to clear after step 3...")
@@ -522,16 +522,16 @@ if __name__ == "__main__":
                         help="Reuse last tcgplayer_prices.csv (skip PriceCharting fetch)")
     parser.add_argument("--skip-images", action="store_true",
                         help="Skip eBay image analysis step (faster, no Claude Vision credits)")
-    parser.add_argument("--image-top-n", type=int, default=20,
-                        help="Number of top cards to analyze with Claude Vision (default: 20)")
+    parser.add_argument("--image-top-n", type=int, default=5,
+                        help="Number of top cards to analyze with Claude Vision (default: 5)")
     parser.add_argument("--skip-sheets", action="store_true")
     parser.add_argument("--skip-email", action="store_true")
     parser.add_argument("--min-graded-price", type=float, default=60.0,
                         help="Min PSA 9 or PSA 10 price to include a card (default: $60)")
     parser.add_argument("--min-roi", type=float, default=0.10,
-                        help="Min ROI after grading fee (default: 0.10 = 10%%)")
+                        help="Min ROI after grading fee (default: 0.10 = 10%%%)")
     parser.add_argument("--min-gem-rate", type=float, default=0.50,
-                        help="Min gem rate to surface a card (default: 0.35 = 35%%)")
+                        help="Min gem rate to surface a card (default: 0.35 = 35%%%)")
     args = parser.parse_args()
 
     sets_list = [s.strip() for s in args.sets.split(",")] if args.sets else None
