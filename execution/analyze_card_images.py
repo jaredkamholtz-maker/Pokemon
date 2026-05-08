@@ -3,19 +3,20 @@ Final filter: find cheapest eBay raw listings for each top flip candidate,
 analyze listing photos with Claude Vision, and pick the best quality copy.
 
 Design principles:
-  - Cheapest listing URL is ALWAYS saved before image analysis runs.
-    The email always has a direct eBay link, even if image analysis fails.
-  - Images come exclusively from the eBay Finding API response.
-    No listing-page scraping — nothing to block, nothing to break.
+  - Only real seller photos are accepted. Stock photos, fakes, and altered
+    cards are auto-disqualified and NEVER used as the listing URL.
+  - If ALL listings for a card are disqualified, no specific URL is set and
+    the email shows a generic eBay search link instead.
+  - Images come exclusively from the eBay Browse API response.
   - Image analysis is additive: Claude's grade prediction and PSA 9+
-    probability are bonus info. They never block a card from getting a link.
+    probability are bonus info on top of the EV math.
 
 Steps per card:
-  1. Search eBay Finding API for cheapest ungraded listings (up to MAX_LISTINGS)
-  2. Save cheapest listing URL immediately as the fallback buy link
-  3. For each listing: download the API-provided image, send to Claude Vision
-  4. Pick the listing with highest PSA 9+ probability (prefer SUBMIT over SKIP)
-  5. Update result with winning listing URL + Claude's grade assessment
+  1. Search eBay Browse API for cheapest ungraded listings (up to MAX_LISTINGS)
+  2. For each listing: download the API-provided image, send to Claude Vision
+  3. Skip listings with stock photos, fakes, or critical red flags
+  4. Pick the listing with highest PSA 9+ probability among valid photos
+  5. Only set ebay_listing_url if at least one listing passed analysis
 
 Output:
   .tmp/image_analysis.csv   — full results for all analyzed cards
@@ -49,42 +50,69 @@ INPUT_FILE = Path(".tmp/flip_opportunities.csv")
 OUTPUT_ANALYSIS = Path(".tmp/image_analysis.csv")
 OUTPUT_SHORTLIST = Path(".tmp/final_shortlist.csv")
 
-EBAY_FINDING_URL = "https://svcs.ebay.com/services/search/FindingService/v1"
-MAX_LISTINGS = 5        # eBay listings to evaluate per card
-RATE_DELAY = 0.5        # seconds between API calls
+MAX_LISTINGS = 5
+RATE_DELAY = 0.5
 MODEL = "claude-sonnet-4-6"
 
-GRADING_PROMPT = """You are an experienced PSA grader examining a Pokemon card listed for sale on eBay.
+GRADING_PROMPT = """You are a Pokémon card condition grader analyzing seller photos from an eBay listing. Your job is to assess condition objectively and flag concerns. You are NOT determining if this is a good deal — only describing what you see.
 
-Card details: {card_name} from {set_name}
+CARD CONTEXT:
+- Card: {card_name}
+- Set: {set_name}
+- Number: {card_number}
 
-Analyze every photo provided and assess the card's condition. Focus on:
-- **Centering**: Is the card centered front and back? Estimate the ratio (e.g. 55/45).
-- **Corners**: Are all four corners sharp or do any show wear/rounding/fraying?
-- **Edges**: Are all edges clean or do any show chips, nicks, or roughness?
-- **Surface**: Any scratches, print lines, holo damage, whitening, or indentations?
+PHOTOS PROVIDED: 1 image (seller listing photo)
 
-Then give your overall prediction and recommendation.
+ASSESS THE FOLLOWING. For each dimension, provide a rating, a confidence score 0.0–1.0 based on photo quality for THAT dimension, and specific observations. If photo quality prevents assessment, set rating to "unknown" and confidence to 0.0. Do not guess.
 
-IMPORTANT RULES:
-- If photos are too blurry, too dark, or don't show enough of the card to assess, set photo_quality to "INSUFFICIENT" and recommendation to "SKIP".
-- Be conservative — a card needs to look genuinely clean to earn SUBMIT.
-- PSA 10 requires near-perfect centering AND pristine corners/edges/surface.
-- PSA 9 allows slight centering variance but corners/edges/surface must be excellent.
+DIMENSIONS:
+1. centering_front: ratio estimate like "55/45" or "60/40 L/R, 50/50 T/B"
+2. centering_back: same format (or "unknown" if back not shown)
+3. corners: sharp | minor_wear | moderate_wear | heavy_wear | unknown
+4. edges: clean | minor_whitening | moderate_whitening | heavy_whitening | unknown
+5. surface_front: clean | minor_scratches | scratches | scuffs | print_lines | unknown
+6. surface_back: same scale
+7. holo_condition: pristine | minor_scratches | scratched | heavy_scratching | n/a | unknown
+8. whitening_overall: none | minor | moderate | heavy | unknown
 
-Respond ONLY with valid JSON in exactly this format:
+PREDICTED GRADE RANGE:
+Based on what's visible, estimate the most likely PSA grade range (e.g., low: 8, high: 9). Use 0 for both if ungradeable (creases, bends, water damage).
+
+RED FLAGS — check each and report true/false with reasoning:
+- stock_photo_suspected: photos look like generic/database images, not this specific card being sold by this seller
+- back_not_shown: no clear photo of card back
+- glare_obscures_detail: critical areas hidden by reflection
+- altered_appearance: signs of trimming, recoloring, or surface treatment
+- fake_indicators: wrong font, color, texture, holo pattern, or back design for this card/set
+- damage_hidden: photos angled to obscure likely damage
+- inconsistent_card: features visible don't match the identified card
+
+Return ONLY valid JSON, no other text:
 {
-  "centering": <1-10>,
-  "corners": <1-10>,
-  "edges": <1-10>,
-  "surface": <1-10>,
-  "predicted_grade": <1-10>,
-  "psa10_probability": <0-100>,
-  "psa9_or_better_probability": <0-100>,
-  "recommendation": "SUBMIT" or "SKIP",
-  "photo_quality": "GOOD" or "PARTIAL" or "INSUFFICIENT",
-  "notes": "<one or two sentences on what you observed>"
+  "centering_front": {"rating": "...", "confidence": 0.0, "notes": "..."},
+  "centering_back": {"rating": "...", "confidence": 0.0, "notes": "..."},
+  "corners": {"rating": "...", "confidence": 0.0, "notes": "..."},
+  "edges": {"rating": "...", "confidence": 0.0, "notes": "..."},
+  "surface_front": {"rating": "...", "confidence": 0.0, "notes": "..."},
+  "surface_back": {"rating": "...", "confidence": 0.0, "notes": "..."},
+  "holo_condition": {"rating": "...", "confidence": 0.0, "notes": "..."},
+  "whitening_overall": {"rating": "...", "confidence": 0.0, "notes": "..."},
+  "predicted_grade_range": {"low": 0, "high": 0, "confidence": 0.0},
+  "red_flags": {
+    "stock_photo_suspected": {"flag": false, "reason": ""},
+    "back_not_shown": {"flag": false, "reason": ""},
+    "glare_obscures_detail": {"flag": false, "reason": ""},
+    "altered_appearance": {"flag": false, "reason": ""},
+    "fake_indicators": {"flag": false, "reason": ""},
+    "damage_hidden": {"flag": false, "reason": ""},
+    "inconsistent_card": {"flag": false, "reason": ""}
+  },
+  "overall_photo_quality": {"rating": "poor|fair|good|excellent", "notes": "..."},
+  "summary": "2-3 sentence overall assessment"
 }"""
+
+# Red flags that auto-disqualify a listing
+_CRITICAL_FLAGS = {"stock_photo_suspected", "fake_indicators", "altered_appearance"}
 
 
 def _get(url: str, params: dict | None = None, max_retries: int = 3) -> object | None:
@@ -108,57 +136,20 @@ def _is_graded_title(title: str) -> bool:
     return any(kw in t for kw in ["psa ", "psa-", "bgs ", "cgc ", "sgc ", "graded", "gem mint"])
 
 
-# ── eBay search ────────────────────────────────────────────────────────────────
+def _is_multi_card_listing(title: str) -> bool:
+    t = title.lower()
+    return any(kw in t for kw in [
+        "pick your", "you pick", "your pick", "pick a card",
+        "lot of", " lot ", "bundle", "set of", "collection",
+        "x2 ", "x3 ", "x4 ", "x5 ", " x2", " x3", " x4", " x5",
+        "2x ", "3x ", "4x ", "5x ",
+        "choose", "random", "assorted", "mixed", "wholesale",
+    ])
 
-def _search_browse_api(card_name: str, set_name: str, access_token: str) -> list[dict]:
-    """
-    Search active eBay listings via the Browse API (recommended replacement for
-    the Finding API's findItemsByKeywords operation).
-    Returns candidates list in the same format as search_ebay_listings.
-    """
-    try:
-        resp = _SESSION.get(
-            "https://api.ebay.com/buy/browse/v1/item_summary/search",
-            headers={"Authorization": f"Bearer {access_token}",
-                     "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"},
-            params={
-                "q": f"{card_name} {set_name} pokemon",
-                "sort": "price",
-                "limit": str(MAX_LISTINGS * 3),
-            },
-            timeout=20,
-        )
-        if not resp or resp.status_code != 200:
-            return []
 
-        data = resp.json()
-        candidates = []
-        for item in data.get("itemSummaries", []):
-            title = item.get("title", "")
-            if _is_graded_title(title):
-                continue
-            url = item.get("itemWebUrl", "")
-            price_str = item.get("price", {}).get("value", "0")
-            try:
-                price = float(price_str)
-            except (ValueError, TypeError):
-                price = 0.0
-            if price <= 0 or not url:
-                continue
-            image_url = item.get("image", {}).get("imageUrl")
-            candidates.append({"title": title, "price": price,
-                                "url": url, "image_url": image_url})
-            if len(candidates) >= MAX_LISTINGS:
-                break
-        return sorted(candidates, key=lambda c: c["price"])[:MAX_LISTINGS]
-    except Exception as e:
-        print(f"  Browse API error: {e}")
-        return []
-
+# ── eBay search ──────────────────────────────────────────────────────────────────────────────
 
 def _get_browse_token(client_id: str, client_secret: str) -> str | None:
-    """Get an OAuth application token for the eBay Browse API."""
-    import base64
     try:
         creds = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
         resp = _SESSION.post(
@@ -176,110 +167,64 @@ def _get_browse_token(client_id: str, client_secret: str) -> str | None:
 
 
 def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
-    """
-    Search active eBay listings for cheapest ungraded copies.
-    Tries the Browse API first (recommended), falls back to Finding API.
-    Returns up to MAX_LISTINGS candidates sorted by price: {title, price, url, image_url}
-    """
     load_dotenv()
-    app_id = os.environ.get("EBAY_APP_ID")
+    app_id  = os.environ.get("EBAY_APP_ID")
     cert_id = os.environ.get("EBAY_CERT_ID")
 
-    if not app_id:
-        print("  EBAY_APP_ID not set — skipping eBay search")
+    if not app_id or not cert_id:
+        print("  EBAY_APP_ID/CERT_ID not set — skipping eBay search")
         return []
 
-    # ── Try Browse API first (OAuth, not deprecated) ──────────────────────────
-    if cert_id:
-        token = _get_browse_token(app_id, cert_id)
-        if token:
-            results = _search_browse_api(card_name, set_name, token)
-            if results:
-                return results
-            print("  Browse API returned 0 results, falling back to Finding API...", end=" ", flush=True)
-        else:
-            print("  Browse API token failed, falling back to Finding API...", end=" ", flush=True)
-
-    # ── Fall back to Finding API (findItemsByKeywords) ────────────────────────
-    # Use minimal params — complex filters can trigger HTTP 500 on some app tiers
-    params = {
-        "OPERATION-NAME": "findItemsByKeywords",
-        "SERVICE-VERSION": "1.13.0",
-        "SECURITY-APPNAME": app_id,
-        "RESPONSE-DATA-FORMAT": "JSON",
-        "keywords": f"{card_name} {set_name} pokemon",
-        "sortOrder": "PricePlusShippingLowest",
-        "paginationInput.entriesPerPage": str(MAX_LISTINGS * 3),
-    }
+    token = _get_browse_token(app_id, cert_id)
+    if not token:
+        print("  OAuth token failed")
+        return []
 
     try:
-        resp = _get(EBAY_FINDING_URL, params=params)
+        resp = _SESSION.get(
+            "https://api.ebay.com/buy/browse/v1/item_summary/search",
+            headers={"Authorization": f"Bearer {token}",
+                     "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"},
+            params={"q": f"{card_name} {set_name} pokemon",
+                    "sort": "price",
+                    "limit": str(MAX_LISTINGS * 3)},
+            timeout=20,
+        )
         if not resp or resp.status_code != 200:
-            print(f"  eBay API error: HTTP {resp and resp.status_code}")
             return []
 
-        data = resp.json()
-        ack = (data.get("findItemsByKeywordsResponse", [{}])[0]
-                   .get("ack", [""])[0])
-        total_entries = (data.get("findItemsByKeywordsResponse", [{}])[0]
-                             .get("searchResult", [{}])[0]
-                             .get("@count", "?"))
-        print(f"(Finding API ack={ack}, total={total_entries})", end=" ", flush=True)
-
-        items = (data
-                 .get("findItemsByKeywordsResponse", [{}])[0]
-                 .get("searchResult", [{}])[0]
-                 .get("item", []))
-
         candidates = []
-        graded_skipped = 0
-        for item in items:
-            title = item.get("title", [""])[0]
+        multi_skipped = 0
+        for item in resp.json().get("itemSummaries", []):
+            title = item.get("title", "")
             if _is_graded_title(title):
-                graded_skipped += 1
                 continue
-
-            view_url = item.get("viewItemURL", [""])[0]
-            price_str = (item.get("sellingStatus", [{}])[0]
-                            .get("currentPrice", [{}])[0]
-                            .get("__value__", "0"))
+            if _is_multi_card_listing(title):
+                multi_skipped += 1
+                continue
+            url = item.get("itemWebUrl", "")
             try:
-                price = float(price_str)
+                price = float(item.get("price", {}).get("value", 0))
             except (ValueError, TypeError):
                 price = 0.0
-
-            if price <= 0 or not view_url:
+            if price <= 0 or not url:
                 continue
-
-            image_url = (
-                (item.get("pictureURLSuperSize") or [None])[0]
-                or (item.get("pictureURLLargeSize") or [None])[0]
-                or (item.get("galleryURL") or [None])[0]
-            )
-
-            candidates.append({
-                "title": title,
-                "price": price,
-                "url": view_url,
-                "image_url": image_url,
-            })
-
+            image_url = item.get("image", {}).get("imageUrl")
+            candidates.append({"title": title, "price": price,
+                                "url": url, "image_url": image_url})
             if len(candidates) >= MAX_LISTINGS:
                 break
-
-        if graded_skipped:
-            print(f"({graded_skipped} graded listings skipped)", end=" ", flush=True)
+        if multi_skipped:
+            print(f"({multi_skipped} multi-card/lot listings skipped)", end=" ", flush=True)
         return sorted(candidates, key=lambda c: c["price"])[:MAX_LISTINGS]
-
     except Exception as e:
-        print(f"  eBay API exception: {e}")
+        print(f"  Browse API error: {e}")
         return []
 
 
-# ── Claude Vision analysis ─────────────────────────────────────────────────────
+# ── Claude Vision analysis ─────────────────────────────────────────────────────────────────────────────
 
 def download_image_b64(url: str) -> str | None:
-    """Download an image URL and return base64-encoded bytes, or None on failure."""
     try:
         resp = _get(url)
         if resp and resp.status_code == 200 and resp.content:
@@ -289,11 +234,94 @@ def download_image_b64(url: str) -> str | None:
     return None
 
 
-def analyze_image(card_name: str, set_name: str, image_b64: str) -> dict:
+def _derive_from_analysis(parsed: dict) -> dict:
     """
-    Send a single listing image to Claude Vision for PSA grade assessment.
-    Returns the parsed assessment dict, or a SKIP dict on any failure.
+    Convert the detailed nested analysis JSON into flat pipeline fields.
+    Returns recommendation, predicted_grade, psa9_or_better_probability,
+    photo_quality, notes, red_flags_active.
     """
+    red_flags = parsed.get("red_flags", {})
+
+    # Critical flags → auto-disqualify
+    active_critical = [f for f in _CRITICAL_FLAGS
+                       if isinstance(red_flags.get(f), dict) and red_flags[f].get("flag")]
+    if active_critical:
+        return {
+            "recommendation": "SKIP",
+            "predicted_grade": None,
+            "psa9_or_better_probability": 0,
+            "photo_quality": "disqualified",
+            "notes": f"Disqualified: {', '.join(active_critical)}",
+            "red_flags_active": ", ".join(active_critical),
+        }
+
+    photo_q_info  = parsed.get("overall_photo_quality", {})
+    photo_quality = photo_q_info.get("rating", "fair") if isinstance(photo_q_info, dict) else "fair"
+    if photo_quality == "poor":
+        return {
+            "recommendation": "SKIP",
+            "predicted_grade": None,
+            "psa9_or_better_probability": 0,
+            "photo_quality": "poor",
+            "notes": photo_q_info.get("notes", "Photo quality too poor to assess") if isinstance(photo_q_info, dict) else "poor quality",
+            "red_flags_active": None,
+        }
+
+    grade_info = parsed.get("predicted_grade_range", {})
+    grade_low  = grade_info.get("low",  0)   if isinstance(grade_info, dict) else 0
+    grade_high = grade_info.get("high", 0)   if isinstance(grade_info, dict) else 0
+    grade_conf = grade_info.get("confidence", 0.5) if isinstance(grade_info, dict) else 0.5
+
+    if grade_high == 0:
+        return {
+            "recommendation": "SKIP",
+            "predicted_grade": None,
+            "psa9_or_better_probability": 0,
+            "photo_quality": photo_quality,
+            "notes": parsed.get("summary", "Ungradeable condition"),
+            "red_flags_active": None,
+        }
+
+    predicted_grade = round((grade_low + grade_high) / 2)
+
+    if grade_high >= 10:
+        prob = int(min(95, 70 + 25 * grade_conf))
+    elif grade_high >= 9 and grade_low >= 9:
+        prob = int(min(85, 60 + 25 * grade_conf))
+    elif grade_high >= 9:
+        range_size = max(grade_high - grade_low, 1)
+        overlap    = (grade_high - 9 + 1) / (range_size + 1)
+        prob       = int(overlap * 70 * grade_conf)
+    else:
+        prob = 0
+
+    # Soft flag: back not shown → halve probability
+    if isinstance(red_flags.get("back_not_shown"), dict) and red_flags["back_not_shown"].get("flag"):
+        prob = prob // 2
+
+    soft_flags = [f for f, info in red_flags.items()
+                  if f not in _CRITICAL_FLAGS
+                  and isinstance(info, dict) and info.get("flag")]
+
+    summary = parsed.get("summary", "")
+    notes   = (f"⚠️ {', '.join(soft_flags)}. " if soft_flags else "") + summary
+
+    return {
+        "recommendation":           "SUBMIT" if grade_high >= 9 and prob >= 30 else "SKIP",
+        "predicted_grade":          predicted_grade,
+        "psa9_or_better_probability": prob,
+        "photo_quality":            photo_quality,
+        "notes":                    notes,
+        "red_flags_active":         ", ".join(soft_flags) if soft_flags else None,
+    }
+
+
+def _get_dim_rating(parsed: dict, key: str) -> str | None:
+    val = parsed.get(key)
+    return val.get("rating") if isinstance(val, dict) else None
+
+
+def analyze_image(card_name: str, set_name: str, card_number: str, image_b64: str) -> dict:
     load_dotenv()
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -305,56 +333,62 @@ def analyze_image(card_name: str, set_name: str, image_b64: str) -> dict:
         return {"error": "anthropic not installed", "recommendation": "SKIP"}
 
     content = [
-        {
-            "type": "image",
-            "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64},
-        },
-        {
-            "type": "text",
-            "text": GRADING_PROMPT.format(card_name=card_name, set_name=set_name),
-        },
+        {"type": "image",
+         "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
+        {"type": "text",
+         "text": GRADING_PROMPT.format(card_name=card_name, set_name=set_name,
+                                       card_number=card_number or "unknown")},
     ]
 
+    raw = ""
     try:
         client = Anthropic(api_key=api_key)
         response = client.messages.create(
             model=MODEL,
-            max_tokens=512,
+            max_tokens=1024,
             messages=[{"role": "user", "content": content}],
         )
-        raw = response.content[0].text.strip()
-
-        # Strip markdown code fences if present
+        raw       = response.content[0].text.strip()
         raw_clean = re.sub(r"```(?:json)?\s*", "", raw).strip()
 
         start = raw_clean.find("{")
-        end = raw_clean.rfind("}") + 1
+        end   = raw_clean.rfind("}") + 1
         if start == -1 or end == 0:
             return {"error": f"No JSON in response: {raw[:100]}", "recommendation": "SKIP"}
 
-        result = json.loads(raw_clean[start:end])
-        if not isinstance(result, dict):
+        parsed = json.loads(raw_clean[start:end])
+        if not isinstance(parsed, dict):
             return {"error": "Response was not a JSON object", "recommendation": "SKIP"}
 
-        return result
+        parsed  = {k.strip().strip('"').strip("'"): v for k, v in parsed.items()}
+        derived = _derive_from_analysis(parsed)
+        return {
+            **derived,
+            "centering_front": _get_dim_rating(parsed, "centering_front"),
+            "corners":         _get_dim_rating(parsed, "corners"),
+            "edges":           _get_dim_rating(parsed, "edges"),
+            "surface_front":   _get_dim_rating(parsed, "surface_front"),
+            "holo_condition":  _get_dim_rating(parsed, "holo_condition"),
+            "grade_low":  parsed.get("predicted_grade_range", {}).get("low")  if isinstance(parsed.get("predicted_grade_range"), dict) else None,
+            "grade_high": parsed.get("predicted_grade_range", {}).get("high") if isinstance(parsed.get("predicted_grade_range"), dict) else None,
+        }
 
     except json.JSONDecodeError as e:
-        return {"error": f"JSON parse error: {e}", "recommendation": "SKIP"}
+        return {"error": f"JSON parse error: {e} | raw: {raw[:200]}", "recommendation": "SKIP"}
     except Exception as e:
         return {"error": str(e), "recommendation": "SKIP"}
 
 
-def pick_best_listing(card_name: str, set_name: str, listings: list[dict]) -> tuple[dict, dict]:
+def pick_best_listing(card_name: str, set_name: str, card_number: str,
+                      listings: list[dict]) -> tuple[dict | None, dict]:
     """
-    Analyze the API-provided image for each listing with Claude Vision.
-    Returns (best_listing, analysis_dict).
-
-    best_listing always defaults to listings[0] (cheapest) so there is always
-    a direct eBay URL regardless of whether image analysis succeeds.
-    Best = highest psa9_or_better_probability, preferring SUBMIT over SKIP.
+    Analyze each listing photo with Claude Vision.
+    Returns (best_listing, analysis) where best_listing is None if every
+    listing was disqualified (stock photo / fake / altered).
+    Never falls back to a disqualified listing.
     """
-    best_listing = listings[0]   # cheapest — guaranteed fallback URL
-    best_analysis: dict = {}
+    best_listing:  dict | None = None   # None = all disqualified
+    best_analysis: dict        = {}
     best_score = -1
 
     for i, listing in enumerate(listings, 1):
@@ -371,22 +405,31 @@ def pick_best_listing(card_name: str, set_name: str, listings: list[dict]) -> tu
             continue
 
         print("analyzing...", end=" ", flush=True)
-        analysis = analyze_image(card_name, set_name, b64)
-        rec = analysis.get("recommendation", "SKIP")
-        prob = analysis.get("psa9_or_better_probability") or 0
-        print(f"{rec} (PSA 9+: {prob}%)")
+        analysis = analyze_image(card_name, set_name, card_number, b64)
+        rec      = analysis.get("recommendation", "SKIP")
+        prob     = analysis.get("psa9_or_better_probability") or 0
+        flags    = analysis.get("red_flags_active") or ""
+        flag_str = f" [{flags}]" if flags else ""
+        print(f"{rec} (PSA 9+: {prob}%){flag_str}")
+
+        # Disqualified listings are never used, even as fallback
+        if analysis.get("photo_quality") == "disqualified":
+            continue
 
         submit_bonus = 1000 if rec == "SUBMIT" else 0
         score = submit_bonus + prob
         if score > best_score:
-            best_score = score
-            best_listing = listing
+            best_score    = score
+            best_listing  = listing
             best_analysis = analysis
+
+    if best_listing is None:
+        print("  All listings disqualified (stock photos / fakes) — no URL set")
 
     return best_listing, best_analysis
 
 
-# ── Main run ───────────────────────────────────────────────────────────────────
+# ── Main run ───────────────────────────────────────────────────────────────────────────────────
 
 def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
     load_dotenv()
@@ -396,46 +439,34 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
         print("No flip opportunities to analyze.")
         return pd.DataFrame()
 
-    sort_col = "roi" if "roi" in df.columns else df.columns[0]
+    sort_col   = "roi" if "roi" in df.columns else df.columns[0]
     candidates = df.sort_values(sort_col, ascending=False).head(top_n).copy()
     print(f"Analyzing top {len(candidates)} cards...\n")
 
     rows = []
     for rank, (_, card) in enumerate(candidates.iterrows(), 1):
-        card_name = str(card.get("card_name", "")).strip()
-        set_name = str(card.get("set_name", "")).strip()
-        print(f"[{rank}/{len(candidates)}] {card_name} | {set_name}")
+        card_name   = str(card.get("card_name",   "")).strip()
+        set_name    = str(card.get("set_name",    "")).strip()
+        card_number = str(card.get("card_number", "")).strip()
+        print(f"[{rank}/{len(candidates)}] {card_name} | {set_name} #{card_number}")
 
         result = {
-            "card_name": card_name,
-            "set_name": set_name,
-            "card_number": card.get("card_number"),
-            "raw_price": card.get("raw_price"),
-            "psa9_price": card.get("psa9_price"),
-            "psa10_price": card.get("psa10_price"),
-            "gem_rate": card.get("gem_rate"),
-            "total_graded": card.get("total_graded"),
-            "psa9_count": card.get("psa9_count"),
-            "psa10_count": card.get("psa10_count"),
-            "roi": card.get("roi"),
-            "track": card.get("track"),
-            "breakeven_gem_rate": card.get("breakeven_gem_rate"),
-            "ebay_listing_url": None,
-            "ebay_price": None,
-            "centering": None,
-            "corners": None,
-            "edges": None,
-            "surface": None,
-            "predicted_grade": None,
-            "psa10_probability": None,
-            "psa9_or_better_probability": None,
-            "recommendation": "NO_DATA",
-            "photo_quality": None,
-            "notes": None,
-            "error": None,
+            "card_name": card_name, "set_name": set_name, "card_number": card_number,
+            "raw_price":   card.get("raw_price"),   "psa9_price":  card.get("psa9_price"),
+            "psa10_price": card.get("psa10_price"), "gem_rate":    card.get("gem_rate"),
+            "total_graded": card.get("total_graded"), "psa9_count": card.get("psa9_count"),
+            "psa10_count":  card.get("psa10_count"),  "roi":        card.get("roi"),
+            "track": card.get("track"), "breakeven_gem_rate": card.get("breakeven_gem_rate"),
+            # URL fields start as None — only set if a real photo listing passes analysis
+            "ebay_listing_url": None, "ebay_price": None,
+            "centering_front": None, "corners": None, "edges": None,
+            "surface_front": None, "holo_condition": None,
+            "grade_low": None, "grade_high": None,
+            "predicted_grade": None, "psa9_or_better_probability": None,
+            "recommendation": "NO_DATA", "photo_quality": None,
+            "red_flags_active": None, "notes": None, "error": None,
         }
 
-        # Step 1: Search eBay
         print(f"  Searching eBay...", end=" ", flush=True)
         time.sleep(RATE_DELAY)
         listings = search_ebay_listings(card_name, set_name)
@@ -451,37 +482,31 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
         )
         print(f"{len(listings)} listings ({price_range})")
 
-        # Step 2: Always save cheapest listing URL as the guaranteed fallback
-        result["ebay_listing_url"] = listings[0]["url"]
-        result["ebay_price"] = listings[0]["price"]
+        try:
+            best_listing, analysis = pick_best_listing(card_name, set_name, card_number, listings)
 
-        # Step 3: Analyze images, pick the best quality listing
-        best_listing, analysis = pick_best_listing(card_name, set_name, listings)
+            # Only set URL if a real (non-stock-photo) listing was found
+            if best_listing is not None:
+                result["ebay_listing_url"] = best_listing["url"]
+                result["ebay_price"]       = best_listing["price"]
 
-        # Update to best listing (may be same as cheapest if analysis picked it or failed)
-        result["ebay_listing_url"] = best_listing["url"]
-        result["ebay_price"] = best_listing["price"]
+            if analysis and isinstance(analysis, dict):
+                for field in ("recommendation", "predicted_grade", "psa9_or_better_probability",
+                              "photo_quality", "notes", "error", "red_flags_active",
+                              "centering_front", "corners", "edges", "surface_front",
+                              "holo_condition", "grade_low", "grade_high"):
+                    if field in analysis:
+                        result[field] = analysis[field]
+        except Exception as e:
+            print(f"  [analysis error] {e}")
+            result["error"] = str(e)
 
-        if analysis:
-            result.update({
-                "centering":                  analysis.get("centering"),
-                "corners":                    analysis.get("corners"),
-                "edges":                      analysis.get("edges"),
-                "surface":                    analysis.get("surface"),
-                "predicted_grade":            analysis.get("predicted_grade"),
-                "psa10_probability":          analysis.get("psa10_probability"),
-                "psa9_or_better_probability": analysis.get("psa9_or_better_probability"),
-                "recommendation":             analysis.get("recommendation", "SKIP"),
-                "photo_quality":              analysis.get("photo_quality"),
-                "notes":                      analysis.get("notes"),
-                "error":                      analysis.get("error"),
-            })
-
-        rec = result["recommendation"]
+        rec   = result.get("recommendation", "NO_DATA")
         grade = result.get("predicted_grade", "?")
-        prob = result.get("psa9_or_better_probability", "?")
-        print(f"  → {best_listing['url']}")
-        print(f"  → ${best_listing['price']:.2f} | {rec} | predicted PSA {grade} | PSA 9+: {prob}%\n")
+        prob  = result.get("psa9_or_better_probability", "?")
+        url   = result.get("ebay_listing_url") or "[no valid listing — search link will be used]"
+        print(f"  → {url}")
+        print(f"  → ${result.get('ebay_price') or 0:.2f} | {rec} | predicted PSA {grade} | PSA 9+: {prob}%\n")
 
         rows.append(result)
 
@@ -493,12 +518,20 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
     shortlist = analysis_df[analysis_df["recommendation"] == "SUBMIT"].copy()
     shortlist.to_csv(OUTPUT_SHORTLIST, index=False)
 
-    total = len(candidates)
-    found = (analysis_df["ebay_listing_url"].notna()).sum()
+    total  = len(candidates)
+    found  = (analysis_df["ebay_listing_url"].notna()).sum()
     submit = len(shortlist)
     print(f"\n{'='*60}")
-    print(f"eBay listings found: {found}/{total}")
+    print(f"Real photo listings found: {found}/{total}")
     print(f"SUBMIT (PSA 9/10 candidate): {submit}/{found}")
     print(f"{'='*60}\n")
 
     return shortlist
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", default=str(INPUT_FILE))
+    parser.add_argument("--top",   type=int, default=20)
+    args = parser.parse_args()
+    run(input_path=args.input, top_n=args.top)
