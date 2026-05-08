@@ -110,31 +110,106 @@ def _is_graded_title(title: str) -> bool:
 
 # ── eBay search ────────────────────────────────────────────────────────────────
 
+def _search_browse_api(card_name: str, set_name: str, access_token: str) -> list[dict]:
+    """
+    Search active eBay listings via the Browse API (recommended replacement for
+    the Finding API's findItemsByKeywords operation).
+    Returns candidates list in the same format as search_ebay_listings.
+    """
+    try:
+        resp = _SESSION.get(
+            "https://api.ebay.com/buy/browse/v1/item_summary/search",
+            headers={"Authorization": f"Bearer {access_token}",
+                     "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"},
+            params={
+                "q": f"{card_name} {set_name} pokemon",
+                "sort": "price",
+                "limit": str(MAX_LISTINGS * 3),
+            },
+            timeout=20,
+        )
+        if not resp or resp.status_code != 200:
+            return []
+
+        data = resp.json()
+        candidates = []
+        for item in data.get("itemSummaries", []):
+            title = item.get("title", "")
+            if _is_graded_title(title):
+                continue
+            url = item.get("itemWebUrl", "")
+            price_str = item.get("price", {}).get("value", "0")
+            try:
+                price = float(price_str)
+            except (ValueError, TypeError):
+                price = 0.0
+            if price <= 0 or not url:
+                continue
+            image_url = item.get("image", {}).get("imageUrl")
+            candidates.append({"title": title, "price": price,
+                                "url": url, "image_url": image_url})
+            if len(candidates) >= MAX_LISTINGS:
+                break
+        return sorted(candidates, key=lambda c: c["price"])[:MAX_LISTINGS]
+    except Exception as e:
+        print(f"  Browse API error: {e}")
+        return []
+
+
+def _get_browse_token(client_id: str, client_secret: str) -> str | None:
+    """Get an OAuth application token for the eBay Browse API."""
+    import base64
+    try:
+        creds = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+        resp = _SESSION.post(
+            "https://api.ebay.com/identity/v1/oauth2/token",
+            headers={"Authorization": f"Basic {creds}",
+                     "Content-Type": "application/x-www-form-urlencoded"},
+            data="grant_type=client_credentials&scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope",
+            timeout=20,
+        )
+        if resp and resp.status_code == 200:
+            return resp.json().get("access_token")
+    except Exception as e:
+        print(f"  OAuth token error: {e}")
+    return None
+
+
 def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
     """
-    Use eBay Finding API to get cheapest raw/ungraded listings.
-    Returns up to MAX_LISTINGS candidates sorted by price ascending.
-    Each dict: {title, price, url, image_url}
+    Search active eBay listings for cheapest ungraded copies.
+    Tries the Browse API first (recommended), falls back to Finding API.
+    Returns up to MAX_LISTINGS candidates sorted by price: {title, price, url, image_url}
     """
     load_dotenv()
     app_id = os.environ.get("EBAY_APP_ID")
+    cert_id = os.environ.get("EBAY_CERT_ID")
+
     if not app_id:
         print("  EBAY_APP_ID not set — skipping eBay search")
         return []
 
+    # ── Try Browse API first (OAuth, not deprecated) ──────────────────────────
+    if cert_id:
+        token = _get_browse_token(app_id, cert_id)
+        if token:
+            results = _search_browse_api(card_name, set_name, token)
+            if results:
+                return results
+            print("  Browse API returned 0 results, falling back to Finding API...", end=" ", flush=True)
+        else:
+            print("  Browse API token failed, falling back to Finding API...", end=" ", flush=True)
+
+    # ── Fall back to Finding API (findItemsByKeywords) ────────────────────────
+    # Use minimal params — complex filters can trigger HTTP 500 on some app tiers
     params = {
         "OPERATION-NAME": "findItemsByKeywords",
         "SERVICE-VERSION": "1.13.0",
         "SECURITY-APPNAME": app_id,
         "RESPONSE-DATA-FORMAT": "JSON",
         "keywords": f"{card_name} {set_name} pokemon",
-        "itemFilter(0).name": "ListingType",
-        "itemFilter(0).value(0)": "FixedPrice",
-        "itemFilter(0).value(1)": "Auction",
         "sortOrder": "PricePlusShippingLowest",
         "paginationInput.entriesPerPage": str(MAX_LISTINGS * 3),
-        "outputSelector(0)": "PictureURLSuperSize",
-        "outputSelector(1)": "PictureURLLargeSize",
     }
 
     try:
@@ -144,13 +219,12 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
             return []
 
         data = resp.json()
-        # Log the raw API ack/error so we can see in CI if something is wrong
         ack = (data.get("findItemsByKeywordsResponse", [{}])[0]
                    .get("ack", [""])[0])
         total_entries = (data.get("findItemsByKeywordsResponse", [{}])[0]
                              .get("searchResult", [{}])[0]
                              .get("@count", "?"))
-        print(f"(API ack={ack}, totalResults={total_entries})", end=" ", flush=True)
+        print(f"(Finding API ack={ack}, total={total_entries})", end=" ", flush=True)
 
         items = (data
                  .get("findItemsByKeywordsResponse", [{}])[0]
@@ -177,7 +251,6 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
             if price <= 0 or not view_url:
                 continue
 
-            # Best image the API provides — prefer largest size available
             image_url = (
                 (item.get("pictureURLSuperSize") or [None])[0]
                 or (item.get("pictureURLLargeSize") or [None])[0]
