@@ -1,14 +1,10 @@
 """
 Fetch raw (ungraded) and PSA 9 / PSA 10 prices from eBay completed sales.
 
-Replaces fetch_tcgplayer_prices.py. Uses the eBay Finding API
-findCompletedItems operation with SoldItemsOnly=true — same EBAY_APP_ID,
-no new credentials, no Cloudflare, no scraping.
-
-For each card:
-  raw_price   — median of last SAMPLE_SIZE sold ungraded listings
-  psa9_price  — median of last SAMPLE_SIZE sold PSA 9 listings
-  psa10_price — median of last SAMPLE_SIZE sold PSA 10 listings
+Uses the eBay Finding API findCompletedItems with SoldItemsOnly=true.
+Makes ONE API call per card (not 3), then buckets results by grade from
+the title. This keeps total calls to ~300 per run instead of ~900,
+avoiding the soft rate-limit that causes HTTP 500 responses.
 
 Output: .tmp/ebay_prices.csv  (card_name, set_name, card_number, raw_price,
                                 psa9_price, psa10_price, raw_sales_count,
@@ -17,7 +13,6 @@ Output: .tmp/ebay_prices.csv  (card_name, set_name, card_number, raw_price,
 Usage:
     python execution/fetch_ebay_prices.py
     python execution/fetch_ebay_prices.py --input .tmp/filtered_cards.csv
-    python execution/fetch_ebay_prices.py --workers 5 --sample 20
 """
 
 import argparse
@@ -25,6 +20,7 @@ import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+import threading
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -41,158 +37,131 @@ EBAY_FINDING_URL = "https://svcs.ebay.com/services/search/FindingService/v1"
 INPUT_FILE  = Path(".tmp/filtered_cards.csv")
 OUTPUT_FILE = Path(".tmp/ebay_prices.csv")
 
-SAMPLE_SIZE  = 10   # sold listings to sample per price bucket
-MAX_WORKERS  = 2    # parallel threads — keep low to preserve rate limit for step 6
-RATE_DELAY   = 1.0  # seconds between requests per thread (3 calls/card × 2 workers = ~6 req/s max)
+MAX_WORKERS = 2    # parallel threads
+RATE_DELAY  = 1.5  # seconds between requests per thread
+MAX_RETRIES = 3    # retries on HTTP 500
 
 
 def _get(params: dict) -> dict | None:
-    """Call the eBay Finding API and return the parsed JSON, or None on failure."""
-    try:
-        resp = _SESSION.get(EBAY_FINDING_URL, params=params, timeout=20)
-        if resp.status_code == 200:
-            return resp.json()
-    except Exception:
-        pass
+    """Call the eBay Finding API with retry on HTTP 500."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = _SESSION.get(EBAY_FINDING_URL, params=params, timeout=20)
+            if resp.status_code == 200:
+                return resp.json()
+            if resp.status_code == 500 and attempt < MAX_RETRIES:
+                time.sleep(attempt * 15)
+                continue
+        except Exception:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 5)
     return None
 
 
 def _is_raw(title: str) -> bool:
-    """Return True if the listing title looks like an ungraded copy."""
     t = title.lower()
-    graded_kws = ["psa ", "psa-", "psa9", "psa10", "bgs ", "cgc ", "sgc ",
-                  "graded", "gem mint", "beckett"]
-    return not any(kw in t for kw in graded_kws)
+    return not any(kw in t for kw in
+                   ["psa ", "psa-", "psa9", "psa10", "bgs ", "cgc ", "sgc ",
+                    "graded", "gem mint", "beckett"])
 
 
 def _has_grade(title: str, grade: int) -> bool:
-    """Return True if the title explicitly mentions the given PSA grade."""
     t = title.upper()
-    if grade == 9:
-        # Accept "PSA 9" but reject "PSA 9.5", "PSA 10"
-        return ("PSA 9" in t) and ("PSA 9.5" not in t) and ("PSA 10" not in t) and ("PSA10" not in t)
     if grade == 10:
         return ("PSA 10" in t) or ("PSA10" in t)
+    if grade == 9:
+        return (("PSA 9" in t) or ("PSA9" in t)) and not _has_grade(title, 10) and ("PSA 9.5" not in t)
     return False
 
 
-def _sold_prices(keywords: str, app_id: str,
-                 title_filter=None, max_results: int = SAMPLE_SIZE) -> list[float]:
-    """
-    Query findCompletedItems for sold listings matching keywords.
-    Returns a list of sold prices (float). title_filter is an optional callable.
-    """
-    params = {
-        "OPERATION-NAME":           "findCompletedItems",
-        "SERVICE-VERSION":          "1.13.0",
-        "SECURITY-APPNAME":         app_id,
-        "RESPONSE-DATA-FORMAT":     "JSON",
-        "keywords":                 keywords,
-        "itemFilter(0).name":       "SoldItemsOnly",
-        "itemFilter(0).value":      "true",
-        "sortOrder":                "StartTimeNewest",
-        "paginationInput.entriesPerPage": str(min(max_results * 3, 100)),
-    }
-
-    data = _get(params)
-    if data is None:
-        return []
-
-    items = (data
-             .get("findCompletedItemsResponse", [{}])[0]
-             .get("searchResult", [{}])[0]
-             .get("item", []))
-
-    prices = []
-    for item in items:
-        title = item.get("title", [""])[0]
-        if title_filter and not title_filter(title):
-            continue
-
-        price_str = (item.get("sellingStatus", [{}])[0]
-                        .get("convertedCurrentPrice", [{}])[0]
-                        .get("__value__", "0"))
-        try:
-            price = float(price_str)
-            if price > 0:
-                prices.append(price)
-        except (ValueError, TypeError):
-            pass
-
-        if len(prices) >= max_results:
-            break
-
-    return prices
-
-
 def _median(prices: list[float]) -> float | None:
-    if not prices:
-        return None
-    return float(pd.Series(prices).median())
+    return float(pd.Series(prices).median()) if prices else None
 
 
 def fetch_card_prices(card_name: str, set_name: str,
                       card_number: str, app_id: str) -> dict:
-    """Fetch raw, PSA 9, and PSA 10 median sold prices for one card."""
-    base = f"{card_name} {set_name} pokemon"
-
+    """
+    One API call per card: fetch last 30 completed sold listings and
+    bucket them into raw / PSA 9 / PSA 10 by title.
+    """
     time.sleep(RATE_DELAY)
-    raw_prices = _sold_prices(base, app_id, title_filter=_is_raw)
+    keywords = f"{card_name} {set_name} pokemon"
 
-    time.sleep(RATE_DELAY)
-    psa9_prices = _sold_prices(
-        f"PSA 9 {base}", app_id,
-        title_filter=lambda t: _has_grade(t, 9),
-    )
+    params = {
+        "OPERATION-NAME":                  "findCompletedItems",
+        "SERVICE-VERSION":                 "1.13.0",
+        "SECURITY-APPNAME":                app_id,
+        "RESPONSE-DATA-FORMAT":            "JSON",
+        "keywords":                        keywords,
+        "itemFilter(0).name":              "SoldItemsOnly",
+        "itemFilter(0).value":             "true",
+        "sortOrder":                       "StartTimeNewest",
+        "paginationInput.entriesPerPage":  "30",
+    }
 
-    time.sleep(RATE_DELAY)
-    psa10_prices = _sold_prices(
-        f"PSA 10 {base}", app_id,
-        title_filter=lambda t: _has_grade(t, 10),
-    )
+    data = _get(params)
 
-    search_url = (
-        "https://www.ebay.com/sch/i.html?"
-        + urllib.parse.urlencode({
-            "_nkw": base,
-            "LH_Complete": "1",
-            "LH_Sold": "1",
-        })
-    )
+    raw_prices, psa9_prices, psa10_prices = [], [], []
+
+    if data:
+        items = (data
+                 .get("findCompletedItemsResponse", [{}])[0]
+                 .get("searchResult", [{}])[0]
+                 .get("item", []))
+
+        for item in items:
+            title = item.get("title", [""])[0]
+            price_str = (item.get("sellingStatus", [{}])[0]
+                            .get("convertedCurrentPrice", [{}])[0]
+                            .get("__value__", "0"))
+            try:
+                price = float(price_str)
+            except (ValueError, TypeError):
+                continue
+            if price <= 0:
+                continue
+
+            if _has_grade(title, 10):
+                psa10_prices.append(price)
+            elif _has_grade(title, 9):
+                psa9_prices.append(price)
+            elif _is_raw(title):
+                raw_prices.append(price)
 
     return {
-        "card_name":        card_name,
-        "set_name":         set_name,
-        "card_number":      card_number,
-        "raw_price":        _median(raw_prices),
-        "psa9_price":       _median(psa9_prices),
-        "psa10_price":      _median(psa10_prices),
-        "raw_sales_count":  len(raw_prices),
-        "psa9_sales_count": len(psa9_prices),
-        "psa10_sales_count":len(psa10_prices),
-        "source_url":       search_url,
+        "card_name":         card_name,
+        "set_name":          set_name,
+        "card_number":       card_number,
+        "raw_price":         _median(raw_prices),
+        "psa9_price":        _median(psa9_prices),
+        "psa10_price":       _median(psa10_prices),
+        "raw_sales_count":   len(raw_prices),
+        "psa9_sales_count":  len(psa9_prices),
+        "psa10_sales_count": len(psa10_prices),
+        "source_url": (
+            "https://www.ebay.com/sch/i.html?"
+            + urllib.parse.urlencode({"_nkw": keywords,
+                                      "LH_Complete": "1", "LH_Sold": "1"})
+        ),
     }
 
 
 def run(input_path: str = str(INPUT_FILE),
         output_path: str = str(OUTPUT_FILE),
-        workers: int = MAX_WORKERS,
-        sample: int = SAMPLE_SIZE) -> pd.DataFrame:
+        workers: int = MAX_WORKERS) -> pd.DataFrame:
     load_dotenv()
     app_id = os.environ.get("EBAY_APP_ID")
     if not app_id:
         raise RuntimeError("EBAY_APP_ID not set — cannot fetch eBay prices")
 
-    global SAMPLE_SIZE
-    SAMPLE_SIZE = sample
-
     cards_df = pd.read_csv(input_path)
     total = len(cards_df)
-    print(f"Fetching eBay sold prices for {total} cards ({workers} workers)...")
+    print(f"Fetching eBay sold prices for {total} cards "
+          f"(1 call/card, {workers} workers, {RATE_DELAY}s delay)...")
 
     results = []
     completed = 0
-    lock = __import__("threading").Lock()
+    lock = threading.Lock()
 
     def _fetch(row):
         return fetch_card_prices(
@@ -210,24 +179,20 @@ def run(input_path: str = str(INPUT_FILE),
             except Exception as e:
                 row = futures[future]
                 result = {
-                    "card_name":   row.get("card_name"),
-                    "set_name":    row.get("set_name"),
+                    "card_name": row.get("card_name"), "set_name": row.get("set_name"),
                     "card_number": row.get("card_number"),
                     "raw_price": None, "psa9_price": None, "psa10_price": None,
                     "raw_sales_count": 0, "psa9_sales_count": 0, "psa10_sales_count": 0,
-                    "source_url": None,
-                    "error": str(e),
+                    "source_url": None, "error": str(e),
                 }
 
             with lock:
                 results.append(result)
                 completed += 1
                 if completed % 50 == 0 or completed == total:
-                    pct = completed / total * 100
-                    has_raw  = sum(1 for r in results if r.get("raw_price"))
-                    has_psa  = sum(1 for r in results
-                                   if r.get("psa9_price") or r.get("psa10_price"))
-                    print(f"  {completed}/{total} ({pct:.0f}%)  —  "
+                    has_raw = sum(1 for r in results if r.get("raw_price"))
+                    has_psa = sum(1 for r in results if r.get("psa9_price") or r.get("psa10_price"))
+                    print(f"  {completed}/{total} ({completed/total*100:.0f}%)  —  "
                           f"{has_raw} with raw price, {has_psa} with PSA price")
 
     df = pd.DataFrame(results)
@@ -247,10 +212,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fetch eBay sold prices for filtered cards")
     parser.add_argument("--input",   default=str(INPUT_FILE))
     parser.add_argument("--output",  default=str(OUTPUT_FILE))
-    parser.add_argument("--workers", type=int, default=MAX_WORKERS,
-                        help="Parallel threads (default: 3)")
-    parser.add_argument("--sample",  type=int, default=SAMPLE_SIZE,
-                        help="Sold listings to sample per price bucket (default: 20)")
+    parser.add_argument("--workers", type=int, default=MAX_WORKERS)
     args = parser.parse_args()
-    run(input_path=args.input, output_path=args.output,
-        workers=args.workers, sample=args.sample)
+    run(input_path=args.input, output_path=args.output, workers=args.workers)
