@@ -43,18 +43,18 @@ MAX_RETRIES = 3    # retries on HTTP 500
 
 
 def _get(params: dict) -> dict | None:
-    """Call the eBay Finding API with retry on HTTP 500."""
-    for attempt in range(1, MAX_RETRIES + 1):
+    """Call the eBay Finding API. On HTTP 500 retry once after 5s, then give up."""
+    for attempt in range(1, 3):
         try:
             resp = _SESSION.get(EBAY_FINDING_URL, params=params, timeout=20)
             if resp.status_code == 200:
                 return resp.json()
-            if resp.status_code == 500 and attempt < MAX_RETRIES:
-                time.sleep(attempt * 15)
+            if resp.status_code == 500 and attempt == 1:
+                time.sleep(5)
                 continue
         except Exception:
-            if attempt < MAX_RETRIES:
-                time.sleep(attempt * 5)
+            if attempt == 1:
+                time.sleep(5)
     return None
 
 
