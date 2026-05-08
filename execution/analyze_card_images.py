@@ -87,11 +87,20 @@ Respond ONLY with valid JSON in exactly this format:
 }"""
 
 
-def _get(url: str, params: dict | None = None) -> object | None:
-    try:
-        return _SESSION.get(url, params=params, timeout=20)
-    except Exception:
-        return None
+def _get(url: str, params: dict | None = None, max_retries: int = 3) -> object | None:
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = _SESSION.get(url, params=params, timeout=20)
+            if resp.status_code == 500 and attempt < max_retries:
+                wait = attempt * 10
+                print(f"(HTTP 500, retrying in {wait}s...)", end=" ", flush=True)
+                time.sleep(wait)
+                continue
+            return resp
+        except Exception:
+            if attempt < max_retries:
+                time.sleep(attempt * 5)
+    return None
 
 
 def _is_graded_title(title: str) -> bool:
