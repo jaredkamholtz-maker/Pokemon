@@ -181,6 +181,42 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
         print("  OAuth token failed")
         return []
 
+    def _parse_items(items: list, strict: bool) -> list:
+        """
+        Parse Browse API itemSummaries into candidates.
+        strict=True  → also filter multi-card/lot listings
+        strict=False → only filter graded listings (last-resort fallback)
+        """
+        out = []
+        graded_n = multi_n = no_url_n = 0
+        for item in items:
+            title = item.get("title", "")
+            url   = item.get("itemWebUrl", "")
+            if not url:
+                no_url_n += 1
+                continue
+            if _is_graded_title(title):
+                graded_n += 1
+                continue
+            if strict and _is_multi_card_listing(title):
+                multi_n += 1
+                continue
+            # Accept any price — auctions may show 0 until first bid
+            try:
+                price = float(item.get("price", {}).get("value") or 0)
+            except (ValueError, TypeError):
+                price = 0.0
+            image_url = item.get("image", {}).get("imageUrl")
+            # Prefer listings that have additional photos (real seller photos)
+            extra_images = len(item.get("additionalImages", []))
+            out.append({"title": title, "price": price, "url": url,
+                        "image_url": image_url, "extra_images": extra_images})
+            if len(out) >= MAX_LISTINGS * 4:   # gather extras for sorting
+                break
+        if strict:
+            print(f"(graded={graded_n} lot={multi_n} no_url={no_url_n} raw={len(out)})", end=" ", flush=True)
+        return out
+
     try:
         resp = _SESSION.get(
             "https://api.ebay.com/buy/browse/v1/item_summary/search",
@@ -197,53 +233,21 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
 
         items = resp.json().get("itemSummaries", [])
         print(f"(API={len(items)})", end=" ", flush=True)
-        candidates = []
-        multi_skipped = 0
-        graded_skipped = 0
-        for item in items:
-            title = item.get("title", "")
-            if _is_graded_title(title):
-                graded_skipped += 1
-                continue
-            if _is_multi_card_listing(title):
-                multi_skipped += 1
-                continue
-            url = item.get("itemWebUrl", "")
-            try:
-                price = float(item.get("price", {}).get("value", 0))
-            except (ValueError, TypeError):
-                price = 0.0
-            if price <= 0 or not url:
-                continue
-            image_url = item.get("image", {}).get("imageUrl")
-            candidates.append({"title": title, "price": price,
-                                "url": url, "image_url": image_url})
-            if len(candidates) >= MAX_LISTINGS:
-                break
-        print(f"(graded={graded_skipped} lot={multi_skipped} kept={len(candidates)})", end=" ", flush=True)
 
-        # Fallback: if strict filtering left nothing, relax to graded-only filter
+        candidates = _parse_items(items, strict=True)
+
+        # Fallback: relax lot filter if strict pass found nothing
         if not candidates:
-            print("(relaxing lot filter as fallback)", end=" ", flush=True)
-            for item in items:
-                title = item.get("title", "")
-                if _is_graded_title(title):
-                    continue
-                url = item.get("itemWebUrl", "")
-                try:
-                    price = float(item.get("price", {}).get("value", 0))
-                except (ValueError, TypeError):
-                    price = 0.0
-                if price <= 0 or not url:
-                    continue
-                image_url = item.get("image", {}).get("imageUrl")
-                candidates.append({"title": title, "price": price,
-                                    "url": url, "image_url": image_url})
-                if len(candidates) >= MAX_LISTINGS:
-                    break
-            print(f"(fallback kept={len(candidates)})", end=" ", flush=True)
+            print("(fallback: relaxing lot filter)", end=" ", flush=True)
+            candidates = _parse_items(items, strict=False)
 
-        return sorted(candidates, key=lambda c: c["price"])[:MAX_LISTINGS]
+        if not candidates:
+            print("(0 candidates after all filters)", end=" ", flush=True)
+            return []
+
+        # Sort: listings with extra photos first (real seller photos), then by price
+        candidates.sort(key=lambda c: (-c["extra_images"], c["price"]))
+        return candidates[:MAX_LISTINGS]
     except Exception as e:
         print(f"  Browse API error: {e}")
         return []
