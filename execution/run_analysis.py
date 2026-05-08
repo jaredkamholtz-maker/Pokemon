@@ -130,7 +130,7 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         return html, plain
 
     # Only include cards with a specific listing URL — skip generic "Find on eBay" cards
-    if has_image_analysis:
+    if "ebay_listing_url" in opportunities.columns:
         opportunities = opportunities[
             opportunities["ebay_listing_url"].notna() &
             (opportunities["ebay_listing_url"] != "")
@@ -453,25 +453,14 @@ def run(
             Path(SHORTLIST_PATH).parent.mkdir(parents=True, exist_ok=True)
             shortlist.to_csv(SHORTLIST_PATH, index=False)
         elif analysis_csv.exists():
-            # No SUBMIT cards — show all opportunities but attach whatever
-            # eBay listing URLs and prices image analysis did find
-            print("  No SUBMIT cards from image analysis — showing all opportunities with eBay links.")
+            # No SUBMIT cards — show only the analyzed cards that got a real eBay URL
+            print("  No SUBMIT cards from image analysis — showing analyzed cards with eBay links.")
             analysis_df = pd.read_csv(analysis_csv)
-            lookup = {
-                (str(r["card_name"]).strip(), str(r["set_name"]).strip()): r
-                for _, r in analysis_df.iterrows()
-            }
-            final = opportunities.copy()
-            final["ebay_listing_url"] = final.apply(
-                lambda r: lookup.get(
-                    (str(r["card_name"]).strip(), str(r["set_name"]).strip()), {}
-                ).get("ebay_listing_url"), axis=1
-            )
-            final["ebay_price"] = final.apply(
-                lambda r: lookup.get(
-                    (str(r["card_name"]).strip(), str(r["set_name"]).strip()), {}
-                ).get("ebay_price"), axis=1
-            )
+            final = analysis_df[
+                analysis_df["ebay_listing_url"].notna() &
+                (analysis_df["ebay_listing_url"] != "")
+            ].copy()
+            has_image_analysis = bool(len(final) > 0)
         print()
     elif skip_images:
         print("[6/6] Skipping image analysis (--skip-images)\n")
