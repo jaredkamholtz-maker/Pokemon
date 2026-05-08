@@ -479,13 +479,23 @@ def run(
         subject = f"Your {date.today().strftime('%m/%d')} Pokenalysis: {len(final)} Opportunit{'y' if len(final) == 1 else 'ies'} Found"
         send_email(html_body, plain_body, subject)
 
-    # Print summary
+    # Print summary + eBay URL diagnostic
     if final.empty:
         print("No cards met all criteria today.")
     else:
         cols = ["card_name", "set_name", "raw_price", "psa9_price", "psa10_price",
                 "gem_rate", "roi", "predicted_grade", "psa9_or_better_probability"]
         print(final[[c for c in cols if c in final.columns]].to_string(index=False))
+
+    # Show eBay URL status for every card so we can diagnose in CI logs
+    if "ebay_listing_url" in final.columns:
+        print("\n── eBay listing URLs ──")
+        for _, row in final.iterrows():
+            url = row.get("ebay_listing_url")
+            label = url if pd.notna(url) and url else "[MISSING — will show generic search link]"
+            print(f"  {row.get('card_name', '?')} | {label}")
+    else:
+        print("\n[WARNING] ebay_listing_url column missing from final dataframe — all links will be generic")
 
     out = SHORTLIST_PATH if has_image_analysis else OUTPUT_PATH
     print(f"\nFinal results saved to: {out}")
