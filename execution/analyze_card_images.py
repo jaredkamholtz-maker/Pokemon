@@ -135,15 +135,25 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
             return []
 
         data = resp.json()
+        # Log the raw API ack/error so we can see in CI if something is wrong
+        ack = (data.get("findItemsByKeywordsResponse", [{}])[0]
+                   .get("ack", [""])[0])
+        total_entries = (data.get("findItemsByKeywordsResponse", [{}])[0]
+                             .get("searchResult", [{}])[0]
+                             .get("@count", "?"))
+        print(f"(API ack={ack}, totalResults={total_entries})", end=" ", flush=True)
+
         items = (data
                  .get("findItemsByKeywordsResponse", [{}])[0]
                  .get("searchResult", [{}])[0]
                  .get("item", []))
 
         candidates = []
+        graded_skipped = 0
         for item in items:
             title = item.get("title", [""])[0]
             if _is_graded_title(title):
+                graded_skipped += 1
                 continue
 
             view_url = item.get("viewItemURL", [""])[0]
@@ -175,6 +185,8 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
             if len(candidates) >= MAX_LISTINGS:
                 break
 
+        if graded_skipped:
+            print(f"({graded_skipped} graded listings skipped)", end=" ", flush=True)
         return sorted(candidates, key=lambda c: c["price"])[:MAX_LISTINGS]
 
     except Exception as e:
