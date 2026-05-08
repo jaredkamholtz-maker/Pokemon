@@ -224,6 +224,19 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
 
 # ── Claude Vision analysis ─────────────────────────────────────────────────────────────────────────────
 
+def _upgrade_ebay_image_url(url: str) -> str:
+    """
+    eBay CDN URLs end in s-l<size>.jpg (e.g. s-l500.jpg, s-l140.jpg).
+    Swap to s-l1600 so Claude Vision gets a high-res photo instead of
+    the small API thumbnail, which can look like a stock image.
+    """
+    if not url:
+        return url
+    import re as _re
+    upgraded = _re.sub(r's-l\d+\.jpg', 's-l1600.jpg', url)
+    return upgraded if upgraded != url else url
+
+
 def download_image_b64(url: str) -> str | None:
     try:
         resp = _get(url)
@@ -405,7 +418,7 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
 
         print(f"  [{i}/{len(listings)}] ${listing['price']:.2f} — downloading image...", end=" ", flush=True)
         time.sleep(RATE_DELAY)
-        b64 = download_image_b64(image_url)
+        b64 = download_image_b64(_upgrade_ebay_image_url(image_url))
         if not b64:
             print("download failed")
             continue
