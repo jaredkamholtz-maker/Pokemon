@@ -134,7 +134,11 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
     for rank, (_, row) in enumerate(opportunities.iterrows(), 1):
         name = row.get("card_name", "?")
         set_name = row.get("set_name", "?")
-        raw = _fmt_price(row.get("raw_price"))
+        # Use the actual eBay listing price (what you'd pay) if captured; fall back to PriceCharting
+        _ebay_price = row.get("ebay_price")
+        _raw_price = row.get("raw_price")
+        buy_price_val = _ebay_price if pd.notna(_ebay_price) else _raw_price
+        raw = _fmt_price(buy_price_val)
         psa9 = _fmt_price(row.get("psa9_price"))
         psa10 = _fmt_price(row.get("psa10_price"))
         is_breakeven = row.get("track") == "breakeven"
@@ -242,7 +246,7 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
   <thead>
     <tr style="background:#f1f5f9;text-align:left;">
       <th style="padding:10px 14px;">Card</th>
-      <th style="padding:10px 14px;text-align:right;">Raw (Ungraded)</th>
+      <th style="padding:10px 14px;text-align:right;">{"Buy Price (eBay)" if has_image_analysis else "Raw (Ungraded)"}</th>
       <th style="padding:10px 14px;text-align:right;">PSA 9</th>
       <th style="padding:10px 14px;text-align:right;">PSA 10</th>
       <th style="padding:10px 14px;text-align:right;">Profit %</th>
@@ -433,15 +437,23 @@ def run(
             analysis_df = pd.read_csv(analysis_csv)
             # Build card → specific listing URL lookup from analysis
             if "ebay_listing_url" in analysis_df.columns:
+                # Strip whitespace to prevent silent key-mismatch failures
                 url_lookup = {
-                    (r["card_name"], r["set_name"]): r["ebay_listing_url"]
+                    (str(r["card_name"]).strip(), str(r["set_name"]).strip()): r["ebay_listing_url"]
                     for _, r in analysis_df.iterrows()
                     if pd.notna(r.get("ebay_listing_url"))
                 }
+                price_lookup = {
+                    (str(r["card_name"]).strip(), str(r["set_name"]).strip()): r["ebay_price"]
+                    for _, r in analysis_df.iterrows()
+                    if pd.notna(r.get("ebay_price"))
+                }
             else:
                 url_lookup = {}
+                price_lookup = {}
         else:
             url_lookup = {}
+            price_lookup = {}
 
         if not shortlist.empty:
             final = shortlist
@@ -450,11 +462,15 @@ def run(
             shortlist.to_csv(SHORTLIST_PATH, index=False)
         else:
             print("  No cards passed image analysis — using full opportunity list with best listing links.")
-            # Merge specific listing URLs into opportunities even for SKIP cards
+            # Merge specific listing URLs and actual eBay prices into opportunities
             final = opportunities.copy()
             if url_lookup:
                 final["ebay_listing_url"] = final.apply(
-                    lambda r: url_lookup.get((r["card_name"], r["set_name"])), axis=1
+                    lambda r: url_lookup.get((str(r["card_name"]).strip(), str(r["set_name"]).strip())), axis=1
+                )
+            if price_lookup:
+                final["ebay_price"] = final.apply(
+                    lambda r: price_lookup.get((str(r["card_name"]).strip(), str(r["set_name"]).strip())), axis=1
                 )
         print()
     elif skip_images:
