@@ -4,7 +4,7 @@ Full pipeline: discover → AI filter → prices → PSA population → EV → i
 Steps:
   1. discover_cards: query Pokemon TCG API for all cards in target sets (~3,000 cards)
   2. filter_cards_ai: Claude Haiku pre-filter → holos, full arts, chase rares (~400-600)
-  3. fetch_tcgplayer_prices: get raw + PSA 9 + PSA 10 prices from PriceCharting
+  3. fetch_ebay_prices: get raw + PSA 9 + PSA 10 prices from eBay completed sales
      Filter: PSA 9 or PSA 10 > $60 (configurable MIN_GRADED_PRICE)
   4. scrape_pokedata_population: get PSA submission counts and gem rate from 130point.com
   5. calculate_flip_ev: merge prices + population, calculate ROI
@@ -18,7 +18,7 @@ Usage:
     python execution/run_analysis.py --era scarlet-violet
     python execution/run_analysis.py --sets "151,Evolving Skies"
     python execution/run_analysis.py --skip-discovery  # reuse last discovered_cards.csv
-    python execution/run_analysis.py --skip-prices     # reuse last tcgplayer_prices.csv
+    python execution/run_analysis.py --skip-prices     # reuse last ebay_prices.csv
     python execution/run_analysis.py --skip-images     # skip eBay image analysis step
     python execution/run_analysis.py --skip-sheets --skip-email
 """
@@ -40,14 +40,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import discover_cards as discover_mod
 import filter_cards_ai as ai_filter_mod
-import fetch_tcgplayer_prices as prices_mod
+import fetch_ebay_prices as prices_mod
 import scrape_pokedata_population as pop_mod
 import calculate_flip_ev as ev_mod
 import analyze_card_images as images_mod
 
 DISCOVERED_PATH = ".tmp/discovered_cards.csv"
 FILTERED_PATH = ".tmp/filtered_cards.csv"
-PRICES_PATH = ".tmp/tcgplayer_prices.csv"
+PRICES_PATH = ".tmp/ebay_prices.csv"
 POP_PATH = ".tmp/pokedata_population.csv"
 OUTPUT_PATH = ".tmp/flip_opportunities.csv"
 SHORTLIST_PATH = ".tmp/final_shortlist.csv"
@@ -355,14 +355,14 @@ def run(
         print("No cards survived AI filter — nothing to analyze.")
         return pd.DataFrame()
 
-    # Step 3: Fetch prices from PriceCharting
+    # Step 3: Fetch prices from eBay completed sales
     if skip_prices and Path(PRICES_PATH).exists():
         n = len(pd.read_csv(PRICES_PATH))
         print(f"[3/6] Reusing {n} price records from {PRICES_PATH}")
     else:
-        print(f"[3/6] Fetching prices from PriceCharting ({len(filtered_df)} cards, "
+        print(f"[3/6] Fetching eBay sold prices ({len(filtered_df)} cards, "
               f"PSA 9/10 > ${min_graded_price:.0f})...")
-        prices_mod.run(watchlist_path=FILTERED_PATH)
+        prices_mod.run(input_path=FILTERED_PATH, output_path=PRICES_PATH)
 
     prices_df = pd.read_csv(PRICES_PATH)
     # Apply the PSA > $60 price filter

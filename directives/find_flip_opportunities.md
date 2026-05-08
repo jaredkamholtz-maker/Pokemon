@@ -20,7 +20,8 @@ target_sets.csv
 [2] filter_cards_ai.py     → .tmp/filtered_cards.csv      (~400–600 cards)
       │
       ▼
-[3] fetch_tcgplayer_prices.py → .tmp/tcgplayer_prices.csv  (parallel, 3 workers, curl_cffi)
+[3] fetch_ebay_prices.py → .tmp/ebay_prices.csv  (parallel, 3 workers, eBay Finding API)
+     → findCompletedItems + SoldItemsOnly=true; median of last 20 sold listings
      → Filter applied: keep only cards with PSA 9 or PSA 10 > $60
       │
       ▼
@@ -48,7 +49,7 @@ target_sets.csv
 |---|---|
 | `execution/discover_cards.py` | Queries Pokemon TCG API (`api.pokemontcg.io/v2/cards`) for all cards; no bot detection; optional `POKEMONTCG_API_KEY` raises rate limit 1k→20k req/day; set IDs hardcoded in `SET_ID_MAP` |
 | `execution/filter_cards_ai.py` | Sends cards to Claude Haiku in batches of 300; drops commons/trainers/bulk; returns PSA-worthy candidates (~80% reduction) |
-| `execution/fetch_tcgplayer_prices.py` | Gets raw + PSA 9 + PSA 10 market prices from PriceCharting; parallel (3 workers); uses `curl_cffi` with `impersonate="chrome124"` to bypass Cloudflare bot detection |
+| `execution/fetch_ebay_prices.py` | Gets raw + PSA 9 + PSA 10 prices from eBay completed sales (`findCompletedItems`); parallel (3 workers); same `EBAY_APP_ID` as step 6; median of last 20 sold listings; filters graded titles for raw price, requires "PSA 9"/"PSA 10" in title for graded prices |
 | `execution/scrape_pokedata_population.py` | Scrapes grade population data from 130point.com; parallel (5 workers) |
 | `execution/calculate_flip_ev.py` | Merges price + pop data; two-track EV analysis (see below); outputs full analysis sorted by ROI |
 | `execution/analyze_card_images.py` | Takes top N flip candidates; finds cheapest eBay raw listing per card; downloads photos; sends to Claude Vision for PSA grade prediction; outputs SUBMIT/SKIP recommendation |
@@ -189,3 +190,5 @@ Keeps: holo rares, full arts, alt arts, VMAX/VSTAR/ex/GX, secret rares, high-dem
 | 2026-05 | `discover_cards.py` used standard `requests` — PokeData.io (Cloudflare) returned 0 cards | Switched to Pokemon TCG API (`api.pokemontcg.io`) — free, no bot detection, no Cloudflare; set IDs hardcoded in `SET_ID_MAP` |
 | 2026-05 | Final filter required `gem_rate` to be present — cards with no 130point data produced 0 results | Added Track-2 (breakeven) path: cards without population data are surfaced if `breakeven_gem_rate ≤ 15%` (spread so good you'd profit even at low gem rates) |
 | 2026-05 | PriceCharting URL slug for "151" set was wrong (`pokemon-151` vs actual `pokemon-scarlet-&-violet-151`) | Added `SET_SLUG_OVERRIDES` dict in `fetch_tcgplayer_prices.py`; added overrides for 151, BREAKthrough, BREAKpoint, and all scarlet-violet sets |
+| 2026-05 | PriceCharting raw prices were stale/wrong (e.g. $400 raw when eBay shows $0.99); Cloudflare blocking scraping | Replaced `fetch_tcgplayer_prices.py` with `fetch_ebay_prices.py`; uses eBay `findCompletedItems` + `SoldItemsOnly=true`; same `EBAY_APP_ID`; median of last 20 sold listings; raw/PSA9/PSA10 prices now match actual market |
+| 2026-05 | Step 6 eBay listing URLs not reaching email; generic search links instead of specific items | Rebuilt `analyze_card_images.py`: removed listing-page scraping entirely; use API-provided image URLs only; cheapest listing URL always saved before analysis runs so email always has a direct `ebay.com/itm/` link |
