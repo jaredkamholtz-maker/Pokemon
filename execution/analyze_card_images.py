@@ -1,4 +1,4 @@
-""" 
+"""
 Final filter: find cheapest eBay raw listings for each top flip candidate,
 analyze listing photos with Claude Vision, and pick the best quality copy.
 
@@ -192,10 +192,11 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
             timeout=20,
         )
         if not resp or resp.status_code != 200:
+            print(f"(Browse API HTTP {resp and resp.status_code})", end=" ", flush=True)
             return []
 
         items = resp.json().get("itemSummaries", [])
-        print(f"(API returned {len(items)} results)", end=" ", flush=True)
+        print(f"(API={len(items)})", end=" ", flush=True)
         candidates = []
         multi_skipped = 0
         graded_skipped = 0
@@ -220,6 +221,28 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
             if len(candidates) >= MAX_LISTINGS:
                 break
         print(f"(graded={graded_skipped} lot={multi_skipped} kept={len(candidates)})", end=" ", flush=True)
+
+        # Fallback: if strict filtering left nothing, relax to graded-only filter
+        if not candidates:
+            print("(relaxing lot filter as fallback)", end=" ", flush=True)
+            for item in items:
+                title = item.get("title", "")
+                if _is_graded_title(title):
+                    continue
+                url = item.get("itemWebUrl", "")
+                try:
+                    price = float(item.get("price", {}).get("value", 0))
+                except (ValueError, TypeError):
+                    price = 0.0
+                if price <= 0 or not url:
+                    continue
+                image_url = item.get("image", {}).get("imageUrl")
+                candidates.append({"title": title, "price": price,
+                                    "url": url, "image_url": image_url})
+                if len(candidates) >= MAX_LISTINGS:
+                    break
+            print(f"(fallback kept={len(candidates)})", end=" ", flush=True)
+
         return sorted(candidates, key=lambda c: c["price"])[:MAX_LISTINGS]
     except Exception as e:
         print(f"  Browse API error: {e}")
