@@ -333,13 +333,26 @@ def analyze_images(card_name: str, set_name: str, image_urls: list[str]) -> dict
             messages=[{"role": "user", "content": content}],
         )
         raw = response.content[0].text.strip()
-        # Extract JSON even if Claude adds extra text
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if m:
-            result = json.loads(m.group())
-            result["images_analyzed"] = len(images_b64)
-            return result
-        return {"error": f"Could not parse JSON from response: {raw[:200]}", "recommendation": "SKIP"}
+
+        # Strip markdown code fences if present
+        raw_clean = re.sub(r"```(?:json)?\s*", "", raw).strip()
+
+        # Try to extract the JSON object — find outermost { ... }
+        start = raw_clean.find("{")
+        end = raw_clean.rfind("}") + 1
+        if start == -1 or end == 0:
+            return {"error": f"No JSON object found in response: {raw[:200]}", "recommendation": "SKIP"}
+
+        try:
+            result = json.loads(raw_clean[start:end])
+        except json.JSONDecodeError as e:
+            return {"error": f"JSON parse error ({e}): {raw_clean[start:end][:200]}", "recommendation": "SKIP"}
+
+        if not isinstance(result, dict):
+            return {"error": f"Expected JSON object, got {type(result).__name__}", "recommendation": "SKIP"}
+
+        result["images_analyzed"] = len(images_b64)
+        return result
     except Exception as e:
         return {"error": str(e), "recommendation": "SKIP"}
 
