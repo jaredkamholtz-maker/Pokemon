@@ -42,17 +42,43 @@ RATE_DELAY  = 1.5  # seconds between requests per thread
 MAX_RETRIES = 3    # retries on HTTP 500
 
 
+_debug_logged = False
+
+
 def _get(params: dict) -> dict | None:
     """Call the eBay Finding API. On HTTP 500 retry once after 5s, then give up."""
+    global _debug_logged
     for attempt in range(1, 3):
         try:
             resp = _SESSION.get(EBAY_FINDING_URL, params=params, timeout=20)
+            if not _debug_logged:
+                _debug_logged = True
+                print(f"  [API DEBUG] status={resp.status_code}")
+                if resp.status_code == 200:
+                    try:
+                        d = resp.json()
+                        r0 = d.get("findCompletedItemsResponse", [{}])[0]
+                        ack = r0.get("ack", ["?"])[0]
+                        total = (r0.get("paginationOutput", [{}])[0]
+                                   .get("totalEntries", ["?"])[0])
+                        items_n = len(r0.get("searchResult", [{}])[0].get("item", []))
+                        print(f"  [API DEBUG] ack={ack} totalEntries={total} items_returned={items_n}")
+                        if ack != "Success":
+                            err = r0.get("errorMessage", [{}])[0].get("error", [{}])[0]
+                            print(f"  [API DEBUG] error: {err.get('message', ['?'])[0]}")
+                    except Exception as de:
+                        print(f"  [API DEBUG] parse error: {de} | raw: {resp.text[:400]}")
+                else:
+                    print(f"  [API DEBUG] non-200 body: {resp.text[:400]}")
             if resp.status_code == 200:
                 return resp.json()
             if resp.status_code == 500 and attempt == 1:
                 time.sleep(5)
                 continue
-        except Exception:
+        except Exception as e:
+            if not _debug_logged:
+                _debug_logged = True
+                print(f"  [API DEBUG] exception on attempt {attempt}: {e}")
             if attempt == 1:
                 time.sleep(5)
     return None
