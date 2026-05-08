@@ -425,53 +425,41 @@ def run(
     print(f"{'='*60}\n")
 
     # Step 6: eBay image analysis (final filter on top N)
+    # analyze_card_images always saves a direct listing URL before analysis runs,
+    # so every card in the result has a specific eBay link regardless of outcome.
     final = opportunities
     has_image_analysis = False
     if not skip_images and not opportunities.empty:
         print(f"[6/6] Analyzing eBay listing photos (top {image_top_n} cards, Claude Vision)...")
         shortlist = images_mod.run(input_path=OUTPUT_PATH, top_n=image_top_n)
 
-        # Always read analysis results to get specific eBay listing URLs
         analysis_csv = Path(".tmp/image_analysis.csv")
-        if analysis_csv.exists():
-            analysis_df = pd.read_csv(analysis_csv)
-            # Build card → specific listing URL lookup from analysis
-            if "ebay_listing_url" in analysis_df.columns:
-                # Strip whitespace to prevent silent key-mismatch failures
-                url_lookup = {
-                    (str(r["card_name"]).strip(), str(r["set_name"]).strip()): r["ebay_listing_url"]
-                    for _, r in analysis_df.iterrows()
-                    if pd.notna(r.get("ebay_listing_url"))
-                }
-                price_lookup = {
-                    (str(r["card_name"]).strip(), str(r["set_name"]).strip()): r["ebay_price"]
-                    for _, r in analysis_df.iterrows()
-                    if pd.notna(r.get("ebay_price"))
-                }
-            else:
-                url_lookup = {}
-                price_lookup = {}
-        else:
-            url_lookup = {}
-            price_lookup = {}
-
-        if not shortlist.empty:
+        if shortlist is not None and not shortlist.empty:
+            # SUBMIT cards: show only these with full image analysis details
             final = shortlist
             has_image_analysis = True
             Path(SHORTLIST_PATH).parent.mkdir(parents=True, exist_ok=True)
             shortlist.to_csv(SHORTLIST_PATH, index=False)
-        else:
-            print("  No cards passed image analysis — using full opportunity list with best listing links.")
-            # Merge specific listing URLs and actual eBay prices into opportunities
+        elif analysis_csv.exists():
+            # No SUBMIT cards — show all opportunities but attach whatever
+            # eBay listing URLs and prices image analysis did find
+            print("  No SUBMIT cards from image analysis — showing all opportunities with eBay links.")
+            analysis_df = pd.read_csv(analysis_csv)
+            lookup = {
+                (str(r["card_name"]).strip(), str(r["set_name"]).strip()): r
+                for _, r in analysis_df.iterrows()
+            }
             final = opportunities.copy()
-            if url_lookup:
-                final["ebay_listing_url"] = final.apply(
-                    lambda r: url_lookup.get((str(r["card_name"]).strip(), str(r["set_name"]).strip())), axis=1
-                )
-            if price_lookup:
-                final["ebay_price"] = final.apply(
-                    lambda r: price_lookup.get((str(r["card_name"]).strip(), str(r["set_name"]).strip())), axis=1
-                )
+            final["ebay_listing_url"] = final.apply(
+                lambda r: lookup.get(
+                    (str(r["card_name"]).strip(), str(r["set_name"]).strip()), {}
+                ).get("ebay_listing_url"), axis=1
+            )
+            final["ebay_price"] = final.apply(
+                lambda r: lookup.get(
+                    (str(r["card_name"]).strip(), str(r["set_name"]).strip()), {}
+                ).get("ebay_price"), axis=1
+            )
         print()
     elif skip_images:
         print("[6/6] Skipping image analysis (--skip-images)\n")
