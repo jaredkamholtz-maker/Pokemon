@@ -48,6 +48,7 @@ jobs:
           MAX_RAW_PRICE: ${{ secrets.MAX_RAW_PRICE }}
           MAX_BREAKEVEN_GEM_RATE: ${{ secrets.MAX_BREAKEVEN_GEM_RATE }}
           GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
+          EBAY_APP_ID: ${{ secrets.EBAY_APP_ID }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}

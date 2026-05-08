@@ -44,7 +44,7 @@ OUTPUT_ANALYSIS = Path(".tmp/image_analysis.csv")
 OUTPUT_SHORTLIST = Path(".tmp/final_shortlist.csv")
 DEBUG_DIR = Path(".tmp/debug_ebay")
 
-EBAY_SEARCH_URL = "https://www.ebay.com/sch/i.html"
+EBAY_FINDING_URL = "https://svcs.ebay.com/services/search/FindingService/v1"
 MAX_IMAGES = 5          # images to send to Claude per card
 MAX_LISTINGS = 5        # eBay listings to evaluate per card
 RATE_DELAY = 1.5        # seconds between eBay requests
@@ -114,51 +114,84 @@ def _is_graded_title(title: str) -> bool:
 
 def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
     """
-    Search eBay for raw/ungraded Buy-It-Now listings, sorted cheapest first.
-    Returns up to MAX_LISTINGS candidates, each with: title, price, url.
+    Use eBay Finding API to get cheapest raw/ungraded listings.
+    Returns up to MAX_LISTINGS candidates: title, price, url, api_image_url.
+    Requires EBAY_APP_ID in environment.
     """
-    query = f"{card_name} {set_name} pokemon raw ungraded"
-    params = {
-        "_nkw": query,
-        "LH_BIN": "1",
-        "_sop": "15",
-        "LH_ItemCondition": "3000",
-    }
-
-    resp = _get(EBAY_SEARCH_URL, params=params)
-    if not resp or resp.status_code != 200:
+    load_dotenv()
+    app_id = os.environ.get("EBAY_APP_ID")
+    if not app_id:
+        print("  EBAY_APP_ID not set — skipping eBay search")
         return []
 
-    _save_debug(f"search_{re.sub(r'[^a-z0-9]', '_', card_name.lower())}.html", resp.text)
+    params = {
+        "OPERATION-NAME": "findItemsByKeywords",
+        "SERVICE-VERSION": "1.13.0",
+        "SECURITY-APPNAME": app_id,
+        "RESPONSE-DATA-FORMAT": "JSON",
+        "keywords": f"{card_name} {set_name} pokemon",
+        "itemFilter(0).name": "ListingType",
+        "itemFilter(0).value(0)": "FixedPrice",
+        "itemFilter(0).value(1)": "Auction",
+        "sortOrder": "PricePlusShippingLowest",
+        "paginationInput.entriesPerPage": str(MAX_LISTINGS * 3),
+        "outputSelector(0)": "PictureURLLargeSize",
+        "outputSelector(1)": "PictureURLSuperSize",
+    }
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    candidates = []
-    for item in soup.select("li.s-item, div.s-item"):
-        title_el = item.select_one(".s-item__title, h3.s-item__title")
-        price_el = item.select_one(".s-item__price")
-        link_el = item.select_one("a.s-item__link, a[href*='itm/']")
+    try:
+        resp = _get(EBAY_FINDING_URL, params=params)
+        if not resp or resp.status_code != 200:
+            print(f"  eBay API returned {resp and resp.status_code}")
+            return []
 
-        if not title_el or not link_el:
-            continue
-        title = title_el.get_text(strip=True)
-        if _is_graded_title(title) or "shop on ebay" in title.lower():
-            continue
-        href = link_el.get("href", "")
-        if not href or "itm/" not in href:
-            continue
+        data = resp.json()
+        items = (data
+                 .get("findItemsByKeywordsResponse", [{}])[0]
+                 .get("searchResult", [{}])[0]
+                 .get("item", []))
 
-        price = 0.0
-        if price_el:
-            m = re.search(r"(\d+\.?\d*)", price_el.get_text(strip=True).replace(",", ""))
-            if m:
-                price = float(m.group(1))
+        candidates = []
+        for item in items:
+            title = item.get("title", [""])[0]
+            if _is_graded_title(title):
+                continue
 
-        if price > 0:
-            candidates.append({"title": title, "price": price, "url": href.split("?")[0]})
+            view_url = item.get("viewItemURL", [""])[0]
+            price_str = (item.get("sellingStatus", [{}])[0]
+                            .get("currentPrice", [{}])[0]
+                            .get("__value__", "0"))
+            try:
+                price = float(price_str)
+            except (ValueError, TypeError):
+                price = 0.0
 
-    # Return cheapest MAX_LISTINGS listings
-    candidates.sort(key=lambda c: c["price"])
-    return candidates[:MAX_LISTINGS]
+            if price <= 0 or not view_url:
+                continue
+
+            # Best image the API provides (used as fallback if listing page scrape fails)
+            api_image_url = (
+                (item.get("pictureURLSuperSize") or [None])[0] or
+                (item.get("pictureURLLargeSize") or [None])[0] or
+                (item.get("galleryURL") or [None])[0]
+            )
+
+            candidates.append({
+                "title": title,
+                "price": price,
+                "url": view_url,
+                "api_image_url": api_image_url,
+            })
+
+            if len(candidates) >= MAX_LISTINGS:
+                break
+
+        candidates.sort(key=lambda c: c["price"])
+        return candidates[:MAX_LISTINGS]
+
+    except Exception as e:
+        print(f"  eBay API error: {e}")
+        return []
 
 
 def pick_best_listing(card_name: str, set_name: str, listings: list[dict]) -> tuple[dict | None, dict]:
@@ -176,7 +209,7 @@ def pick_best_listing(card_name: str, set_name: str, listings: list[dict]) -> tu
     for i, listing in enumerate(listings, 1):
         print(f"  Listing {i}/{len(listings)} (${listing['price']:.2f})...", end=" ", flush=True)
         time.sleep(RATE_DELAY)
-        image_urls = get_listing_images(listing["url"])
+        image_urls = get_listing_images(listing["url"], listing.get("api_image_url"))
         if not image_urls:
             print("no images")
             continue
@@ -197,15 +230,15 @@ def pick_best_listing(card_name: str, set_name: str, listings: list[dict]) -> tu
     return best_listing, best_analysis
 
 
-def get_listing_images(listing_url: str) -> list[str]:
+def get_listing_images(listing_url: str, api_image_url: str | None = None) -> list[str]:
     """
-    Fetch an eBay listing page and extract up to MAX_IMAGES photo URLs.
-    Returns a list of image URLs (full-resolution where possible).
+    Fetch listing photos. Tries the item page first; falls back to the API-provided
+    image if the page is blocked or returns no images.
     """
     time.sleep(RATE_DELAY)
     resp = _get(listing_url)
     if not resp or resp.status_code != 200:
-        return []
+        return [api_image_url] if api_image_url else []
 
     html = resp.text
     _save_debug("listing_page.html", html)
@@ -232,6 +265,10 @@ def get_listing_images(listing_url: str) -> list[str]:
                 clean = re.sub(r"s-l\d+", "s-l1600", src)
                 if clean not in image_urls:
                     image_urls.append(clean)
+
+    # Strategy 3: fall back to API-provided image if page scraping got nothing
+    if not image_urls and api_image_url:
+        image_urls.append(api_image_url)
 
     return image_urls[:MAX_IMAGES]
 
