@@ -437,12 +437,11 @@ def run(
     final = opportunities
     has_image_analysis = False
     if not skip_images and not opportunities.empty:
-        # Cooldown so step 3's eBay price calls don't exhaust the Browse API rate limit.
-        # Full scans (many cards) need a longer wait than focused era runs.
+        # Brief cooldown so step 3's ~1,500 API calls don't exhaust the rate limit
+        # right before step 6 needs to call the same eBay app_id
         import time as _time
-        wait_s = 120 if len(opportunities) > 20 else 30
-        print(f"[6/6] Waiting {wait_s}s for eBay API rate limit to clear after step 3...")
-        _time.sleep(wait_s)
+        print("[6/6] Waiting 30s for eBay API rate limit to clear after step 3...")
+        _time.sleep(30)
         print(f"[6/6] Analyzing eBay listing photos (top {image_top_n} cards, Claude Vision)...")
         shortlist = images_mod.run(input_path=OUTPUT_PATH, top_n=image_top_n)
 
