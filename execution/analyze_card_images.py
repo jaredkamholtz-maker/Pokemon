@@ -1,4 +1,4 @@
-"""
+""" 
 Final filter: find cheapest eBay raw listings for each top flip candidate,
 analyze listing photos with Claude Vision, and pick the best quality copy.
 
@@ -50,7 +50,8 @@ INPUT_FILE = Path(".tmp/flip_opportunities.csv")
 OUTPUT_ANALYSIS = Path(".tmp/image_analysis.csv")
 OUTPUT_SHORTLIST = Path(".tmp/final_shortlist.csv")
 
-MAX_LISTINGS = 5
+MAX_LISTINGS = 5        # how many candidates to analyze with Claude Vision
+BROWSE_LIMIT = 50       # how many results to fetch from Browse API before filtering
 RATE_DELAY = 0.5
 MODEL = "claude-sonnet-4-6"
 
@@ -140,10 +141,10 @@ def _is_multi_card_listing(title: str) -> bool:
     t = title.lower()
     return any(kw in t for kw in [
         "pick your", "you pick", "your pick", "pick a card",
-        "lot of", " lot ", "bundle", "set of", "collection",
+        "lot of", " lot ", "bundle", "set of",
         "x2 ", "x3 ", "x4 ", "x5 ", " x2", " x3", " x4", " x5",
         "2x ", "3x ", "4x ", "5x ",
-        "choose", "random", "assorted", "mixed", "wholesale",
+        "wholesale",
     ])
 
 
@@ -187,17 +188,21 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
                      "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"},
             params={"q": f"{card_name} {set_name} pokemon",
                     "sort": "price",
-                    "limit": str(MAX_LISTINGS * 3)},
+                    "limit": str(BROWSE_LIMIT)},
             timeout=20,
         )
         if not resp or resp.status_code != 200:
             return []
 
+        items = resp.json().get("itemSummaries", [])
+        print(f"(API returned {len(items)} results)", end=" ", flush=True)
         candidates = []
         multi_skipped = 0
-        for item in resp.json().get("itemSummaries", []):
+        graded_skipped = 0
+        for item in items:
             title = item.get("title", "")
             if _is_graded_title(title):
+                graded_skipped += 1
                 continue
             if _is_multi_card_listing(title):
                 multi_skipped += 1
@@ -214,8 +219,7 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
                                 "url": url, "image_url": image_url})
             if len(candidates) >= MAX_LISTINGS:
                 break
-        if multi_skipped:
-            print(f"({multi_skipped} multi-card/lot listings skipped)", end=" ", flush=True)
+        print(f"(graded={graded_skipped} lot={multi_skipped} kept={len(candidates)})", end=" ", flush=True)
         return sorted(candidates, key=lambda c: c["price"])[:MAX_LISTINGS]
     except Exception as e:
         print(f"  Browse API error: {e}")
