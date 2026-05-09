@@ -52,6 +52,7 @@ OUTPUT_SHORTLIST = Path(".tmp/final_shortlist.csv")
 
 MAX_LISTINGS = 5        # analyze the top 5 most expensive ungraded listings
 BROWSE_LIMIT = 50       # how many results to fetch from Browse API before filtering
+MAX_PRICE    = 500.0    # ignore listings above this price (outliers / special editions)
 RATE_DELAY = 0.5
 MODEL = "claude-sonnet-4-6"
 
@@ -325,7 +326,11 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
             print("(0 candidates after all filters)", end=" ", flush=True)
             return []
 
-        # Sort by price descending — most expensive ungraded listings first
+        # Cap at MAX_PRICE, then sort by price descending
+        candidates = [c for c in candidates if c["price"] <= MAX_PRICE]
+        if not candidates:
+            print(f"(0 candidates under ${MAX_PRICE:.0f})", end=" ", flush=True)
+            return []
         candidates.sort(key=lambda c: -c["price"])
         return candidates[:MAX_LISTINGS]
     except Exception as e:
