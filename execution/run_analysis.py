@@ -492,6 +492,11 @@ def run(
         else:
             print("  GOOGLE_SPREADSHEET_ID not set — skipping Sheets output.")
 
+    # Apply the same filters that format_email_body does, so subject line count matches body
+    if "ebay_listing_url" in final.columns:
+        final = final[final["ebay_listing_url"].notna() & (final["ebay_listing_url"] != "")].copy()
+    final = final.drop_duplicates(subset=["card_name", "set_name"], keep="first").copy()
+
     # Email
     if not skip_email:
         html_body, plain_body = format_email_body(final, today, has_image_analysis=has_image_analysis)
