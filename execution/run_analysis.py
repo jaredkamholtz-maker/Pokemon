@@ -53,7 +53,7 @@ OUTPUT_PATH = ".tmp/flip_opportunities.csv"
 SHORTLIST_PATH = ".tmp/final_shortlist.csv"
 
 
-# ── Google Sheets ───────────────────────────────────────────────────────────────
+# ── Google Sheets ───────────────────────────────────────────────────────────────────────────
 
 def push_to_google_sheets(df: pd.DataFrame, spreadsheet_id: str, tab_name: str) -> str | None:
     try:
@@ -94,7 +94,7 @@ def push_to_google_sheets(df: pd.DataFrame, spreadsheet_id: str, tab_name: str) 
         return None
 
 
-# ── Email ────────────────────────────────────────────────────────────────────
+# ── Email ──────────────────────────────────────────────────────────────────────────
 
 def _fmt_price(val) -> str:
     try:
@@ -156,8 +156,10 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         psa10_count = row.get("psa10_count")
         if pd.notna(gem_val) and gem_val == gem_val:
             pct = f"{gem_val * 100:.1f}%"
+            pop_src = row.get("pop_source") or ""
             if pd.notna(psa9_count) and pd.notna(psa10_count) and pd.notna(total):
-                gem = f"{pct} ({int(psa9_count + psa10_count):,} / {int(total):,})"
+                src_label = " eBay proxy" if pop_src == "ebay_proxy" else ""
+                gem = f"{pct} ({int(psa9_count + psa10_count):,} / {int(total):,}{src_label})"
             else:
                 gem = pct
         elif is_breakeven:
@@ -309,7 +311,7 @@ def send_email(html_body: str, plain_body: str, subject: str) -> bool:
         return False
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────────────
 
 def run(
     target_sets: str = "data/target_sets.csv",
@@ -383,20 +385,25 @@ def run(
     print(f"  → {len(prices_df)} cards with PSA 9/10 > ${min_graded_price:.0f}\n")
 
     if prices_df.empty:
-tml        print("No cards passed the price filter — nothing to analyze.")
+        print("No cards passed the price filter — nothing to analyze.")
         return pd.DataFrame()
 
-    # Step 4: Attempt PSA population from 130point.com; always fails from cloud IPs
-    # (IP blocked — "Host not in allowlist"). calculate_flip_ev falls back to breakeven.
-    print(f"[4/6] Fetching PSA population ({len(prices_df)} cards, 130point → eBay proxy fallback)...")
-    pop_mod.run(PRICES_PATH)
+    # Step 4: PSA population — 130point.com blocks all cloud/datacenter IPs at the
+    # network level ("Host not in allowlist"). Skip the scraper entirely and write an
+    # empty population file so calculate_flip_ev uses Track-2 breakeven for all cards.
+    print(f"[4/6] PSA population: 130point.com is IP-blocked from cloud — skipping scraper, using breakeven track.")
+    pop_empty = prices_df[["card_name", "set_name", "card_number"]].copy()
+    for col in ("total_graded", "psa10_count", "psa9_count", "gem_rate", "source_url", "error"):
+        pop_empty[col] = None
+    Path(POP_PATH).parent.mkdir(parents=True, exist_ok=True)
+    pop_empty.to_csv(POP_PATH, index=False)
     print()
 
     # Step 5: Calculate EV
     print(f"[5/6] Calculating flip EV...")
     df = ev_mod.run(grading_fee=grading_fee, min_roi=min_roi)
 
-    # Track 1: population data available — gem rate >= min_gem_rate AND roi >= min_roi
+    # Track 1: population data available — gem rate >= 50% AND roi >= 10%
     has_pop = df["gem_rate"].notna() & df["roi"].notna()
     track1 = df[
         has_pop &
@@ -438,9 +445,13 @@ tml        print("No cards passed the price filter — nothing to analyze.")
     print(f"{'='*60}\n")
 
     # Step 6: eBay image analysis (final filter on top N)
+    # analyze_card_images always saves a direct listing URL before analysis runs,
+    # so every card in the result has a specific eBay link regardless of outcome.
     final = opportunities
     has_image_analysis = False
     if not skip_images and not opportunities.empty:
+        # Cooldown so step 3's eBay price calls don't exhaust the Browse API rate limit.
+        # Full scans (many cards) need a longer wait than focused era runs.
         import time as _time
         wait_s = 120 if len(opportunities) > 20 else 30
         print(f"[6/6] Waiting {wait_s}s for eBay API rate limit to clear after step 3...")
@@ -450,11 +461,13 @@ tml        print("No cards passed the price filter — nothing to analyze.")
 
         analysis_csv = Path(".tmp/image_analysis.csv")
         if shortlist is not None and not shortlist.empty:
+            # SUBMIT cards: show only these with full image analysis details
             final = shortlist
             has_image_analysis = True
             Path(SHORTLIST_PATH).parent.mkdir(parents=True, exist_ok=True)
             shortlist.to_csv(SHORTLIST_PATH, index=False)
         elif analysis_csv.exists():
+            # No SUBMIT cards — show all analyzed cards; email filter drops any without a URL
             print("  No SUBMIT cards from image analysis — showing analyzed cards with eBay links.")
             final = pd.read_csv(analysis_csv)
             has_image_analysis = True
@@ -485,6 +498,7 @@ tml        print("No cards passed the price filter — nothing to analyze.")
                 "gem_rate", "roi", "predicted_grade", "psa9_or_better_probability"]
         print(final[[c for c in cols if c in final.columns]].to_string(index=False))
 
+    # Show eBay URL status for every card so we can diagnose in CI logs
     if "ebay_listing_url" in final.columns:
         print("\n── eBay listing URLs ──")
         for _, row in final.iterrows():
@@ -506,16 +520,24 @@ if __name__ == "__main__":
                         help="Filter to one era: mega-evolution, sword-shield, scarlet-violet")
     parser.add_argument("--sets", default=None,
                         help="Comma-separated set names, e.g. '151,Evolving Skies'")
-    parser.add_argument("--skip-discovery", action="store_true")
-    parser.add_argument("--skip-ai-filter", action="store_true")
-    parser.add_argument("--skip-prices", action="store_true")
-    parser.add_argument("--skip-images", action="store_true")
-    parser.add_argument("--image-top-n", type=int, default=20)
+    parser.add_argument("--skip-discovery", action="store_true",
+                        help="Reuse last discovered_cards.csv (skip PokeData.io API call)")
+    parser.add_argument("--skip-ai-filter", action="store_true",
+                        help="Reuse last filtered_cards.csv (skip Claude Haiku step)")
+    parser.add_argument("--skip-prices", action="store_true",
+                        help="Reuse last tcgplayer_prices.csv (skip PriceCharting fetch)")
+    parser.add_argument("--skip-images", action="store_true",
+                        help="Skip eBay image analysis step (faster, no Claude Vision credits)")
+    parser.add_argument("--image-top-n", type=int, default=20,
+                        help="Number of top cards to analyze with Claude Vision (default: 20)")
     parser.add_argument("--skip-sheets", action="store_true")
     parser.add_argument("--skip-email", action="store_true")
-    parser.add_argument("--min-graded-price", type=float, default=60.0)
-    parser.add_argument("--min-roi", type=float, default=0.10)
-    parser.add_argument("--min-gem-rate", type=float, default=0.50)
+    parser.add_argument("--min-graded-price", type=float, default=60.0,
+                        help="Min PSA 9 or PSA 10 price to include a card (default: $60)")
+    parser.add_argument("--min-roi", type=float, default=0.10,
+                        help="Min ROI after grading fee (default: 0.10 = 10%%%)")
+    parser.add_argument("--min-gem-rate", type=float, default=0.50,
+                        help="Min gem rate to surface a card (default: 0.35 = 35%%%)")
     args = parser.parse_args()
 
     sets_list = [s.strip() for s in args.sets.split(",")] if args.sets else None
