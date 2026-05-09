@@ -388,11 +388,15 @@ def run(
         print("No cards passed the price filter — nothing to analyze.")
         return pd.DataFrame()
 
-    # Step 4: Attempt PSA population from 130point.com; always fails from cloud IPs
-    # (IP blocked — "Host not in allowlist"). calculate_flip_ev falls back to eBay
-    # listing count proxy automatically when 130point data is absent.
-    print(f"[4/6] Fetching PSA population ({len(prices_df)} cards, 130point → eBay proxy fallback)...")
-    pop_mod.run(PRICES_PATH)
+    # Step 4: PSA population — 130point.com blocks all cloud/datacenter IPs at the
+    # network level ("Host not in allowlist"). Skip the scraper entirely and write an
+    # empty population file so calculate_flip_ev uses Track-2 breakeven for all cards.
+    print(f"[4/6] PSA population: 130point.com is IP-blocked from cloud — skipping scraper, using breakeven track.")
+    pop_empty = prices_df[["card_name", "set_name", "card_number"]].copy()
+    for col in ("total_graded", "psa10_count", "psa9_count", "gem_rate", "source_url", "error"):
+        pop_empty[col] = None
+    Path(POP_PATH).parent.mkdir(parents=True, exist_ok=True)
+    pop_empty.to_csv(POP_PATH, index=False)
     print()
 
     # Step 5: Calculate EV
