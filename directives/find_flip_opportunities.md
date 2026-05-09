@@ -111,7 +111,7 @@ roi              = profit / cost
 ```
 
 ### Track 2 — Breakeven gem rate (no population data)
-When PSA submission counts are unavailable, compute the minimum gem rate needed to break even. Cards requiring < `MAX_BREAKEVEN_GEM_RATE` (default 15%) are surfaced as low-bar opportunities.
+When PSA submission counts are unavailable, compute the minimum gem rate needed to break even. Cards requiring < `MAX_BREAKEVEN_GEM_RATE` (default 10%) are surfaced as low-bar opportunities.
 ```
 breakeven_gem_rate = (cost / (1 - selling_fee_rate) - raw_price) / (psa_weighted - raw_price)
 # where psa_weighted = 0.6 * psa10_price + 0.4 * psa9_price (assumed 60/40 split)
@@ -131,7 +131,7 @@ breakeven_gem_rate = (cost / (1 - selling_fee_rate) - raw_price) / (psa_weighted
 ### Track 2 (no population data)
 | Filter | Default | Env var |
 |---|---|---|
-| `breakeven_gem_rate <= MAX_BREAKEVEN_GEM_RATE` | 0.15 | `MAX_BREAKEVEN_GEM_RATE` |
+| `breakeven_gem_rate <= MAX_BREAKEVEN_GEM_RATE` | 0.10 | `MAX_BREAKEVEN_GEM_RATE` |
 | `psa10_price > raw_price + grading_fee * 2` | — | — |
 | `raw_price <= MAX_RAW_PRICE` | 500.00 | `MAX_RAW_PRICE` |
 
@@ -161,7 +161,7 @@ Keeps: holo rares, full arts, alt arts, VMAX/VSTAR/ex/GX, secret rares, high-dem
 - **Set not found on PokeData.io**: logs `[SKIP]` with closest-match hints; add alias to `ALIASES` dict in `discover_cards.py`
 - **Card not found on PriceCharting**: logs warning, `raw_price` = null, skipped in EV calc
 - **No graded listings**: `psa9_price`/`psa10_price` null → falls through to Track 2 (breakeven)
-- **130point.com rate limit / 403**: logs error per card, population data absent → Track 2 for that card
+- **130point.com blocks datacenter IPs**: returns "Host not in allowlist" from any cloud/CI environment (GitHub Actions, AWS, GCP). No impersonation fix works — it is IP-based. Population data will always be absent in automated runs → all cards fall through to Track 2 (breakeven). Do not attempt to fix the scraper; find an alternative data source (PSA API, eBay graded count proxy) or tighten `MAX_BREAKEVEN_GEM_RATE` to compensate.
 - **Total graded < MIN_POP_COUNT**: still calculates but flags `low_data = True` in output
 - **No `.env` file**: scripts fail loudly listing missing vars
 
@@ -192,3 +192,4 @@ Keeps: holo rares, full arts, alt arts, VMAX/VSTAR/ex/GX, secret rares, high-dem
 | 2026-05 | PriceCharting URL slug for "151" set was wrong (`pokemon-151` vs actual `pokemon-scarlet-&-violet-151`) | Added `SET_SLUG_OVERRIDES` dict in `fetch_tcgplayer_prices.py`; added overrides for 151, BREAKthrough, BREAKpoint, and all scarlet-violet sets |
 | 2026-05 | PriceCharting raw prices were stale/wrong (e.g. $400 raw when eBay shows $0.99); Cloudflare blocking scraping | Replaced `fetch_tcgplayer_prices.py` with `fetch_ebay_prices.py`; uses eBay `findCompletedItems` + `SoldItemsOnly=true`; same `EBAY_APP_ID`; median of last 20 sold listings; raw/PSA9/PSA10 prices now match actual market |
 | 2026-05 | Step 6 eBay listing URLs not reaching email; generic search links instead of specific items | Rebuilt `analyze_card_images.py`: removed listing-page scraping entirely; use API-provided image URLs only; cheapest listing URL always saved before analysis runs so email always has a direct `ebay.com/itm/` link |
+| 2026-05 | 130point.com returns 403 "Host not in allowlist" from GitHub Actions | IP-based block on all datacenter IPs — unfixable via impersonation. All automated runs land in Track 2 (breakeven). Tightened `MAX_BREAKEVEN_GEM_RATE` default to 0.10 (10%) so Track 2 only surfaces exceptional spreads. Next step: replace step 4 with eBay graded sale count as population proxy (already available from step 3 API response). |
