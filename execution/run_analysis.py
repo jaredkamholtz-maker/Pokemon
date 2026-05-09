@@ -136,6 +136,9 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
             (opportunities["ebay_listing_url"] != "")
         ].copy()
 
+    # Final safety net: never show the same card twice regardless of card_number variant
+    opportunities = opportunities.drop_duplicates(subset=["card_name", "set_name"], keep="first").copy()
+
     rows_html = []
     rows_plain = []
     for rank, (_, row) in enumerate(opportunities.iterrows(), 1):
@@ -359,7 +362,12 @@ def run(
         filtered_df.to_csv(FILTERED_PATH, index=False)
 
     filtered_df = pd.read_csv(FILTERED_PATH)
-    print(f"  → {len(filtered_df)} cards after AI filter\n")
+    before = len(filtered_df)
+    filtered_df["_num_norm"] = filtered_df["card_number"].astype(str).str.split("/").str[0].str.strip()
+    filtered_df = filtered_df.drop_duplicates(subset=["card_name", "set_name", "_num_norm"]).drop(columns=["_num_norm"])
+    filtered_df.to_csv(FILTERED_PATH, index=False)
+    dupes = before - len(filtered_df)
+    print(f"  → {len(filtered_df)} cards after AI filter" + (f" ({dupes} duplicates removed)" if dupes else "") + "\n")
 
     if filtered_df.empty:
         print("No cards survived AI filter — nothing to analyze.")
