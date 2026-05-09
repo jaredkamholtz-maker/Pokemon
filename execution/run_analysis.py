@@ -410,7 +410,7 @@ def run(
 
     # Track 2: no population data, but spread is so good breakeven is very low
     # Surface cards where you'd break even needing < 15% gem rate — attractive even blind
-    max_breakeven = float(os.environ.get("MAX_BREAKEVEN_GEM_RATE") or 0.10)
+    max_breakeven = float(os.environ.get("MAX_BREAKEVEN_GEM_RATE") or 0.15)
     has_breakeven = ("breakeven_gem_rate" in df.columns) and df["breakeven_gem_rate"].notna()
     track2 = df[
         has_breakeven &
