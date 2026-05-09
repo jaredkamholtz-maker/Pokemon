@@ -12,7 +12,7 @@ Design principles:
     probability are bonus info on top of the EV math.
 
 Steps per card:
-  1. Search eBay Browse API for cheapest ungraded listings (up to MAX_LISTINGS)
+  1. Search eBay Browse API for most expensive ungraded listings (up to MAX_LISTINGS)
   2. For each listing: download the API-provided image, send to Claude Vision
   3. Skip listings with stock photos, fakes, or critical red flags
   4. Pick the listing with highest PSA 9+ probability among valid photos
@@ -50,9 +50,8 @@ INPUT_FILE = Path(".tmp/flip_opportunities.csv")
 OUTPUT_ANALYSIS = Path(".tmp/image_analysis.csv")
 OUTPUT_SHORTLIST = Path(".tmp/final_shortlist.csv")
 
-MAX_LISTINGS = 12       # how many candidates to analyze with Claude Vision
+MAX_LISTINGS = 5        # analyze the top 5 most expensive ungraded listings
 BROWSE_LIMIT = 50       # how many results to fetch from Browse API before filtering
-PRICE_FLOOR_RATIO = 0.40  # drop listings below this fraction of the median price
 RATE_DELAY = 0.5
 MODEL = "claude-sonnet-4-6"
 
@@ -221,6 +220,7 @@ def _is_multi_card_listing(title: str) -> bool:
     t = title.lower()
     return any(kw in t for kw in [
         "pick your", "you pick", "your pick", "pick a card",
+        "choose your", "choose a card", "your choice",
         "lot of", " lot ", "bundle", "set of",
         "x2 ", "x3 ", "x4 ", "x5 ", " x2", " x3", " x4", " x5",
         "2x ", "3x ", "4x ", "5x ",
@@ -287,7 +287,6 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
             except (ValueError, TypeError):
                 price = 0.0
             image_url = item.get("image", {}).get("imageUrl")
-            # Prefer listings that have additional photos (real seller photos)
             extra_images = len(item.get("additionalImages", []))
             out.append({"title": title, "price": price, "url": url,
                         "image_url": image_url, "extra_images": extra_images})
@@ -303,7 +302,7 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
             headers={"Authorization": f"Bearer {token}",
                      "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"},
             params={"q": f"{card_name} {set_name} pokemon",
-                    "sort": "price",
+                    "sort": "-price",
                     "limit": str(BROWSE_LIMIT)},
             timeout=20,
         )
@@ -325,21 +324,8 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
             print("(0 candidates after all filters)", end=" ", flush=True)
             return []
 
-        # Price floor: drop ultra-cheap listings (almost always damaged)
-        # Only apply if there are enough candidates to afford filtering
-        priced = [c for c in candidates if c["price"] > 0]
-        if len(priced) >= 4:
-            prices = sorted(c["price"] for c in priced)
-            median = prices[len(prices) // 2]
-            floor  = median * PRICE_FLOOR_RATIO
-            before_floor = len(candidates)
-            candidates = [c for c in candidates if c["price"] == 0 or c["price"] >= floor]
-            dropped = before_floor - len(candidates)
-            if dropped:
-                print(f"(floor=${floor:.2f} dropped {dropped})", end=" ", flush=True)
-
-        # Sort: listings with extra photos first (real seller photos), then by price
-        candidates.sort(key=lambda c: (-c["extra_images"], c["price"]))
+        # Sort by price descending -- most expensive ungraded listings first
+        candidates.sort(key=lambda c: -c["price"])
         return candidates[:MAX_LISTINGS]
     except Exception as e:
         print(f"  Browse API error: {e}")
@@ -534,7 +520,7 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
     Analyze each listing photo with Claude Vision.
     Returns (best_listing, analysis).
 
-    Always returns listings[0] as a minimum fallback (cheapest single-card
+    Always returns listings[0] as a minimum fallback (most expensive single-card
     listing -- already filtered for graded/lot/pick listings at search time).
     If a non-disqualified listing is found, that takes priority.
     If a SUBMIT listing is found, that wins.
@@ -577,7 +563,7 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
             best_analysis = analysis
 
     if not any_non_disqualified:
-        print("  All listings had stock/unverifiable photos -- using cheapest listing URL as fallback")
+        print("  All listings had stock/unverifiable photos -- using most expensive listing URL as fallback")
 
     return best_listing, best_analysis
 
