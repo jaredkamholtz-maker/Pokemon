@@ -425,6 +425,10 @@ def run(
         ascending=[False, True],
         na_position="last",
     )
+    # Deduplicate — keep highest-ROI row per card
+    opportunities = opportunities.drop_duplicates(
+        subset=["card_name", "set_name", "card_number"], keep="first"
+    ).reset_index(drop=True)
 
     # Save filtered results
     Path(OUTPUT_PATH).parent.mkdir(parents=True, exist_ok=True)
