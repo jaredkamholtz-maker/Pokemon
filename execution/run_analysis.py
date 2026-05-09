@@ -156,8 +156,10 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         psa10_count = row.get("psa10_count")
         if pd.notna(gem_val) and gem_val == gem_val:
             pct = f"{gem_val * 100:.1f}%"
+            pop_src = row.get("pop_source") or ""
             if pd.notna(psa9_count) and pd.notna(psa10_count) and pd.notna(total):
-                gem = f"{pct} ({int(psa9_count + psa10_count):,} / {int(total):,})"
+                src_label = " eBay proxy" if pop_src == "ebay_proxy" else ""
+                gem = f"{pct} ({int(psa9_count + psa10_count):,} / {int(total):,}{src_label})"
             else:
                 gem = pct
         elif is_breakeven:
@@ -385,8 +387,10 @@ def run(
         print("No cards passed the price filter — nothing to analyze.")
         return pd.DataFrame()
 
-    # Step 4: Scrape PSA population data from 130point.com
-    print(f"[4/6] Scraping PSA population from 130point.com ({len(prices_df)} cards)...")
+    # Step 4: Attempt PSA population from 130point.com; always fails from cloud IPs
+    # (IP blocked — "Host not in allowlist"). calculate_flip_ev falls back to eBay
+    # listing count proxy automatically when 130point data is absent.
+    print(f"[4/6] Fetching PSA population ({len(prices_df)} cards, 130point → eBay proxy fallback)...")
     pop_mod.run(PRICES_PATH)
     print()
 

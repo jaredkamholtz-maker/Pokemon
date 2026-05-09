@@ -177,6 +177,36 @@ def run(grading_fee: float = None, selling_fee_rate: float = None, min_roi: floa
     df = pd.merge(prices, pop, on=["card_name", "set_name", "card_number"],
                   how="left", suffixes=("_price", "_pop"))
 
+    # When 130point data is absent (always from cloud/CI — IP blocked), fall back to
+    # eBay active listing counts as a population proxy. The fraction of graded (PSA 9/10)
+    # listings among all 50 Browse API results correlates with real gem rate. Requires
+    # >= 3 graded listings to be statistically meaningful.
+    _MIN_GRADED = 3
+    _MIN_TOTAL = 5
+    pop_sources = []
+    for idx, row in df.iterrows():
+        if pd.notna(row.get("total_graded")):
+            pop_sources.append("130point")
+            continue
+        psa9_n  = int(row.get("psa9_sales_count")  or 0)
+        psa10_n = int(row.get("psa10_sales_count") or 0)
+        raw_n   = int(row.get("raw_sales_count")   or 0)
+        total_n = raw_n + psa9_n + psa10_n
+        if (psa9_n + psa10_n) >= _MIN_GRADED and total_n >= _MIN_TOTAL:
+            df.at[idx, "total_graded"] = total_n
+            df.at[idx, "psa9_count"]   = psa9_n
+            df.at[idx, "psa10_count"]  = psa10_n
+            df.at[idx, "gem_rate"]     = round((psa9_n + psa10_n) / total_n, 4)
+            pop_sources.append("ebay_proxy")
+        else:
+            pop_sources.append(None)
+
+    df["pop_source"] = pop_sources
+    n_130  = sum(s == "130point"   for s in pop_sources)
+    n_ebay = sum(s == "ebay_proxy" for s in pop_sources)
+    n_none = sum(s is None         for s in pop_sources)
+    print(f"  Pop sources: {n_130} from 130point, {n_ebay} eBay listing proxy, {n_none} none → breakeven")
+
     ev_rows = []
     for _, row in df.iterrows():
         if pd.isna(row.get("raw_price")) or pd.isna(row.get("psa10_price")):
