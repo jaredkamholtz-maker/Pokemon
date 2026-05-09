@@ -217,6 +217,8 @@ def _is_graded_title(title: str) -> bool:
     return any(kw in t for kw in [
         "psa ", "psa-", "psa9", "psa10", "psa8", "psa7", "psa6",
         "bgs ", "cgc ", "sgc ", "graded", "gem mint",
+        "mint 10", "mint 9", "mint 8", "mint 7",
+        "grade 10", "grade 9", "grade 8", "grade 7",
     ])
 
 
@@ -280,6 +282,10 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
                 no_url_n += 1
                 continue
             if _is_graded_title(title):
+                graded_n += 1
+                continue
+            # eBay condition ID 2750 = "Graded" — filter at the API level too
+            if item.get("conditionId") == "2750":
                 graded_n += 1
                 continue
             if strict and _is_multi_card_listing(title):
