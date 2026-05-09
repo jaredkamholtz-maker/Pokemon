@@ -50,8 +50,9 @@ INPUT_FILE = Path(".tmp/flip_opportunities.csv")
 OUTPUT_ANALYSIS = Path(".tmp/image_analysis.csv")
 OUTPUT_SHORTLIST = Path(".tmp/final_shortlist.csv")
 
-MAX_LISTINGS = 5        # how many candidates to analyze with Claude Vision
+MAX_LISTINGS = 12       # how many candidates to analyze with Claude Vision
 BROWSE_LIMIT = 50       # how many results to fetch from Browse API before filtering
+PRICE_FLOOR_RATIO = 0.40  # drop listings below this fraction of the median price
 RATE_DELAY = 0.5
 MODEL = "claude-sonnet-4-6"
 
@@ -275,6 +276,19 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
         if not candidates:
             print("(0 candidates after all filters)", end=" ", flush=True)
             return []
+
+        # Price floor: drop ultra-cheap listings (almost always damaged)
+        # Only apply if there are enough candidates to afford filtering
+        priced = [c for c in candidates if c["price"] > 0]
+        if len(priced) >= 4:
+            prices = sorted(c["price"] for c in priced)
+            median = prices[len(prices) // 2]
+            floor  = median * PRICE_FLOOR_RATIO
+            before_floor = len(candidates)
+            candidates = [c for c in candidates if c["price"] == 0 or c["price"] >= floor]
+            dropped = before_floor - len(candidates)
+            if dropped:
+                print(f"(floor=${floor:.2f} dropped {dropped})", end=" ", flush=True)
 
         # Sort: listings with extra photos first (real seller photos), then by price
         candidates.sort(key=lambda c: (-c["extra_images"], c["price"]))
