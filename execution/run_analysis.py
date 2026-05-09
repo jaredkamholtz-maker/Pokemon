@@ -156,10 +156,8 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         psa10_count = row.get("psa10_count")
         if pd.notna(gem_val) and gem_val == gem_val:
             pct = f"{gem_val * 100:.1f}%"
-            pop_src = row.get("pop_source") or ""
             if pd.notna(psa9_count) and pd.notna(psa10_count) and pd.notna(total):
-                src_label = " eBay proxy" if pop_src == "ebay_proxy" else ""
-                gem = f"{pct} ({int(psa9_count + psa10_count):,} / {int(total):,}{src_label})"
+                gem = f"{pct} ({int(psa9_count + psa10_count):,} / {int(total):,})"
             else:
                 gem = pct
         elif is_breakeven:
@@ -409,8 +407,8 @@ def run(
     track1["track"] = "population"
 
     # Track 2: no population data, but spread is so good breakeven is very low
-    # Surface cards where you'd break even needing < 10% gem rate — attractive even blind
-    max_breakeven = float(os.environ.get("MAX_BREAKEVEN_GEM_RATE") or 0.10)
+    # Surface cards where you'd break even needing < 15% gem rate — attractive even blind
+    max_breakeven = float(os.environ.get("MAX_BREAKEVEN_GEM_RATE") or 0.15)
     has_breakeven = ("breakeven_gem_rate" in df.columns) and df["breakeven_gem_rate"].notna()
     track2 = df[
         has_breakeven &
