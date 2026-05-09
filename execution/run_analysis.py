@@ -193,7 +193,8 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         # Image analysis columns (only present when step 6 ran)
         pred_grade = row.get("predicted_grade")
         psa9p = row.get("psa9_or_better_probability")
-        notes = row.get("notes") or ""
+        _notes_raw = row.get("notes")
+        notes = str(_notes_raw) if pd.notna(_notes_raw) and _notes_raw else ""
 
         card_link = f'<a href="{url}" style="color:#1a73e8;text-decoration:none;">{name}</a>' if url else name
         if ebay_listing_url:
