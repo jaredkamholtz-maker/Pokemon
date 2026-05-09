@@ -214,7 +214,10 @@ def _get(url: str, params: dict | None = None, max_retries: int = 3) -> object |
 
 def _is_graded_title(title: str) -> bool:
     t = title.lower()
-    return any(kw in t for kw in ["psa ", "psa-", "bgs ", "cgc ", "sgc ", "graded", "gem mint"])
+    return any(kw in t for kw in [
+        "psa ", "psa-", "psa9", "psa10", "psa8", "psa7", "psa6",
+        "bgs ", "cgc ", "sgc ", "graded", "gem mint",
+    ])
 
 
 def _is_multi_card_listing(title: str) -> bool:
@@ -222,7 +225,7 @@ def _is_multi_card_listing(title: str) -> bool:
     return any(kw in t for kw in [
         "pick your", "you pick", "your pick", "pick a card",
         "choose your", "choose a card", "your choice",
-        "lot of", " lot ", "bundle", "set of",
+        "lot of", " lot ", "bundle", "set of", "complete set", "full set", "sealed set",
         "x2 ", "x3 ", "x4 ", "x5 ", " x2", " x3", " x4", " x5",
         "2x ", "3x ", "4x ", "5x ",
         "wholesale",
