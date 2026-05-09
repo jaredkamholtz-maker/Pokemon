@@ -12,7 +12,7 @@ Design principles:
     probability are bonus info on top of the EV math.
 
 Steps per card:
-  1. Search eBay Browse API for most expensive ungraded listings (up to MAX_LISTINGS)
+  1. Search eBay Browse API for most expensive ungraded listings up to $500
   2. For each listing: download the API-provided image, send to Claude Vision
   3. Skip listings with stock photos, fakes, or critical red flags
   4. Pick the listing with highest PSA 9+ probability among valid photos
@@ -52,6 +52,7 @@ OUTPUT_SHORTLIST = Path(".tmp/final_shortlist.csv")
 
 MAX_LISTINGS = 5        # analyze the top 5 most expensive ungraded listings
 BROWSE_LIMIT = 50       # how many results to fetch from Browse API before filtering
+MAX_PRICE    = 500.0    # ignore listings above this price (outliers / special editions)
 RATE_DELAY = 0.5
 MODEL = "claude-sonnet-4-6"
 
@@ -281,7 +282,6 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
             if strict and _is_multi_card_listing(title):
                 multi_n += 1
                 continue
-            # Accept any price -- auctions may show 0 until first bid
             try:
                 price = float(item.get("price", {}).get("value") or 0)
             except (ValueError, TypeError):
@@ -290,7 +290,7 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
             extra_images = len(item.get("additionalImages", []))
             out.append({"title": title, "price": price, "url": url,
                         "image_url": image_url, "extra_images": extra_images})
-            if len(out) >= MAX_LISTINGS * 4:   # gather extras for sorting
+            if len(out) >= MAX_LISTINGS * 4:
                 break
         if strict:
             print(f"(graded={graded_n} lot={multi_n} no_url={no_url_n} raw={len(out)})", end=" ", flush=True)
@@ -315,7 +315,6 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
 
         candidates = _parse_items(items, strict=True)
 
-        # Fallback: relax lot filter if strict pass found nothing
         if not candidates:
             print("(fallback: relaxing lot filter)", end=" ", flush=True)
             candidates = _parse_items(items, strict=False)
@@ -324,7 +323,11 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
             print("(0 candidates after all filters)", end=" ", flush=True)
             return []
 
-        # Sort by price descending -- most expensive ungraded listings first
+        # Cap at MAX_PRICE, then sort by price descending
+        candidates = [c for c in candidates if c["price"] <= MAX_PRICE]
+        if not candidates:
+            print(f"(0 candidates under ${MAX_PRICE:.0f})", end=" ", flush=True)
+            return []
         candidates.sort(key=lambda c: -c["price"])
         return candidates[:MAX_LISTINGS]
     except Exception as e:
@@ -365,7 +368,6 @@ def _derive_from_analysis(parsed: dict) -> dict:
     """
     red_flags = parsed.get("red_flags", {})
 
-    # Critical flags -> auto-disqualify
     active_critical = [f for f in _CRITICAL_FLAGS
                        if isinstance(red_flags.get(f), dict) and red_flags[f].get("flag")]
     if active_critical:
@@ -418,7 +420,6 @@ def _derive_from_analysis(parsed: dict) -> dict:
     else:
         prob = 0
 
-    # Soft flag: back not shown -> halve probability
     if isinstance(red_flags.get("back_not_shown"), dict) and red_flags["back_not_shown"].get("flag"):
         prob = prob // 2
 
