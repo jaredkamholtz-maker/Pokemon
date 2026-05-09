@@ -383,12 +383,11 @@ def run(
     print(f"  → {len(prices_df)} cards with PSA 9/10 > ${min_graded_price:.0f}\n")
 
     if prices_df.empty:
-        print("No cards passed the price filter — nothing to analyze.")
+tml        print("No cards passed the price filter — nothing to analyze.")
         return pd.DataFrame()
 
     # Step 4: Attempt PSA population from 130point.com; always fails from cloud IPs
-    # (IP blocked — "Host not in allowlist"). calculate_flip_ev falls back to eBay
-    # listing count proxy automatically when 130point data is absent.
+    # (IP blocked — "Host not in allowlist"). calculate_flip_ev falls back to breakeven.
     print(f"[4/6] Fetching PSA population ({len(prices_df)} cards, 130point → eBay proxy fallback)...")
     pop_mod.run(PRICES_PATH)
     print()
@@ -397,7 +396,7 @@ def run(
     print(f"[5/6] Calculating flip EV...")
     df = ev_mod.run(grading_fee=grading_fee, min_roi=min_roi)
 
-    # Track 1: population data available — gem rate >= 50% AND roi >= 10%
+    # Track 1: population data available — gem rate >= min_gem_rate AND roi >= min_roi
     has_pop = df["gem_rate"].notna() & df["roi"].notna()
     track1 = df[
         has_pop &
@@ -423,6 +422,10 @@ def run(
         ascending=[False, True],
         na_position="last",
     )
+    # Deduplicate — keep highest-ROI row per card
+    opportunities = opportunities.drop_duplicates(
+        subset=["card_name", "set_name", "card_number"], keep="first"
+    ).reset_index(drop=True)
 
     # Save filtered results
     Path(OUTPUT_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -435,13 +438,9 @@ def run(
     print(f"{'='*60}\n")
 
     # Step 6: eBay image analysis (final filter on top N)
-    # analyze_card_images always saves a direct listing URL before analysis runs,
-    # so every card in the result has a specific eBay link regardless of outcome.
     final = opportunities
     has_image_analysis = False
     if not skip_images and not opportunities.empty:
-        # Cooldown so step 3's eBay price calls don't exhaust the Browse API rate limit.
-        # Full scans (many cards) need a longer wait than focused era runs.
         import time as _time
         wait_s = 120 if len(opportunities) > 20 else 30
         print(f"[6/6] Waiting {wait_s}s for eBay API rate limit to clear after step 3...")
@@ -451,13 +450,11 @@ def run(
 
         analysis_csv = Path(".tmp/image_analysis.csv")
         if shortlist is not None and not shortlist.empty:
-            # SUBMIT cards: show only these with full image analysis details
             final = shortlist
             has_image_analysis = True
             Path(SHORTLIST_PATH).parent.mkdir(parents=True, exist_ok=True)
             shortlist.to_csv(SHORTLIST_PATH, index=False)
         elif analysis_csv.exists():
-            # No SUBMIT cards — show all analyzed cards; email filter drops any without a URL
             print("  No SUBMIT cards from image analysis — showing analyzed cards with eBay links.")
             final = pd.read_csv(analysis_csv)
             has_image_analysis = True
@@ -488,7 +485,6 @@ def run(
                 "gem_rate", "roi", "predicted_grade", "psa9_or_better_probability"]
         print(final[[c for c in cols if c in final.columns]].to_string(index=False))
 
-    # Show eBay URL status for every card so we can diagnose in CI logs
     if "ebay_listing_url" in final.columns:
         print("\n── eBay listing URLs ──")
         for _, row in final.iterrows():
@@ -510,24 +506,16 @@ if __name__ == "__main__":
                         help="Filter to one era: mega-evolution, sword-shield, scarlet-violet")
     parser.add_argument("--sets", default=None,
                         help="Comma-separated set names, e.g. '151,Evolving Skies'")
-    parser.add_argument("--skip-discovery", action="store_true",
-                        help="Reuse last discovered_cards.csv (skip PokeData.io API call)")
-    parser.add_argument("--skip-ai-filter", action="store_true",
-                        help="Reuse last filtered_cards.csv (skip Claude Haiku step)")
-    parser.add_argument("--skip-prices", action="store_true",
-                        help="Reuse last tcgplayer_prices.csv (skip PriceCharting fetch)")
-    parser.add_argument("--skip-images", action="store_true",
-                        help="Skip eBay image analysis step (faster, no Claude Vision credits)")
-    parser.add_argument("--image-top-n", type=int, default=20,
-                        help="Number of top cards to analyze with Claude Vision (default: 20)")
+    parser.add_argument("--skip-discovery", action="store_true")
+    parser.add_argument("--skip-ai-filter", action="store_true")
+    parser.add_argument("--skip-prices", action="store_true")
+    parser.add_argument("--skip-images", action="store_true")
+    parser.add_argument("--image-top-n", type=int, default=20)
     parser.add_argument("--skip-sheets", action="store_true")
     parser.add_argument("--skip-email", action="store_true")
-    parser.add_argument("--min-graded-price", type=float, default=60.0,
-                        help="Min PSA 9 or PSA 10 price to include a card (default: $60)")
-    parser.add_argument("--min-roi", type=float, default=0.10,
-                        help="Min ROI after grading fee (default: 0.10 = 10%%%)")
-    parser.add_argument("--min-gem-rate", type=float, default=0.50,
-                        help="Min gem rate to surface a card (default: 0.35 = 35%%%)")
+    parser.add_argument("--min-graded-price", type=float, default=60.0)
+    parser.add_argument("--min-roi", type=float, default=0.10)
+    parser.add_argument("--min-gem-rate", type=float, default=0.50)
     args = parser.parse_args()
 
     sets_list = [s.strip() for s in args.sets.split(",")] if args.sets else None
