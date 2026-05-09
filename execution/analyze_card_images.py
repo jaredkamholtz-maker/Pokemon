@@ -56,6 +56,11 @@ PRICE_FLOOR_RATIO = 0.40  # drop listings below this fraction of the median pric
 RATE_DELAY = 0.5
 MODEL = "claude-sonnet-4-6"
 
+# eBay listing used as a visual reference for PSA 10 card quality and photo quality.
+# Set REFERENCE_LISTING_URL in .env to override. Image is cached in .tmp/reference_card.jpg.
+REFERENCE_ITEM_ID = "397923543088"
+REFERENCE_CACHE   = Path(".tmp/reference_card.jpg")
+
 GRADING_PROMPT = """You are a strict PSA card grader analyzing seller photos from an eBay listing. Apply the OFFICIAL PSA grading standards exactly as written below. Be conservative — most cards do not reach PSA 9 or 10. Do not give the benefit of the doubt when a defect is visible.
 
 CARD CONTEXT:
@@ -144,8 +149,51 @@ Return ONLY valid JSON, no other text:
   "summary": "2-3 sentence overall assessment applying PSA standards strictly"
 }"""
 
+REFERENCE_INTRO = (
+    "The first image below is a REFERENCE EXAMPLE provided by the buyer. "
+    "It represents a card they consider a strong PSA 9/10 candidate — "
+    "use it to calibrate your expectations for corner sharpness, surface cleanliness, "
+    "centering, and photo quality. Do NOT grade the reference card itself.\n\n"
+    "The second image is the actual listing you must grade."
+)
+
 # Red flags that auto-disqualify a listing
 _CRITICAL_FLAGS = {"stock_photo_suspected", "fake_indicators", "altered_appearance"}
+
+
+def _fetch_reference_image(token: str) -> str | None:
+    """
+    Fetch the reference listing image via Browse API getItem, cache it locally.
+    Returns base64-encoded JPEG, or None if unavailable.
+    """
+    if REFERENCE_CACHE.exists():
+        try:
+            return base64.standard_b64encode(REFERENCE_CACHE.read_bytes()).decode()
+        except Exception:
+            pass
+
+    item_id = os.environ.get("REFERENCE_LISTING_ITEM_ID", REFERENCE_ITEM_ID)
+    try:
+        resp = _SESSION.get(
+            f"https://api.ebay.com/buy/browse/v1/item/v1|{item_id}|0",
+            headers={"Authorization": f"Bearer {token}",
+                     "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"},
+            timeout=20,
+        )
+        if not resp or resp.status_code != 200:
+            return None
+        data      = resp.json()
+        image_url = data.get("image", {}).get("imageUrl")
+        if not image_url:
+            return None
+        img_resp = _SESSION.get(_upgrade_ebay_image_url(image_url), timeout=20)
+        if img_resp and img_resp.status_code == 200 and img_resp.content:
+            REFERENCE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            REFERENCE_CACHE.write_bytes(img_resp.content)
+            return base64.standard_b64encode(img_resp.content).decode()
+    except Exception as e:
+        print(f"  (reference image fetch failed: {e})")
+    return None
 
 
 def _get(url: str, params: dict | None = None, max_retries: int = 3) -> object | None:
@@ -410,7 +458,8 @@ def _get_dim_rating(parsed: dict, key: str) -> str | None:
     return val.get("rating") if isinstance(val, dict) else None
 
 
-def analyze_image(card_name: str, set_name: str, card_number: str, image_b64: str) -> dict:
+def analyze_image(card_name: str, set_name: str, card_number: str, image_b64: str,
+                  reference_b64: str | None = None) -> dict:
     load_dotenv()
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -427,11 +476,21 @@ def analyze_image(card_name: str, set_name: str, card_number: str, image_b64: st
                        .replace("{card_name}", card_name)
                        .replace("{set_name}", set_name)
                        .replace("{card_number}", card_number or "unknown"))
-        content = [
-            {"type": "image",
-             "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
-            {"type": "text", "text": prompt_text},
-        ]
+        if reference_b64:
+            content = [
+                {"type": "text", "text": REFERENCE_INTRO},
+                {"type": "image",
+                 "source": {"type": "base64", "media_type": "image/jpeg", "data": reference_b64}},
+                {"type": "image",
+                 "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
+                {"type": "text", "text": prompt_text},
+            ]
+        else:
+            content = [
+                {"type": "image",
+                 "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
+                {"type": "text", "text": prompt_text},
+            ]
         client = Anthropic(api_key=api_key)
         response = client.messages.create(
             model=MODEL,
@@ -470,7 +529,7 @@ def analyze_image(card_name: str, set_name: str, card_number: str, image_b64: st
 
 
 def pick_best_listing(card_name: str, set_name: str, card_number: str,
-                      listings: list[dict]) -> tuple[dict, dict]:
+                      listings: list[dict], reference_b64: str | None = None) -> tuple[dict, dict]:
     """
     Analyze each listing photo with Claude Vision.
     Returns (best_listing, analysis).
@@ -501,7 +560,7 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
             continue
 
         print("analyzing...", end=" ", flush=True)
-        analysis = analyze_image(card_name, set_name, card_number, b64)
+        analysis = analyze_image(card_name, set_name, card_number, b64, reference_b64)
         rec      = analysis.get("recommendation", "SKIP")
         prob     = analysis.get("psa9_or_better_probability") or 0
         flags    = analysis.get("red_flags_active") or ""
@@ -540,6 +599,17 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
     sort_col   = "roi" if "roi" in df.columns else df.columns[0]
     candidates = df.sort_values(sort_col, ascending=False).head(top_n).copy()
     print(f"Analyzing top {len(candidates)} cards...\n")
+
+    # Load reference image once — used as a visual quality anchor in every Claude Vision call
+    app_id  = os.environ.get("EBAY_APP_ID")
+    cert_id = os.environ.get("EBAY_CERT_ID")
+    reference_b64: str | None = None
+    if app_id and cert_id:
+        ref_token = _get_browse_token(app_id, cert_id)
+        if ref_token:
+            reference_b64 = _fetch_reference_image(ref_token)
+            status = "cached" if REFERENCE_CACHE.exists() else "fetched"
+            print(f"Reference image {'loaded (' + status + ')' if reference_b64 else 'unavailable — grading without reference'}\n")
 
     rows = []
     for rank, (_, card) in enumerate(candidates.iterrows(), 1):
@@ -581,7 +651,7 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
         print(f"{len(listings)} listings ({price_range})")
 
         try:
-            best_listing, analysis = pick_best_listing(card_name, set_name, card_number, listings)
+            best_listing, analysis = pick_best_listing(card_name, set_name, card_number, listings, reference_b64)
 
             # Always set URL — pick_best_listing guarantees a listing (cheapest fallback)
             result["ebay_listing_url"] = best_listing["url"]
