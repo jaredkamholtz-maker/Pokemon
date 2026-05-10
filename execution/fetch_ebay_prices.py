@@ -40,8 +40,8 @@ EBAY_TOKEN_URL  = "https://api.ebay.com/identity/v1/oauth2/token"
 INPUT_FILE      = Path(".tmp/filtered_cards.csv")
 OUTPUT_FILE     = Path(".tmp/ebay_prices.csv")
 
-MAX_WORKERS = 3
-RATE_DELAY  = 1.0
+MAX_WORKERS = 1      # sequential to stay within eBay per-second rate limit
+RATE_DELAY  = 1.2    # seconds between requests
 
 _token_cache: dict = {"token": None, "expires_at": 0.0}
 _token_lock = threading.Lock()
@@ -75,22 +75,29 @@ def _get_oauth_token(app_id: str, cert_id: str) -> str | None:
 
 
 def _search_browse(keywords: str, token: str, limit: int = 50) -> list[dict]:
-    try:
-        resp = _SESSION.get(
-            BROWSE_URL,
-            params={"q": keywords, "limit": limit},
-            headers={
-                "Authorization": f"Bearer {token}",
-                "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
-                "X-EBAY-C-ENDUSERCTX": "contextualLocation=country%3DUS",
-            },
-            timeout=20,
-        )
-        if resp.status_code == 200:
-            return resp.json().get("itemSummaries", [])
-        print(f"  [Browse] status={resp.status_code}")
-    except Exception as e:
-        print(f"  [Browse] error: {e}")
+    backoffs = [5, 15, 45]
+    for attempt, wait in enumerate(backoffs + [None], 1):
+        try:
+            resp = _SESSION.get(
+                BROWSE_URL,
+                params={"q": keywords, "limit": limit},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+                    "X-EBAY-C-ENDUSERCTX": "contextualLocation=country%3DUS",
+                },
+                timeout=20,
+            )
+            if resp.status_code == 200:
+                return resp.json().get("itemSummaries", [])
+            if resp.status_code == 429 and wait is not None:
+                print(f"  [Browse] 429 rate-limited, waiting {wait}s (attempt {attempt})...")
+                time.sleep(wait)
+                continue
+            print(f"  [Browse] status={resp.status_code}")
+        except Exception as e:
+            print(f"  [Browse] error: {e}")
+        break
     return []
 
 
