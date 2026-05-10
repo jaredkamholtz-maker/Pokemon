@@ -209,18 +209,9 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         else:
             ebay_link = f' <a href="{ebay_search_url}" style="font-size:11px;color:#e67e00;font-weight:600;">[Find on eBay]</a>'
 
-        image_cells = ""
         image_plain = ""
-        if has_image_analysis:
-            pred_str = f"PSA {int(pred_grade)}" if pd.notna(pred_grade) else "—"
-            prob_str = f"{int(psa9p)}%" if pd.notna(psa9p) else "—"
-            image_cells = (
-                f'<td style="padding:10px 14px;text-align:right;font-weight:700;color:#7c3aed;">{pred_str}</td>'
-                f'<td style="padding:10px 14px;text-align:right;color:#7c3aed;">{prob_str}</td>'
-            )
-            image_plain = f"  Predicted: {pred_str}  PSA9+ Probability: {prob_str}"
-            if notes:
-                image_plain += f"\n  Note: {notes}"
+        if has_image_analysis and notes:
+            image_plain = f"\n  Note: {notes}"
 
         rows_html.append(f"""<tr style="border-bottom:1px solid #e5e7eb;">
   <td style="padding:10px 14px;font-weight:500;">{rank}. {card_link}{ebay_link}<br>
@@ -230,25 +221,18 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
   <td style="padding:10px 14px;text-align:right;">{raw}</td>
   <td style="padding:10px 14px;text-align:right;">{psa9}</td>
   <td style="padding:10px 14px;text-align:right;font-weight:600;color:#15803d;">{psa10}</td>
-  <td style="padding:10px 14px;text-align:right;font-weight:700;color:#1d4ed8;">{roi}</td>
   <td style="padding:10px 14px;text-align:right;font-weight:700;color:#15803d;">{gem}</td>
-  {image_cells}
 </tr>""")
 
         link_text = f"\n  Buy on eBay: {buy_url}" + (f"\n  PriceCharting: {url}" if url else "")
         rows_plain.append(
             f"#{rank} {name} | {set_name}\n"
-            f"  Raw: {raw}  PSA9: {psa9}  PSA10: {psa10}  Profit: {roi}  Gem Rate: {gem}"
+            f"  Raw: {raw}  PSA9: {psa9}  PSA10: {psa10}  Gem Rate: {gem}"
             f"{image_plain}{link_text}"
         )
 
-    image_headers = ""
     image_footer = ""
     if has_image_analysis:
-        image_headers = (
-            '<th style="padding:10px 14px;text-align:right;">Predicted Grade</th>'
-            '<th style="padding:10px 14px;text-align:right;">PSA 9+ Probability</th>'
-        )
         image_footer = " Cards shown passed eBay photo analysis (Claude Vision)."
 
     table_rows = "\n".join(rows_html)
@@ -262,9 +246,7 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
       <th style="padding:10px 14px;text-align:right;">{"Buy Price (eBay)" if has_image_analysis else "Raw (Ungraded)"}</th>
       <th style="padding:10px 14px;text-align:right;">PSA 9</th>
       <th style="padding:10px 14px;text-align:right;">PSA 10</th>
-      <th style="padding:10px 14px;text-align:right;">Profit %</th>
       <th style="padding:10px 14px;text-align:right;">Gem Rate (gem / total)</th>
-      {image_headers}
     </tr>
   </thead>
   <tbody>
@@ -272,7 +254,7 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
   </tbody>
 </table>
 <p style="font-size:12px;color:#94a3b8;margin-top:24px;">
-  Profit % = ROI after $25 grading fee. Gem Rate = % of all PSA submissions that came back 9 or 10 (gem count / total graded). BE ≤ X% = breakeven if at least X% grade gem.{image_footer}
+  Gem Rate = % of all PSA submissions that came back 9 or 10 (gem count / total graded). BE ≤ X% = breakeven if at least X% grade gem.{image_footer}
 </p>
 </body></html>"""
 
