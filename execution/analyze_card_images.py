@@ -579,7 +579,7 @@ def analyze_image(card_name: str, set_name: str, card_number: str, image_b64: st
         client = Anthropic(api_key=api_key)
         response = client.messages.create(
             model=MODEL,
-            max_tokens=1024,
+            max_tokens=2048,
             messages=[{"role": "user", "content": content}],
         )
         raw       = response.content[0].text.strip()
