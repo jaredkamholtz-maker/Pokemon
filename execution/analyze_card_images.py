@@ -59,9 +59,15 @@ MODEL = "claude-sonnet-4-6"
 # eBay listing used as a visual reference for PSA 10 card quality and photo quality.
 # Override via REFERENCE_LISTING_ITEM_ID or REFERENCE_IMAGE_URL in .env / GitHub secrets.
 # Committed fallback: data/reference_card.jpg (never regenerated, always available in CI).
-REFERENCE_ITEM_ID = "397923543088"
-REFERENCE_CACHE   = Path(".tmp/reference_card.jpg")
+REFERENCE_ITEM_ID   = "397923543088"
+REFERENCE_CACHE     = Path(".tmp/reference_card.jpg")
 REFERENCE_COMMITTED = Path("data/reference_card.jpg")
+
+# Negative reference examples: visibly damaged cards (bent edges, heavy wear).
+# Used to calibrate Claude Vision on what a DO-NOT-SUBMIT card looks like.
+DAMAGED_EXAMPLE_ITEM_IDS = ["376469060746", "134783144970"]
+DAMAGED_EXAMPLE_COMMITTED = [Path(f"data/damaged_example_{i+1}.jpg") for i in range(len(DAMAGED_EXAMPLE_ITEM_IDS))]
+DAMAGED_EXAMPLE_CACHE     = [Path(f".tmp/damaged_example_{i+1}.jpg")  for i in range(len(DAMAGED_EXAMPLE_ITEM_IDS))]
 
 GRADING_PROMPT = """You are a strict PSA card grader analyzing seller photos from an eBay listing. Apply the OFFICIAL PSA grading standards exactly as written below. Be conservative — most cards do not reach PSA 9 or 10. Do not give the benefit of the doubt when a defect is visible.
 
@@ -152,6 +158,18 @@ Return ONLY valid JSON, no other text:
 }"""
 
 REFERENCE_INTRO = (
+    "You are given reference images before the listing to grade.\n\n"
+    "POSITIVE REFERENCE (image 1): A card the buyer considers a strong PSA 9/10 candidate. "
+    "Use it to calibrate corner sharpness, surface cleanliness, centering, and photo quality. "
+    "Do NOT grade this card.\n\n"
+    "NEGATIVE REFERENCES (images 2 and 3): Cards with VISIBLY DESTROYED edges and bends — "
+    "they have ZERO chance of grading. Heavy whitening, bent corners, and edge damage are "
+    "clearly visible. Use these to anchor your lower bound. Any card that looks like these "
+    "must be SKIP regardless of price.\n\n"
+    "The FINAL image is the actual listing you must grade."
+)
+
+REFERENCE_INTRO_NO_DAMAGED = (
     "The first image below is a REFERENCE EXAMPLE provided by the buyer. "
     "It represents a card they consider a strong PSA 9/10 candidate — "
     "use it to calibrate your expectations for corner sharpness, surface cleanliness, "
@@ -216,6 +234,50 @@ def _fetch_reference_image(token: str) -> str | None:
     except Exception as e:
         print(f"  (reference image fetch failed: {e})")
     return None
+
+
+def _fetch_damaged_examples(token: str) -> list[str]:
+    """
+    Load negative reference images (clearly damaged cards).
+    Priority: committed data/ → .tmp/ cache → eBay Browse API.
+    Returns a list of base64 strings (may be shorter than DAMAGED_EXAMPLE_ITEM_IDS if some fail).
+    """
+    results = []
+    for idx, item_id in enumerate(DAMAGED_EXAMPLE_ITEM_IDS):
+        committed = DAMAGED_EXAMPLE_COMMITTED[idx]
+        cache     = DAMAGED_EXAMPLE_CACHE[idx]
+        b64 = None
+        for path in (committed, cache):
+            if path.exists():
+                try:
+                    b64 = base64.standard_b64encode(path.read_bytes()).decode()
+                    break
+                except Exception:
+                    pass
+        if b64:
+            results.append(b64)
+            continue
+        try:
+            resp = _SESSION.get(
+                f"https://api.ebay.com/buy/browse/v1/item/v1|{item_id}|0",
+                headers={"Authorization": f"Bearer {token}",
+                         "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"},
+                timeout=20,
+            )
+            if resp and resp.status_code == 200:
+                image_url = resp.json().get("image", {}).get("imageUrl")
+                if image_url:
+                    img_resp = _SESSION.get(_upgrade_ebay_image_url(image_url), timeout=20)
+                    if img_resp and img_resp.status_code == 200 and img_resp.content:
+                        for path in (committed, cache):
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            path.write_bytes(img_resp.content)
+                        b64 = base64.standard_b64encode(img_resp.content).decode()
+                        results.append(b64)
+                        continue
+        except Exception as e:
+            print(f"  (damaged example {idx+1} fetch failed: {e})")
+    return results
 
 
 def _get(url: str, params: dict | None = None, max_retries: int = 3) -> object | None:
@@ -483,7 +545,8 @@ def _get_dim_rating(parsed: dict, key: str) -> str | None:
 
 
 def analyze_image(card_name: str, set_name: str, card_number: str, image_b64: str,
-                  reference_b64: str | None = None) -> dict:
+                  reference_b64: str | None = None,
+                  damaged_examples_b64: list[str] | None = None) -> dict:
     load_dotenv()
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -500,15 +563,18 @@ def analyze_image(card_name: str, set_name: str, card_number: str, image_b64: st
                        .replace("{card_name}", card_name)
                        .replace("{set_name}", set_name)
                        .replace("{card_number}", card_number or "unknown"))
+        has_damaged = bool(damaged_examples_b64)
         if reference_b64:
-            content = [
-                {"type": "text", "text": REFERENCE_INTRO},
-                {"type": "image",
-                 "source": {"type": "base64", "media_type": "image/jpeg", "data": reference_b64}},
-                {"type": "image",
-                 "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
-                {"type": "text", "text": prompt_text},
-            ]
+            intro = REFERENCE_INTRO if has_damaged else REFERENCE_INTRO_NO_DAMAGED
+            content = [{"type": "text", "text": intro}]
+            content.append({"type": "image",
+                             "source": {"type": "base64", "media_type": "image/jpeg", "data": reference_b64}})
+            for dmg_b64 in (damaged_examples_b64 or []):
+                content.append({"type": "image",
+                                 "source": {"type": "base64", "media_type": "image/jpeg", "data": dmg_b64}})
+            content.append({"type": "image",
+                             "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}})
+            content.append({"type": "text", "text": prompt_text})
         else:
             content = [
                 {"type": "image",
@@ -553,7 +619,8 @@ def analyze_image(card_name: str, set_name: str, card_number: str, image_b64: st
 
 
 def pick_best_listing(card_name: str, set_name: str, card_number: str,
-                      listings: list[dict], reference_b64: str | None = None) -> tuple[dict, dict]:
+                      listings: list[dict], reference_b64: str | None = None,
+                      damaged_examples_b64: list[str] | None = None) -> tuple[dict, dict]:
     """
     Analyze each listing photo with Claude Vision.
     Returns (best_listing, analysis).
@@ -584,7 +651,7 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
             continue
 
         print("analyzing...", end=" ", flush=True)
-        analysis = analyze_image(card_name, set_name, card_number, b64, reference_b64)
+        analysis = analyze_image(card_name, set_name, card_number, b64, reference_b64, damaged_examples_b64)
         rec      = analysis.get("recommendation", "SKIP")
         prob     = analysis.get("psa9_or_better_probability") or 0
         flags    = analysis.get("red_flags_active") or ""
@@ -624,10 +691,9 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
     candidates = df.sort_values(sort_col, ascending=False).head(top_n).copy()
     print(f"Analyzing top {len(candidates)} cards...\n")
 
-    # Load reference image once — used as a visual quality anchor in every Claude Vision call
+    # Load reference images once — positive + negative anchors for every Claude Vision call
     app_id  = os.environ.get("EBAY_APP_ID")
     cert_id = os.environ.get("EBAY_CERT_ID")
-    reference_b64: str | None = None
     ref_token = _get_browse_token(app_id, cert_id) if (app_id and cert_id) else None
     reference_b64 = _fetch_reference_image(ref_token or "")
     if reference_b64:
@@ -639,10 +705,19 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
             src = "REFERENCE_IMAGE_URL"
         else:
             src = "eBay API"
-        print(f"Reference image loaded ({src})\n")
+        print(f"Reference image loaded ({src})")
     else:
         print("Reference image unavailable — grading without reference\n"
-              "  Fix: add REFERENCE_IMAGE_URL secret, or commit data/reference_card.jpg\n")
+              "  Fix: add REFERENCE_IMAGE_URL secret, or commit data/reference_card.jpg")
+
+    damaged_examples_b64 = _fetch_damaged_examples(ref_token or "")
+    committed_count = sum(1 for p in DAMAGED_EXAMPLE_COMMITTED if p.exists())
+    if damaged_examples_b64:
+        src = "committed" if committed_count == len(DAMAGED_EXAMPLE_ITEM_IDS) else "eBay API"
+        print(f"Damaged reference examples loaded: {len(damaged_examples_b64)}/{len(DAMAGED_EXAMPLE_ITEM_IDS)} ({src})")
+    else:
+        print("Damaged reference examples unavailable — grading without negative anchors")
+    print()
 
     rows = []
     for rank, (_, card) in enumerate(candidates.iterrows(), 1):
@@ -684,7 +759,7 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
         print(f"{len(listings)} listings ({price_range})")
 
         try:
-            best_listing, analysis = pick_best_listing(card_name, set_name, card_number, listings, reference_b64)
+            best_listing, analysis = pick_best_listing(card_name, set_name, card_number, listings, reference_b64, damaged_examples_b64)
 
             # Always set URL — pick_best_listing guarantees a listing (cheapest fallback)
             result["ebay_listing_url"] = best_listing["url"]
