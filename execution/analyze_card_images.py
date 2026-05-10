@@ -337,7 +337,7 @@ def _get_browse_token(client_id: str, client_secret: str) -> str | None:
     return None
 
 
-def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
+def search_ebay_listings(card_name: str, set_name: str, card_number: str = "") -> list[dict]:
     load_dotenv()
     app_id  = os.environ.get("EBAY_APP_ID")
     cert_id = os.environ.get("EBAY_CERT_ID")
@@ -740,7 +740,7 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
 
         print(f"  Searching eBay...", end=" ", flush=True)
         time.sleep(RATE_DELAY)
-        listings = search_ebay_listings(card_name, set_name)
+        listings = search_ebay_listings(card_name, set_name, card_number)
 
         if not listings:
             result["error"] = "No eBay listings found"
