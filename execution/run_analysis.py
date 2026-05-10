@@ -308,10 +308,10 @@ def run(
     skip_images: bool = False,
     skip_sheets: bool = False,
     skip_email: bool = False,
-    min_graded_price: float = 60.0,
+    min_graded_price: float = 50.0,
     min_roi: float = 0.10,
     min_gem_rate: float = 0.35,
-    image_top_n: int = 5,
+    image_top_n: int = 10,
 ):
     load_dotenv()
     today = date.today().isoformat()
@@ -404,7 +404,7 @@ def run(
 
     # Track 2: no population data, but spread is so good breakeven is very low
     # Surface cards where you'd break even needing < 15% gem rate — attractive even blind
-    max_breakeven = float(os.environ.get("MAX_BREAKEVEN_GEM_RATE") or 0.15)
+    max_breakeven = float(os.environ.get("MAX_BREAKEVEN_GEM_RATE") or 0.20)
     has_breakeven = ("breakeven_gem_rate" in df.columns) and df["breakeven_gem_rate"].notna()
     track2 = df[
         has_breakeven &
