@@ -12,15 +12,15 @@ Design principles:
     probability are bonus info on top of the EV math.
 
 Steps per card:
-  1. Search eBay Browse API for most expensive ungraded listings up to $500
+  1. Search eBay Browse API for cheapest ungraded listings (up to MAX_LISTINGS)
   2. For each listing: download the API-provided image, send to Claude Vision
   3. Skip listings with stock photos, fakes, or critical red flags
   4. Pick the listing with highest PSA 9+ probability among valid photos
   5. Only set ebay_listing_url if at least one listing passed analysis
 
 Output:
-  .tmp/image_analysis.csv   -- full results for all analyzed cards
-  .tmp/final_shortlist.csv  -- SUBMIT cards only
+  .tmp/image_analysis.csv   — full results for all analyzed cards
+  .tmp/final_shortlist.csv  — SUBMIT cards only
 
 Usage:
     python execution/analyze_card_images.py
@@ -57,11 +57,11 @@ RATE_DELAY = 0.5
 MODEL = "claude-sonnet-4-6"
 
 # eBay listing used as a visual reference for PSA 10 card quality and photo quality.
-# Set REFERENCE_LISTING_ITEM_ID in .env to override. Image cached in .tmp/reference_card.jpg.
+# Set REFERENCE_LISTING_URL in .env to override. Image is cached in .tmp/reference_card.jpg.
 REFERENCE_ITEM_ID = "397923543088"
 REFERENCE_CACHE   = Path(".tmp/reference_card.jpg")
 
-GRADING_PROMPT = """You are a strict PSA card grader analyzing seller photos from an eBay listing. Apply the OFFICIAL PSA grading standards exactly as written below. Be conservative -- most cards do not reach PSA 9 or 10. Do not give the benefit of the doubt when a defect is visible.
+GRADING_PROMPT = """You are a strict PSA card grader analyzing seller photos from an eBay listing. Apply the OFFICIAL PSA grading standards exactly as written below. Be conservative — most cards do not reach PSA 9 or 10. Do not give the benefit of the doubt when a defect is visible.
 
 CARD CONTEXT:
 - Card: {card_name}
@@ -70,37 +70,37 @@ CARD CONTEXT:
 
 OFFICIAL PSA GRADING STANDARDS (apply these exactly):
 
-PSA 10 GEM MINT -- Virtually perfect. ALL of the following must be true:
-  * Four perfectly sharp corners, no wear whatsoever
-  * Sharp focus, full original gloss, no surface scratches
-  * Free of staining of any kind
-  * Centering: <=55/45 left-right AND top-bottom on front; <=75/25 on back
-  * A minor printing imperfection is allowed ONLY if it does not impair overall appeal
+PSA 10 GEM MINT — Virtually perfect. ALL of the following must be true:
+  • Four perfectly sharp corners, no wear whatsoever
+  • Sharp focus, full original gloss, no surface scratches
+  • Free of staining of any kind
+  • Centering: ≤55/45 left-right AND top-bottom on front; ≤75/25 on back
+  • A minor printing imperfection is allowed ONLY if it does not impair overall appeal
 
-PSA 9 MINT -- Outstanding condition. At most ONE of these minor defects:
-  * Slight wear on one or two corners (barely visible)
-  * Slightly off-white borders
-  * Minor printing imperfection
-  * Slight loss of original gloss
-  * Centering: <=60/40 front; <=75/25 back
-  * No creases, no staining, no surface scratches
+PSA 9 MINT — Outstanding condition. At most ONE of these minor defects:
+  • Slight wear on one or two corners (barely visible)
+  • Slightly off-white borders
+  • Minor printing imperfection
+  • Slight loss of original gloss
+  • Centering: ≤60/40 front; ≤75/25 back
+  • No creases, no staining, no surface scratches
 
-PSA 8 NEAR MINT-MINT -- Slightly worn. May have two of the PSA 9 defects, OR:
-  * Slightly fuzzy corners on up to two corners
-  * Centering: <=65/35 front
+PSA 8 NEAR MINT–MINT — Slightly worn. May have two of the PSA 9 defects, OR:
+  • Slightly fuzzy corners on up to two corners
+  • Centering: ≤65/35 front
 
-PSA 7 NEAR MINT -- Three or four corners show slight wear. Centering <=70/30.
+PSA 7 NEAR MINT — Three or four corners show slight wear. Centering ≤70/30.
 
-PSA 6 and below -- Visible wear, scuffs, creases, or heavy whitening.
+PSA 6 and below — Visible wear, scuffs, creases, or heavy whitening.
 
 GRADING RULES:
 - Any visible crease, bend, or water damage = PSA 5 or below (use grade_high = 5)
 - Any two defects that individually would allow PSA 9 = PSA 8, not PSA 9
-- Centering visibly off to the naked eye likely means <=PSA 8
+- Centering visibly off to the naked eye likely means ≤PSA 8
 - Holo scratches visible at any angle = at most PSA 8 for holo cards
-- Be skeptical of stock-looking photos -- many eBay sellers use database images
+- Be skeptical of stock-looking photos — many eBay sellers use database images
 
-ASSESS THE FOLLOWING. For each dimension, provide a rating, a confidence score 0.0-1.0 based on photo quality for THAT dimension, and specific observations. If photo quality prevents assessment, set rating to "unknown" and confidence to 0.0. Do not guess.
+ASSESS THE FOLLOWING. For each dimension, provide a rating, a confidence score 0.0–1.0 based on photo quality for THAT dimension, and specific observations. If photo quality prevents assessment, set rating to "unknown" and confidence to 0.0. Do not guess.
 
 DIMENSIONS:
 1. centering_front: measure border widths and estimate ratio like "55/45 L/R, 50/50 T/B"
@@ -116,7 +116,7 @@ DIMENSIONS:
 PREDICTED GRADE RANGE:
 Based strictly on the PSA standards above, give the range this card would likely receive at PSA. Low = pessimistic outcome, High = optimistic outcome. Use 0 for both if ungradeable (creases, bends, water damage).
 
-RED FLAGS -- check each and report true/false with reasoning:
+RED FLAGS — check each and report true/false with reasoning:
 - stock_photo_suspected: photos look like generic/database images, not this specific card being sold by this seller
 - back_not_shown: no clear photo of card back
 - glare_obscures_detail: critical areas hidden by reflection
@@ -151,7 +151,7 @@ Return ONLY valid JSON, no other text:
 
 REFERENCE_INTRO = (
     "The first image below is a REFERENCE EXAMPLE provided by the buyer. "
-    "It represents a card they consider a strong PSA 9/10 candidate -- "
+    "It represents a card they consider a strong PSA 9/10 candidate — "
     "use it to calibrate your expectations for corner sharpness, surface cleanliness, "
     "centering, and photo quality. Do NOT grade the reference card itself.\n\n"
     "The second image is the actual listing you must grade."
@@ -217,6 +217,8 @@ def _is_graded_title(title: str) -> bool:
     return any(kw in t for kw in [
         "psa ", "psa-", "psa9", "psa10", "psa8", "psa7", "psa6",
         "bgs ", "cgc ", "sgc ", "graded", "gem mint",
+        "mint 10", "mint 9", "mint 8", "mint 7",
+        "grade 10", "grade 9", "grade 8", "grade 7",
     ])
 
 
@@ -232,7 +234,7 @@ def _is_multi_card_listing(title: str) -> bool:
     ])
 
 
-# -- eBay search ---------------------------------------------------------------------------
+# ── eBay search ──────────────────────────────────────────────────────────────────────────────
 
 def _get_browse_token(client_id: str, client_secret: str) -> str | None:
     try:
@@ -257,7 +259,7 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
     cert_id = os.environ.get("EBAY_CERT_ID")
 
     if not app_id or not cert_id:
-        print("  EBAY_APP_ID/CERT_ID not set -- skipping eBay search")
+        print("  EBAY_APP_ID/CERT_ID not set — skipping eBay search")
         return []
 
     token = _get_browse_token(app_id, cert_id)
@@ -268,8 +270,8 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
     def _parse_items(items: list, strict: bool) -> list:
         """
         Parse Browse API itemSummaries into candidates.
-        strict=True  -> also filter multi-card/lot listings
-        strict=False -> only filter graded listings (last-resort fallback)
+        strict=True  → also filter multi-card/lot listings
+        strict=False → only filter graded listings (last-resort fallback)
         """
         out = []
         graded_n = multi_n = no_url_n = 0
@@ -282,18 +284,24 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
             if _is_graded_title(title):
                 graded_n += 1
                 continue
+            # eBay condition ID 2750 = "Graded" — filter at the API level too
+            if item.get("conditionId") == "2750":
+                graded_n += 1
+                continue
             if strict and _is_multi_card_listing(title):
                 multi_n += 1
                 continue
+            # Accept any price — auctions may show 0 until first bid
             try:
                 price = float(item.get("price", {}).get("value") or 0)
             except (ValueError, TypeError):
                 price = 0.0
             image_url = item.get("image", {}).get("imageUrl")
+            # Prefer listings that have additional photos (real seller photos)
             extra_images = len(item.get("additionalImages", []))
             out.append({"title": title, "price": price, "url": url,
                         "image_url": image_url, "extra_images": extra_images})
-            if len(out) >= MAX_LISTINGS * 4:
+            if len(out) >= MAX_LISTINGS * 4:   # gather extras for sorting
                 break
         if strict:
             print(f"(graded={graded_n} lot={multi_n} no_url={no_url_n} raw={len(out)})", end=" ", flush=True)
@@ -318,6 +326,7 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
 
         candidates = _parse_items(items, strict=True)
 
+        # Fallback: relax lot filter if strict pass found nothing
         if not candidates:
             print("(fallback: relaxing lot filter)", end=" ", flush=True)
             candidates = _parse_items(items, strict=False)
@@ -338,7 +347,7 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
         return []
 
 
-# -- Claude Vision analysis ---------------------------------------------------------------
+# ── Claude Vision analysis ─────────────────────────────────────────────────────────────────────────────
 
 def _upgrade_ebay_image_url(url: str) -> str:
     """
@@ -371,6 +380,7 @@ def _derive_from_analysis(parsed: dict) -> dict:
     """
     red_flags = parsed.get("red_flags", {})
 
+    # Critical flags → auto-disqualify
     active_critical = [f for f in _CRITICAL_FLAGS
                        if isinstance(red_flags.get(f), dict) and red_flags[f].get("flag")]
     if active_critical:
@@ -423,6 +433,7 @@ def _derive_from_analysis(parsed: dict) -> dict:
     else:
         prob = 0
 
+    # Soft flag: back not shown → halve probability
     if isinstance(red_flags.get("back_not_shown"), dict) and red_flags["back_not_shown"].get("flag"):
         prob = prob // 2
 
@@ -431,7 +442,7 @@ def _derive_from_analysis(parsed: dict) -> dict:
                   and isinstance(info, dict) and info.get("flag")]
 
     summary = parsed.get("summary", "")
-    notes   = (f"[{', '.join(soft_flags)}]. " if soft_flags else "") + summary
+    notes   = (f"⚠️ {', '.join(soft_flags)}. " if soft_flags else "") + summary
 
     return {
         "recommendation":           "SUBMIT" if grade_high >= 9 and prob >= 30 else "SKIP",
@@ -524,11 +535,13 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
     Analyze each listing photo with Claude Vision.
     Returns (best_listing, analysis).
 
-    Always returns listings[0] as a minimum fallback (most expensive single-card
-    listing -- already filtered for graded/lot/pick listings at search time).
+    Always returns listings[0] as a minimum fallback (cheapest single-card
+    listing — already filtered for graded/lot/pick listings at search time).
     If a non-disqualified listing is found, that takes priority.
     If a SUBMIT listing is found, that wins.
     """
+    # Cheapest listing is always the fallback — it's already filtered for
+    # graded/lot/multi-card titles, so it's a real single-card listing
     best_listing  = listings[0]
     best_analysis: dict = {"recommendation": "SKIP", "notes": "photo unverified"}
     best_score = -1
@@ -537,10 +550,10 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
     for i, listing in enumerate(listings, 1):
         image_url = listing.get("image_url")
         if not image_url:
-            print(f"  [{i}/{len(listings)}] ${listing['price']:.2f} -- no image from API")
+            print(f"  [{i}/{len(listings)}] ${listing['price']:.2f} — no image from API")
             continue
 
-        print(f"  [{i}/{len(listings)}] ${listing['price']:.2f} -- downloading image...", end=" ", flush=True)
+        print(f"  [{i}/{len(listings)}] ${listing['price']:.2f} — downloading image...", end=" ", flush=True)
         time.sleep(RATE_DELAY)
         b64 = download_image_b64(_upgrade_ebay_image_url(image_url))
         if not b64:
@@ -555,6 +568,8 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
         flag_str = f" [{flags}]" if flags else ""
         print(f"{rec} (PSA 9+: {prob}%){flag_str}")
 
+        # Disqualified (stock photo / fake) listings never win, but cheapest
+        # non-disqualified listing upgrades the fallback
         if analysis.get("photo_quality") == "disqualified":
             continue
 
@@ -567,12 +582,12 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
             best_analysis = analysis
 
     if not any_non_disqualified:
-        print("  All listings had stock/unverifiable photos -- using most expensive listing URL as fallback")
+        print("  All listings had stock/unverifiable photos — using cheapest listing URL as fallback")
 
     return best_listing, best_analysis
 
 
-# -- Main run -----------------------------------------------------------------------------
+# ── Main run ───────────────────────────────────────────────────────────────────────────────────
 
 def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
     load_dotenv()
@@ -586,7 +601,7 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
     candidates = df.sort_values(sort_col, ascending=False).head(top_n).copy()
     print(f"Analyzing top {len(candidates)} cards...\n")
 
-    # Load reference image once -- used as a visual quality anchor in every Claude Vision call
+    # Load reference image once — used as a visual quality anchor in every Claude Vision call
     app_id  = os.environ.get("EBAY_APP_ID")
     cert_id = os.environ.get("EBAY_CERT_ID")
     reference_b64: str | None = None
@@ -595,7 +610,7 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
         if ref_token:
             reference_b64 = _fetch_reference_image(ref_token)
             status = "cached" if REFERENCE_CACHE.exists() else "fetched"
-            print(f"Reference image {'loaded (' + status + ')' if reference_b64 else 'unavailable -- grading without reference'}\n")
+            print(f"Reference image {'loaded (' + status + ')' if reference_b64 else 'unavailable — grading without reference'}\n")
 
     rows = []
     for rank, (_, card) in enumerate(candidates.iterrows(), 1):
@@ -611,6 +626,7 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
             "total_graded": card.get("total_graded"), "psa9_count": card.get("psa9_count"),
             "psa10_count":  card.get("psa10_count"),  "roi":        card.get("roi"),
             "track": card.get("track"), "breakeven_gem_rate": card.get("breakeven_gem_rate"),
+            # URL fields start as None — only set if a real photo listing passes analysis
             "ebay_listing_url": None, "ebay_price": None,
             "centering_front": None, "corners": None, "edges": None,
             "surface_front": None, "holo_condition": None,
@@ -631,13 +647,14 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
             continue
 
         price_range = f"${listings[0]['price']:.2f}" + (
-            f"-${listings[-1]['price']:.2f}" if len(listings) > 1 else ""
+            f"–${listings[-1]['price']:.2f}" if len(listings) > 1 else ""
         )
         print(f"{len(listings)} listings ({price_range})")
 
         try:
             best_listing, analysis = pick_best_listing(card_name, set_name, card_number, listings, reference_b64)
 
+            # Always set URL — pick_best_listing guarantees a listing (cheapest fallback)
             result["ebay_listing_url"] = best_listing["url"]
             result["ebay_price"]       = best_listing["price"]
 
@@ -655,16 +672,16 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
         rec   = result.get("recommendation", "NO_DATA")
         grade = result.get("predicted_grade", "?")
         prob  = result.get("psa9_or_better_probability", "?")
-        url   = result.get("ebay_listing_url") or "[no valid listing -- search link will be used]"
-        print(f"  -> {url}")
-        print(f"  -> ${result.get('ebay_price') or 0:.2f} | {rec} | predicted PSA {grade} | PSA 9+: {prob}%\n")
+        url   = result.get("ebay_listing_url") or "[no valid listing — search link will be used]"
+        print(f"  → {url}")
+        print(f"  → ${result.get('ebay_price') or 0:.2f} | {rec} | predicted PSA {grade} | PSA 9+: {prob}%\n")
 
         rows.append(result)
 
     analysis_df = pd.DataFrame(rows)
     OUTPUT_ANALYSIS.parent.mkdir(parents=True, exist_ok=True)
     analysis_df.to_csv(OUTPUT_ANALYSIS, index=False)
-    print(f"Full analysis saved -> {OUTPUT_ANALYSIS}")
+    print(f"Full analysis saved → {OUTPUT_ANALYSIS}")
 
     shortlist = analysis_df[analysis_df["recommendation"] == "SUBMIT"].copy()
     shortlist.to_csv(OUTPUT_SHORTLIST, index=False)
