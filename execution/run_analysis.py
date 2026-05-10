@@ -11,7 +11,7 @@ Steps:
      Filter: gem rate >= 35% AND ROI >= 10% after $25 grading fee
   6. analyze_card_images: find cheapest eBay raw listing per top-20 card, analyze photos
      with Claude Vision, keep only SUBMIT cards
-  7. Email final shortlist: card, raw price, PSA 9/10, profit %, gem rate, predicted grade
+  7. Email final shortlist: card, raw price, PSA 9/10, gem rate
 
 Usage:
     python execution/run_analysis.py
@@ -53,7 +53,7 @@ OUTPUT_PATH = ".tmp/flip_opportunities.csv"
 SHORTLIST_PATH = ".tmp/final_shortlist.csv"
 
 
-# ── Google Sheets ───────────────────────────────────────────────────────────────────────────
+# ── Google Sheets ──────────────────────────────────────────────────────────────────────────────
 
 def push_to_google_sheets(df: pd.DataFrame, spreadsheet_id: str, tab_name: str) -> str | None:
     try:
@@ -94,7 +94,7 @@ def push_to_google_sheets(df: pd.DataFrame, spreadsheet_id: str, tab_name: str) 
         return None
 
 
-# ── Email ──────────────────────────────────────────────────────────────────────────
+# ── Email ────────────────────────────────────────────────────────────────────────────
 
 def _fmt_price(val) -> str:
     try:
@@ -170,14 +170,6 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
             gem = f"BE ≤ {_fmt_pct(be)}" if pd.notna(be) and be == be else "No data"
         else:
             gem = "—"
-        # Profit %: use ROI if available, else label as breakeven opportunity
-        roi_val = row.get("roi")
-        if pd.notna(roi_val) and roi_val == roi_val:
-            roi = _fmt_pct(roi_val)
-        elif is_breakeven:
-            roi = "breakeven play"
-        else:
-            roi = "—"
         url = row.get("source_url") or ""
         _ebay_raw = row.get("ebay_listing_url")
         ebay_listing_url = str(_ebay_raw) if pd.notna(_ebay_raw) and _ebay_raw else ""
@@ -194,8 +186,6 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         buy_url = ebay_listing_url or ebay_search_url
 
         # Image analysis columns (only present when step 6 ran)
-        pred_grade = row.get("predicted_grade")
-        psa9p = row.get("psa9_or_better_probability")
         _notes_raw = row.get("notes")
         notes = str(_notes_raw) if pd.notna(_notes_raw) and _notes_raw else ""
 
@@ -209,18 +199,9 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         else:
             ebay_link = f' <a href="{ebay_search_url}" style="font-size:11px;color:#e67e00;font-weight:600;">[Find on eBay]</a>'
 
-        image_cells = ""
         image_plain = ""
-        if has_image_analysis:
-            pred_str = f"PSA {int(pred_grade)}" if pd.notna(pred_grade) else "—"
-            prob_str = f"{int(psa9p)}%" if pd.notna(psa9p) else "—"
-            image_cells = (
-                f'<td style="padding:10px 14px;text-align:right;font-weight:700;color:#7c3aed;">{pred_str}</td>'
-                f'<td style="padding:10px 14px;text-align:right;color:#7c3aed;">{prob_str}</td>'
-            )
-            image_plain = f"  Predicted: {pred_str}  PSA9+ Probability: {prob_str}"
-            if notes:
-                image_plain += f"\n  Note: {notes}"
+        if has_image_analysis and notes:
+            image_plain = f"\n  Note: {notes}"
 
         rows_html.append(f"""<tr style="border-bottom:1px solid #e5e7eb;">
   <td style="padding:10px 14px;font-weight:500;">{rank}. {card_link}{ebay_link}<br>
@@ -230,25 +211,18 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
   <td style="padding:10px 14px;text-align:right;">{raw}</td>
   <td style="padding:10px 14px;text-align:right;">{psa9}</td>
   <td style="padding:10px 14px;text-align:right;font-weight:600;color:#15803d;">{psa10}</td>
-  <td style="padding:10px 14px;text-align:right;font-weight:700;color:#1d4ed8;">{roi}</td>
   <td style="padding:10px 14px;text-align:right;font-weight:700;color:#15803d;">{gem}</td>
-  {image_cells}
 </tr>""")
 
         link_text = f"\n  Buy on eBay: {buy_url}" + (f"\n  PriceCharting: {url}" if url else "")
         rows_plain.append(
             f"#{rank} {name} | {set_name}\n"
-            f"  Raw: {raw}  PSA9: {psa9}  PSA10: {psa10}  Profit: {roi}  Gem Rate: {gem}"
+            f"  Raw: {raw}  PSA9: {psa9}  PSA10: {psa10}  Gem Rate: {gem}"
             f"{image_plain}{link_text}"
         )
 
-    image_headers = ""
     image_footer = ""
     if has_image_analysis:
-        image_headers = (
-            '<th style="padding:10px 14px;text-align:right;">Predicted Grade</th>'
-            '<th style="padding:10px 14px;text-align:right;">PSA 9+ Probability</th>'
-        )
         image_footer = " Cards shown passed eBay photo analysis (Claude Vision)."
 
     table_rows = "\n".join(rows_html)
@@ -262,9 +236,7 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
       <th style="padding:10px 14px;text-align:right;">{"Buy Price (eBay)" if has_image_analysis else "Raw (Ungraded)"}</th>
       <th style="padding:10px 14px;text-align:right;">PSA 9</th>
       <th style="padding:10px 14px;text-align:right;">PSA 10</th>
-      <th style="padding:10px 14px;text-align:right;">Profit %</th>
       <th style="padding:10px 14px;text-align:right;">Gem Rate (gem / total)</th>
-      {image_headers}
     </tr>
   </thead>
   <tbody>
@@ -272,7 +244,7 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
   </tbody>
 </table>
 <p style="font-size:12px;color:#94a3b8;margin-top:24px;">
-  Profit % = ROI after $25 grading fee. Gem Rate = % of all PSA submissions that came back 9 or 10 (gem count / total graded). BE ≤ X% = breakeven if at least X% grade gem.{image_footer}
+  Gem Rate = % of all PSA submissions that came back 9 or 10 (gem count / total graded). BE ≤ X% = breakeven if at least X% grade gem.{image_footer}
 </p>
 </body></html>"""
 
@@ -314,7 +286,7 @@ def send_email(html_body: str, plain_body: str, subject: str) -> bool:
         return False
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────────────────────
 
 def run(
     target_sets: str = "data/target_sets.csv",
@@ -492,7 +464,7 @@ def run(
         else:
             print("  GOOGLE_SPREADSHEET_ID not set — skipping Sheets output.")
 
-    # Apply the same filters that format_email_body does, so subject line count matches body
+    # Apply the same dedup that format_email_body does, so subject line count matches body
     if "ebay_listing_url" in final.columns:
         final = final[final["ebay_listing_url"].notna() & (final["ebay_listing_url"] != "")].copy()
     final = final.drop_duplicates(subset=["card_name", "set_name"], keep="first").copy()
@@ -548,9 +520,9 @@ if __name__ == "__main__":
     parser.add_argument("--min-graded-price", type=float, default=60.0,
                         help="Min PSA 9 or PSA 10 price to include a card (default: $60)")
     parser.add_argument("--min-roi", type=float, default=0.10,
-                        help="Min ROI after grading fee (default: 0.10 = 10%%%)")
+                        help="Min ROI after grading fee (default: 0.10 = 10%%%%)")
     parser.add_argument("--min-gem-rate", type=float, default=0.50,
-                        help="Min gem rate to surface a card (default: 0.35 = 35%%%)")
+                        help="Min gem rate to surface a card (default: 0.35 = 35%%%%)")
     args = parser.parse_args()
 
     sets_list = [s.strip() for s in args.sets.split(",")] if args.sets else None
