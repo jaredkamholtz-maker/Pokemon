@@ -11,7 +11,7 @@ Steps:
      Filter: gem rate >= 35% AND ROI >= 10% after $25 grading fee
   6. analyze_card_images: find cheapest eBay raw listing per top-20 card, analyze photos
      with Claude Vision, keep only SUBMIT cards
-  7. Email final shortlist: card, raw price, PSA 9/10, gem rate
+  7. Email final shortlist: card, raw price, PSA 9/10, profit %, gem rate, predicted grade
 
 Usage:
     python execution/run_analysis.py
@@ -53,7 +53,7 @@ OUTPUT_PATH = ".tmp/flip_opportunities.csv"
 SHORTLIST_PATH = ".tmp/final_shortlist.csv"
 
 
-# ── Google Sheets ──────────────────────────────────────────────────────────────────────────────
+# ── Google Sheets ───────────────────────────────────────────────────────────────────────────────
 
 def push_to_google_sheets(df: pd.DataFrame, spreadsheet_id: str, tab_name: str) -> str | None:
     try:
@@ -94,7 +94,7 @@ def push_to_google_sheets(df: pd.DataFrame, spreadsheet_id: str, tab_name: str) 
         return None
 
 
-# ── Email ────────────────────────────────────────────────────────────────────────────
+# ── Email ──────────────────────────────────────────────────────────────────────────
 
 def _fmt_price(val) -> str:
     try:
@@ -170,6 +170,14 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
             gem = f"BE ≤ {_fmt_pct(be)}" if pd.notna(be) and be == be else "No data"
         else:
             gem = "—"
+        # Profit %: use ROI if available, else label as breakeven opportunity
+        roi_val = row.get("roi")
+        if pd.notna(roi_val) and roi_val == roi_val:
+            roi = _fmt_pct(roi_val)
+        elif is_breakeven:
+            roi = "breakeven play"
+        else:
+            roi = "—"
         url = row.get("source_url") or ""
         _ebay_raw = row.get("ebay_listing_url")
         ebay_listing_url = str(_ebay_raw) if pd.notna(_ebay_raw) and _ebay_raw else ""
@@ -186,6 +194,8 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         buy_url = ebay_listing_url or ebay_search_url
 
         # Image analysis columns (only present when step 6 ran)
+        pred_grade = row.get("predicted_grade")
+        psa9p = row.get("psa9_or_better_probability")
         _notes_raw = row.get("notes")
         notes = str(_notes_raw) if pd.notna(_notes_raw) and _notes_raw else ""
 
@@ -298,10 +308,10 @@ def run(
     skip_images: bool = False,
     skip_sheets: bool = False,
     skip_email: bool = False,
-    min_graded_price: float = 60.0,
+    min_graded_price: float = 50.0,
     min_roi: float = 0.10,
     min_gem_rate: float = 0.35,
-    image_top_n: int = 5,
+    image_top_n: int = 10,
 ):
     load_dotenv()
     today = date.today().isoformat()
@@ -355,7 +365,7 @@ def run(
         prices_mod.run(input_path=FILTERED_PATH, output_path=PRICES_PATH)
 
     prices_df = pd.read_csv(PRICES_PATH)
-    # Apply the PSA > $60 price filter
+    # Apply the PSA > $50 price filter
     has_graded = (
         (prices_df["psa10_price"].notna() & (prices_df["psa10_price"] > min_graded_price)) |
         (prices_df["psa9_price"].notna() & (prices_df["psa9_price"] > min_graded_price))
@@ -393,8 +403,8 @@ def run(
     track1["track"] = "population"
 
     # Track 2: no population data, but spread is so good breakeven is very low
-    # Surface cards where you'd break even needing < 15% gem rate — attractive even blind
-    max_breakeven = float(os.environ.get("MAX_BREAKEVEN_GEM_RATE") or 0.15)
+    # Surface cards where you'd break even needing < 20% gem rate — attractive even blind
+    max_breakeven = float(os.environ.get("MAX_BREAKEVEN_GEM_RATE") or 0.20)
     has_breakeven = ("breakeven_gem_rate" in df.columns) and df["breakeven_gem_rate"].notna()
     track2 = df[
         has_breakeven &
@@ -513,16 +523,16 @@ if __name__ == "__main__":
                         help="Reuse last tcgplayer_prices.csv (skip PriceCharting fetch)")
     parser.add_argument("--skip-images", action="store_true",
                         help="Skip eBay image analysis step (faster, no Claude Vision credits)")
-    parser.add_argument("--image-top-n", type=int, default=20,
-                        help="Number of top cards to analyze with Claude Vision (default: 20)")
+    parser.add_argument("--image-top-n", type=int, default=10,
+                        help="Number of top cards to analyze with Claude Vision (default: 10)")
     parser.add_argument("--skip-sheets", action="store_true")
     parser.add_argument("--skip-email", action="store_true")
-    parser.add_argument("--min-graded-price", type=float, default=60.0,
-                        help="Min PSA 9 or PSA 10 price to include a card (default: $60)")
+    parser.add_argument("--min-graded-price", type=float, default=50.0,
+                        help="Min PSA 9 or PSA 10 price to include a card (default: $50)")
     parser.add_argument("--min-roi", type=float, default=0.10,
-                        help="Min ROI after grading fee (default: 0.10 = 10%%%%)")
+                        help="Min ROI after grading fee (default: 0.10 = 10%%%)")
     parser.add_argument("--min-gem-rate", type=float, default=0.50,
-                        help="Min gem rate to surface a card (default: 0.35 = 35%%%%)")
+                        help="Min gem rate to surface a card (default: 0.35 = 35%%%)")
     args = parser.parse_args()
 
     sets_list = [s.strip() for s in args.sets.split(",")] if args.sets else None
