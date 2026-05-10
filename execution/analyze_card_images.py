@@ -160,7 +160,9 @@ REFERENCE_INTRO = (
 )
 
 # Red flags that auto-disqualify a listing
-_CRITICAL_FLAGS = {"stock_photo_suspected", "fake_indicators", "altered_appearance", "inconsistent_card"}
+# inconsistent_card is intentionally soft — title filters catch wrong-item listings
+# before image analysis; here it's a warning note, not a hard block.
+_CRITICAL_FLAGS = {"stock_photo_suspected", "fake_indicators", "altered_appearance"}
 
 
 def _fetch_reference_image(token: str) -> str | None:
