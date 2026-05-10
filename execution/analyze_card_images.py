@@ -158,7 +158,7 @@ REFERENCE_INTRO = (
 )
 
 # Red flags that auto-disqualify a listing
-_CRITICAL_FLAGS = {"stock_photo_suspected", "fake_indicators", "altered_appearance"}
+_CRITICAL_FLAGS = {"stock_photo_suspected", "fake_indicators", "altered_appearance", "inconsistent_card"}
 
 
 def _fetch_reference_image(token: str) -> str | None:
@@ -228,6 +228,7 @@ def _is_multi_card_listing(title: str) -> bool:
         "pick your", "you pick", "your pick", "pick a card",
         "choose your", "choose a card", "your choice",
         "lot of", " lot ", "bundle", "set of", "complete set", "full set", "sealed set",
+        "booster box", "booster pack", "sealed box", "display box",
         "x2 ", "x3 ", "x4 ", "x5 ", " x2", " x3", " x4", " x5",
         "2x ", "3x ", "4x ", "5x ",
         "wholesale",
