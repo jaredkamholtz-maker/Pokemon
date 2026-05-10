@@ -403,7 +403,7 @@ def run(
     track1["track"] = "population"
 
     # Track 2: no population data, but spread is so good breakeven is very low
-    # Surface cards where you'd break even needing < 15% gem rate — attractive even blind
+    # Surface cards where you'd break even needing < 20% gem rate — attractive even blind
     max_breakeven = float(os.environ.get("MAX_BREAKEVEN_GEM_RATE") or 0.20)
     has_breakeven = ("breakeven_gem_rate" in df.columns) and df["breakeven_gem_rate"].notna()
     track2 = df[
@@ -523,12 +523,12 @@ if __name__ == "__main__":
                         help="Reuse last tcgplayer_prices.csv (skip PriceCharting fetch)")
     parser.add_argument("--skip-images", action="store_true",
                         help="Skip eBay image analysis step (faster, no Claude Vision credits)")
-    parser.add_argument("--image-top-n", type=int, default=20,
-                        help="Number of top cards to analyze with Claude Vision (default: 20)")
+    parser.add_argument("--image-top-n", type=int, default=10,
+                        help="Number of top cards to analyze with Claude Vision (default: 10)")
     parser.add_argument("--skip-sheets", action="store_true")
     parser.add_argument("--skip-email", action="store_true")
-    parser.add_argument("--min-graded-price", type=float, default=60.0,
-                        help="Min PSA 9 or PSA 10 price to include a card (default: $60)")
+    parser.add_argument("--min-graded-price", type=float, default=50.0,
+                        help="Min PSA 9 or PSA 10 price to include a card (default: $50)")
     parser.add_argument("--min-roi", type=float, default=0.10,
                         help="Min ROI after grading fee (default: 0.10 = 10%%%)")
     parser.add_argument("--min-gem-rate", type=float, default=0.50,
