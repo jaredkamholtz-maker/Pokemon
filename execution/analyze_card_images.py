@@ -107,7 +107,7 @@ GRADING RULES:
 - Holo scratches visible at any angle = at most PSA 8 for holo cards
 - Be skeptical of stock-looking photos — many eBay sellers use database images
 
-ASSESS THE FOLLOWING. For each dimension, provide a rating, a confidence score 0.0–1.0 based on photo quality for THAT dimension, and specific observations. If photo quality prevents assessment, set rating to "unknown" and confidence to 0.0. Do not guess.
+ASSESS THE FOLLOWING. For each dimension, provide a rating, a confidence score 0.0–1.0 based on photo quality for THAT dimension, and specific observations. Keep notes concise (1 sentence max per dimension). If photo quality prevents assessment, set rating to "unknown" and confidence to 0.0. Do not guess.
 
 DIMENSIONS:
 1. centering_front: measure border widths and estimate ratio like "55/45 L/R, 50/50 T/B"
@@ -123,7 +123,7 @@ DIMENSIONS:
 PREDICTED GRADE RANGE:
 Based strictly on the PSA standards above, give the range this card would likely receive at PSA. Low = pessimistic outcome, High = optimistic outcome. Use 0 for both if ungradeable (creases, bends, water damage).
 
-RED FLAGS — check each and report true/false with reasoning:
+RED FLAGS — check each and report true/false with reasoning (1 sentence max):
 - stock_photo_suspected: photos look like generic/database images, not this specific card being sold by this seller
 - back_not_shown: no clear photo of card back
 - glare_obscures_detail: critical areas hidden by reflection
@@ -579,7 +579,7 @@ def analyze_image(card_name: str, set_name: str, card_number: str, image_b64: st
         client = Anthropic(api_key=api_key)
         response = client.messages.create(
             model=MODEL,
-            max_tokens=1024,
+            max_tokens=2048,
             messages=[{"role": "user", "content": content}],
         )
         raw       = response.content[0].text.strip()
