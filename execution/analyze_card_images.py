@@ -57,9 +57,11 @@ RATE_DELAY = 0.5
 MODEL = "claude-sonnet-4-6"
 
 # eBay listing used as a visual reference for PSA 10 card quality and photo quality.
-# Set REFERENCE_LISTING_URL in .env to override. Image is cached in .tmp/reference_card.jpg.
+# Override via REFERENCE_LISTING_ITEM_ID or REFERENCE_IMAGE_URL in .env / GitHub secrets.
+# Committed fallback: data/reference_card.jpg (never regenerated, always available in CI).
 REFERENCE_ITEM_ID = "397923543088"
 REFERENCE_CACHE   = Path(".tmp/reference_card.jpg")
+REFERENCE_COMMITTED = Path("data/reference_card.jpg")
 
 GRADING_PROMPT = """You are a strict PSA card grader analyzing seller photos from an eBay listing. Apply the OFFICIAL PSA grading standards exactly as written below. Be conservative — most cards do not reach PSA 9 or 10. Do not give the benefit of the doubt when a defect is visible.
 
@@ -163,14 +165,31 @@ _CRITICAL_FLAGS = {"stock_photo_suspected", "fake_indicators", "altered_appearan
 
 def _fetch_reference_image(token: str) -> str | None:
     """
-    Fetch the reference listing image via Browse API getItem, cache it locally.
-    Returns base64-encoded JPEG, or None if unavailable.
+    Load the grading reference image. Priority order:
+      1. data/reference_card.jpg  — committed to repo, always available in CI
+      2. .tmp/reference_card.jpg  — session cache from a previous successful fetch
+      3. REFERENCE_IMAGE_URL env var — direct URL to any stable image
+      4. eBay Browse API using REFERENCE_LISTING_ITEM_ID / REFERENCE_ITEM_ID
+    On a successful remote fetch the image is written to both cache paths.
     """
-    if REFERENCE_CACHE.exists():
+    for path in (REFERENCE_COMMITTED, REFERENCE_CACHE):
+        if path.exists():
+            try:
+                return base64.standard_b64encode(path.read_bytes()).decode()
+            except Exception:
+                pass
+
+    direct_url = os.environ.get("REFERENCE_IMAGE_URL")
+    if direct_url:
         try:
-            return base64.standard_b64encode(REFERENCE_CACHE.read_bytes()).decode()
-        except Exception:
-            pass
+            resp = _SESSION.get(direct_url, timeout=20)
+            if resp and resp.status_code == 200 and resp.content:
+                for path in (REFERENCE_COMMITTED, REFERENCE_CACHE):
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(resp.content)
+                return base64.standard_b64encode(resp.content).decode()
+        except Exception as e:
+            print(f"  (REFERENCE_IMAGE_URL fetch failed: {e})")
 
     item_id = os.environ.get("REFERENCE_LISTING_ITEM_ID", REFERENCE_ITEM_ID)
     try:
@@ -188,8 +207,9 @@ def _fetch_reference_image(token: str) -> str | None:
             return None
         img_resp = _SESSION.get(_upgrade_ebay_image_url(image_url), timeout=20)
         if img_resp and img_resp.status_code == 200 and img_resp.content:
-            REFERENCE_CACHE.parent.mkdir(parents=True, exist_ok=True)
-            REFERENCE_CACHE.write_bytes(img_resp.content)
+            for path in (REFERENCE_COMMITTED, REFERENCE_CACHE):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(img_resp.content)
             return base64.standard_b64encode(img_resp.content).decode()
     except Exception as e:
         print(f"  (reference image fetch failed: {e})")
@@ -606,12 +626,21 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
     app_id  = os.environ.get("EBAY_APP_ID")
     cert_id = os.environ.get("EBAY_CERT_ID")
     reference_b64: str | None = None
-    if app_id and cert_id:
-        ref_token = _get_browse_token(app_id, cert_id)
-        if ref_token:
-            reference_b64 = _fetch_reference_image(ref_token)
-            status = "cached" if REFERENCE_CACHE.exists() else "fetched"
-            print(f"Reference image {'loaded (' + status + ')' if reference_b64 else 'unavailable — grading without reference'}\n")
+    ref_token = _get_browse_token(app_id, cert_id) if (app_id and cert_id) else None
+    reference_b64 = _fetch_reference_image(ref_token or "")
+    if reference_b64:
+        if REFERENCE_COMMITTED.exists():
+            src = "committed (data/reference_card.jpg)"
+        elif REFERENCE_CACHE.exists():
+            src = "cached (.tmp/)"
+        elif os.environ.get("REFERENCE_IMAGE_URL"):
+            src = "REFERENCE_IMAGE_URL"
+        else:
+            src = "eBay API"
+        print(f"Reference image loaded ({src})\n")
+    else:
+        print("Reference image unavailable — grading without reference\n"
+              "  Fix: add REFERENCE_IMAGE_URL secret, or commit data/reference_card.jpg\n")
 
     rows = []
     for rank, (_, card) in enumerate(candidates.iterrows(), 1):
