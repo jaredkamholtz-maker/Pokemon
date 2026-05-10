@@ -52,7 +52,6 @@ OUTPUT_SHORTLIST = Path(".tmp/final_shortlist.csv")
 
 MAX_LISTINGS = 5        # analyze the top 5 most expensive ungraded listings
 BROWSE_LIMIT = 50       # how many results to fetch from Browse API before filtering
-MAX_PRICE    = 500.0    # ignore listings above this price (outliers / special editions)
 RATE_DELAY = 0.5
 MODEL = "claude-sonnet-4-6"
 
@@ -338,7 +337,7 @@ def _get_browse_token(client_id: str, client_secret: str) -> str | None:
     return None
 
 
-def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
+def search_ebay_listings(card_name: str, set_name: str, card_number: str = "") -> list[dict]:
     load_dotenv()
     app_id  = os.environ.get("EBAY_APP_ID")
     cert_id = os.environ.get("EBAY_CERT_ID")
@@ -397,7 +396,7 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
             "https://api.ebay.com/buy/browse/v1/item_summary/search",
             headers={"Authorization": f"Bearer {token}",
                      "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"},
-            params={"q": f"{card_name} {set_name} pokemon",
+            params={"q": f"{card_name} {set_name} {card_number} pokemon",
                     "sort": "-price",
                     "limit": str(BROWSE_LIMIT)},
             timeout=20,
@@ -420,11 +419,7 @@ def search_ebay_listings(card_name: str, set_name: str) -> list[dict]:
             print("(0 candidates after all filters)", end=" ", flush=True)
             return []
 
-        # Cap at MAX_PRICE, then sort by price descending
-        candidates = [c for c in candidates if c["price"] <= MAX_PRICE]
-        if not candidates:
-            print(f"(0 candidates under ${MAX_PRICE:.0f})", end=" ", flush=True)
-            return []
+        # Sort by price descending — most expensive raw listings tend to be better condition
         candidates.sort(key=lambda c: -c["price"])
         return candidates[:MAX_LISTINGS]
     except Exception as e:
@@ -630,7 +625,7 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
     If a non-disqualified listing is found, that takes priority.
     If a SUBMIT listing is found, that wins.
     """
-    # Cheapest listing is always the fallback — it's already filtered for
+    # Most expensive listing is the default — already filtered for
     # graded/lot/multi-card titles, so it's a real single-card listing
     best_listing  = listings[0]
     best_analysis: dict = {"recommendation": "SKIP", "notes": "photo unverified"}
@@ -745,7 +740,7 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
 
         print(f"  Searching eBay...", end=" ", flush=True)
         time.sleep(RATE_DELAY)
-        listings = search_ebay_listings(card_name, set_name)
+        listings = search_ebay_listings(card_name, set_name, card_number)
 
         if not listings:
             result["error"] = "No eBay listings found"
