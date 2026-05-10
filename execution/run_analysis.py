@@ -5,12 +5,11 @@ Steps:
   1. discover_cards: query Pokemon TCG API for all cards in target sets (~3,000 cards)
   2. filter_cards_ai: Claude Haiku pre-filter → holos, full arts, chase rares (~400-600)
   3. fetch_ebay_prices: get raw + PSA 9 + PSA 10 prices from eBay completed sales
-     Filter: PSA 9 or PSA 10 > $60 (configurable MIN_GRADED_PRICE)
+     Filter: raw_price < PSA 9 price (positive grading spread exists)
   4. scrape_pokedata_population: get PSA submission counts and gem rate from 130point.com
-  5. calculate_flip_ev: merge prices + population, calculate ROI
-     Filter: gem rate >= 35% AND ROI >= 10% after $25 grading fee
-  6. analyze_card_images: find cheapest eBay raw listing per top-20 card, analyze photos
-     with Claude Vision, keep only SUBMIT cards
+  5. calculate_flip_ev: merge prices + population, calculate ROI (informational only)
+  6. analyze_card_images: find cheapest eBay raw listing per card, analyze photos
+     with Claude Vision — this is the primary quality filter
   7. Email final shortlist: card, raw price, PSA 9/10, profit %, gem rate, predicted grade
 
 Usage:
@@ -119,14 +118,14 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         count_summary = (f"<strong>{len(opportunities)}</strong> cards passed all filters "
                          f"including eBay photo analysis (Claude Vision)")
     else:
-        count_summary = f"<strong>{len(opportunities)}</strong> cards with PSA gem rate ≥ 35% and ROI ≥ 10%"
+        count_summary = f"<strong>{len(opportunities)}</strong> cards with a positive grading spread"
 
     if opportunities.empty:
         html = f"""<html><body style="font-family:sans-serif;color:#222;">
 <h2>{subject_line}</h2>
-<p>No cards met the criteria today (PSA 9/10 &gt; $60, gem rate ≥ 35%, ROI ≥ 10%).</p>
+<p>No cards passed image analysis today.</p>
 </body></html>"""
-        plain = f"{subject_line}\n\nNo cards met the criteria today."
+        plain = f"{subject_line}\n\nNo cards passed image analysis today."
         return html, plain
 
     # Only include cards with a specific listing URL — skip generic "Find on eBay" cards
@@ -308,10 +307,6 @@ def run(
     skip_images: bool = False,
     skip_sheets: bool = False,
     skip_email: bool = False,
-    min_graded_price: float = 50.0,
-    min_roi: float = 0.10,
-    min_gem_rate: float = 0.35,
-    image_top_n: int = 10,
 ):
     load_dotenv()
     today = date.today().isoformat()
@@ -365,14 +360,17 @@ def run(
         prices_mod.run(input_path=FILTERED_PATH, output_path=PRICES_PATH)
 
     prices_df = pd.read_csv(PRICES_PATH)
-    # Apply the PSA > $60 price filter
-    has_graded = (
-        (prices_df["psa10_price"].notna() & (prices_df["psa10_price"] > min_graded_price)) |
-        (prices_df["psa9_price"].notna() & (prices_df["psa9_price"] > min_graded_price))
+    # Keep only cards where raw price is below PSA 9 or PSA 10 price — a grading spread exists
+    has_spread = (
+        prices_df["raw_price"].notna() &
+        (
+            (prices_df["psa9_price"].notna() & (prices_df["psa9_price"] > prices_df["raw_price"])) |
+            (prices_df["psa10_price"].notna() & (prices_df["psa10_price"] > prices_df["raw_price"]))
+        )
     )
-    prices_df = prices_df[has_graded & prices_df["raw_price"].notna()]
+    prices_df = prices_df[has_spread]
     prices_df.to_csv(PRICES_PATH, index=False)
-    print(f"  → {len(prices_df)} cards with PSA 9/10 > ${min_graded_price:.0f}\n")
+    print(f"  → {len(prices_df)} cards with a positive grading spread (raw < PSA 9/10)\n")
 
     if prices_df.empty:
         print("No cards passed the price filter — nothing to analyze.")
@@ -389,28 +387,18 @@ def run(
     pop_empty.to_csv(POP_PATH, index=False)
     print()
 
-    # Step 5: Calculate EV
+    # Step 5: Calculate EV (informational — image analysis is the real filter)
     print(f"[5/6] Calculating flip EV...")
-    df = ev_mod.run(grading_fee=grading_fee, min_roi=min_roi)
+    df = ev_mod.run(grading_fee=grading_fee)
 
-    # Track 1: population data available — gem rate >= 50% AND roi >= 10%
+    # Track 1: population data available — include all, sorted by ROI
     has_pop = df["gem_rate"].notna() & df["roi"].notna()
-    track1 = df[
-        has_pop &
-        (df["gem_rate"] >= min_gem_rate) &
-        (df["roi"] >= min_roi)
-    ].copy()
+    track1 = df[has_pop].copy()
     track1["track"] = "population"
 
-    # Track 2: no population data, but spread is so good breakeven is very low
-    # Surface cards where you'd break even needing < 20% gem rate — attractive even blind
-    max_breakeven = float(os.environ.get("MAX_BREAKEVEN_GEM_RATE") or 0.20)
-    has_breakeven = ("breakeven_gem_rate" in df.columns) and df["breakeven_gem_rate"].notna()
-    track2 = df[
-        has_breakeven &
-        ~has_pop &
-        (df["breakeven_gem_rate"] <= max_breakeven)
-    ].copy()
+    # Track 2: no population data but a grading spread exists — include all
+    has_breakeven = ("breakeven_gem_rate" in df.columns) & df["breakeven_gem_rate"].notna()
+    track2 = df[has_breakeven & ~has_pop].copy()
     track2["track"] = "breakeven"
 
     opportunities = pd.concat([track1, track2], ignore_index=True)
@@ -424,14 +412,14 @@ def run(
         subset=["card_name", "set_name", "card_number"], keep="first"
     ).reset_index(drop=True)
 
-    # Save filtered results
+    # Save for image analysis step
     Path(OUTPUT_PATH).parent.mkdir(parents=True, exist_ok=True)
     opportunities.to_csv(OUTPUT_PATH, index=False)
 
     print(f"\n{'='*60}")
-    print(f"{len(track1)} Track-1 cards (gem rate ≥ {min_gem_rate*100:.0f}%, ROI ≥ {min_roi*100:.0f}%)")
-    print(f"{len(track2)} Track-2 cards (breakeven gem rate ≤ {max_breakeven*100:.0f}%, no pop data)")
-    print(f"{len(opportunities)} total opportunities out of {len(prices_df)} price candidates")
+    print(f"{len(track1)} Track-1 cards (population data, sorted by ROI)")
+    print(f"{len(track2)} Track-2 cards (no pop data, positive spread)")
+    print(f"{len(opportunities)} total opportunities → all go to image analysis")
     print(f"{'='*60}\n")
 
     # Step 6: eBay image analysis (final filter on top N)
@@ -446,8 +434,9 @@ def run(
         wait_s = 120 if len(opportunities) > 20 else 30
         print(f"[6/6] Waiting {wait_s}s for eBay API rate limit to clear after step 3...")
         _time.sleep(wait_s)
-        print(f"[6/6] Analyzing eBay listing photos (top {image_top_n} cards, Claude Vision)...")
-        shortlist = images_mod.run(input_path=OUTPUT_PATH, top_n=image_top_n)
+        n_opps = len(opportunities)
+        print(f"[6/6] Analyzing eBay listing photos ({n_opps} cards, Claude Vision)...")
+        shortlist = images_mod.run(input_path=OUTPUT_PATH, top_n=n_opps)
 
         analysis_csv = Path(".tmp/image_analysis.csv")
         if shortlist is not None and not shortlist.empty:
@@ -523,16 +512,8 @@ if __name__ == "__main__":
                         help="Reuse last tcgplayer_prices.csv (skip PriceCharting fetch)")
     parser.add_argument("--skip-images", action="store_true",
                         help="Skip eBay image analysis step (faster, no Claude Vision credits)")
-    parser.add_argument("--image-top-n", type=int, default=10,
-                        help="Number of top cards to analyze with Claude Vision (default: 10)")
     parser.add_argument("--skip-sheets", action="store_true")
     parser.add_argument("--skip-email", action="store_true")
-    parser.add_argument("--min-graded-price", type=float, default=50.0,
-                        help="Min PSA 9 or PSA 10 price to include a card (default: $50)")
-    parser.add_argument("--min-roi", type=float, default=0.10,
-                        help="Min ROI after grading fee (default: 0.10 = 10%%%)")
-    parser.add_argument("--min-gem-rate", type=float, default=0.50,
-                        help="Min gem rate to surface a card (default: 0.35 = 35%%%)")
     args = parser.parse_args()
 
     sets_list = [s.strip() for s in args.sets.split(",")] if args.sets else None
@@ -546,8 +527,4 @@ if __name__ == "__main__":
         skip_images=args.skip_images,
         skip_sheets=args.skip_sheets,
         skip_email=args.skip_email,
-        min_graded_price=args.min_graded_price,
-        min_roi=args.min_roi,
-        min_gem_rate=args.min_gem_rate,
-        image_top_n=args.image_top_n,
     )

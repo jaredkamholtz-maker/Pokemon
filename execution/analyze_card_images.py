@@ -302,7 +302,8 @@ def _is_graded_title(title: str) -> bool:
     t = title.lower()
     return any(kw in t for kw in [
         "psa ", "psa-", "psa9", "psa10", "psa8", "psa7", "psa6",
-        "bgs ", "cgc ", "sgc ", "graded", "gem mint",
+        "bgs ", "cgc ", "sgc ", "hga ", "aog ", "mnt ", "tag ",
+        "graded", "gem mint",
         "mint 10", "mint 9", "mint 8", "mint 7",
         "grade 10", "grade 9", "grade 8", "grade 7",
     ])
