@@ -181,6 +181,9 @@ REFERENCE_INTRO_NO_DAMAGED = (
 # before image analysis; here it's a warning note, not a hard block.
 _CRITICAL_FLAGS = {"stock_photo_suspected", "fake_indicators", "altered_appearance"}
 
+# Set of eBay item IDs that must never appear as candidates (our negative reference cards)
+_BLOCKED_ITEM_IDS = set(DAMAGED_EXAMPLE_ITEM_IDS)
+
 
 def _fetch_reference_image(token: str) -> str | None:
     """
@@ -360,10 +363,15 @@ def search_ebay_listings(card_name: str, set_name: str, card_number: str = "") -
         out = []
         graded_n = multi_n = no_url_n = 0
         for item in items:
-            title = item.get("title", "")
-            url   = item.get("itemWebUrl", "")
+            title   = item.get("title", "")
+            url     = item.get("itemWebUrl", "")
+            item_id = str(item.get("itemId", ""))
             if not url:
                 no_url_n += 1
+                continue
+            # Never surface our own negative reference examples as candidates
+            if item_id in _BLOCKED_ITEM_IDS:
+                graded_n += 1
                 continue
             if _is_graded_title(title):
                 graded_n += 1
@@ -513,9 +521,16 @@ def _derive_from_analysis(parsed: dict) -> dict:
     else:
         prob = 0
 
-    # Soft flag: back not shown → halve probability
+    # No back photo → can't verify card condition; auto-disqualify
     if isinstance(red_flags.get("back_not_shown"), dict) and red_flags["back_not_shown"].get("flag"):
-        prob = prob // 2
+        return {
+            "recommendation": "SKIP",
+            "predicted_grade": predicted_grade,
+            "psa9_or_better_probability": 0,
+            "photo_quality": photo_quality,
+            "notes": "Back not shown — cannot verify card condition",
+            "red_flags_active": "back_not_shown",
+        }
 
     soft_flags = [f for f, info in red_flags.items()
                   if f not in _CRITICAL_FLAGS
@@ -525,7 +540,7 @@ def _derive_from_analysis(parsed: dict) -> dict:
     notes   = (f"⚠️ {', '.join(soft_flags)}. " if soft_flags else "") + summary
 
     return {
-        "recommendation":           "SUBMIT" if grade_high >= 9 and prob >= 30 else "SKIP",
+        "recommendation":           "SUBMIT" if grade_high >= 9 and prob >= 50 else "SKIP",
         "predicted_grade":          predicted_grade,
         "psa9_or_better_probability": prob,
         "photo_quality":            photo_quality,
