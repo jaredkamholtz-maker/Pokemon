@@ -471,8 +471,8 @@ def run(
         if dropped:
             print(f"  Dropped {dropped} card(s) whose actual listing price left no margin after grading fee.")
 
-    # Email
-    if not skip_email:
+    # Email — only send if there are actual opportunities
+    if not skip_email and not final.empty:
         html_body, plain_body = format_email_body(final, today, has_image_analysis=has_image_analysis)
         subject = f"Your {date.today().strftime('%m/%d')} Pokenalysis: {len(final)} Opportunit{'y' if len(final) == 1 else 'ies'} Found"
         send_email(html_body, plain_body, subject)
