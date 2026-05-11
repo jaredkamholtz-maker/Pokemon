@@ -257,7 +257,9 @@ def _is_multi_card_listing(title: str) -> bool:
     return any(kw in t for kw in [
         "pick your", "you pick", "your pick", "pick a card",
         "choose your", "choose a card", "your choice",
-        "lot of", " lot ", "bundle", "set of", "complete set", "full set", "sealed set",
+        "lot of", " lot ", "bundle", "set of", "complete set", "full set", "sealed set", "master set",
+        " + ",
+        "holo/reverse holo", "holo/reverse",
         "booster box", "booster pack", "sealed box", "display box",
         "elite trainer", " etb", "etb ",
         "collection box", "collection set", "premium collection", "special collection",
