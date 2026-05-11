@@ -343,29 +343,40 @@ def search_ebay_listings(card_name: str, set_name: str, card_number: str = "") -
             print(f"(graded={graded_n} lot={multi_n} no_url={no_url_n} raw={len(out)})", end=" ", flush=True)
         return out
 
-    try:
-        resp = _SESSION.get(
-            "https://api.ebay.com/buy/browse/v1/item_summary/search",
-            headers={"Authorization": f"Bearer {token}",
-                     "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"},
-            params={"q": f"{card_name} {set_name} {card_number} pokemon",
-                    "sort": "-price",
-                    "limit": str(BROWSE_LIMIT)},
-            timeout=20,
-        )
-        if not resp or resp.status_code != 200:
-            print(f"(Browse API HTTP {resp and resp.status_code})", end=" ", flush=True)
+    def _search(query: str) -> list:
+        try:
+            resp = _SESSION.get(
+                "https://api.ebay.com/buy/browse/v1/item_summary/search",
+                headers={"Authorization": f"Bearer {token}",
+                         "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"},
+                params={"q": query, "sort": "-price", "limit": str(BROWSE_LIMIT)},
+                timeout=20,
+            )
+            if not resp or resp.status_code != 200:
+                print(f"(Browse API HTTP {resp and resp.status_code})", end=" ", flush=True)
+                return []
+            return resp.json().get("itemSummaries", [])
+        except Exception as e:
+            print(f"  Browse API error: {e}")
             return []
 
-        items = resp.json().get("itemSummaries", [])
+    try:
+        # First pass: include card number to narrow results for common Pokémon names
+        query = f"{card_name} {set_name} {card_number} pokemon".strip()
+        items = _search(query)
         print(f"(API={len(items)})", end=" ", flush=True)
 
         candidates = _parse_items(items, strict=True)
-
-        # Fallback: relax lot filter if strict pass found nothing
         if not candidates:
-            print("(fallback: relaxing lot filter)", end=" ", flush=True)
             candidates = _parse_items(items, strict=False)
+
+        # Fallback: drop card number if first pass found nothing
+        if not candidates and card_number:
+            print("(fallback: dropping card number)", end=" ", flush=True)
+            items = _search(f"{card_name} {set_name} pokemon")
+            candidates = _parse_items(items, strict=True)
+            if not candidates:
+                candidates = _parse_items(items, strict=False)
 
         if not candidates:
             print("(0 candidates after all filters)", end=" ", flush=True)
