@@ -355,8 +355,7 @@ def run(
         n = len(pd.read_csv(PRICES_PATH))
         print(f"[3/6] Reusing {n} price records from {PRICES_PATH}")
     else:
-        print(f"[3/6] Fetching eBay sold prices ({len(filtered_df)} cards, "
-              f"PSA 9/10 > ${min_graded_price:.0f})...")
+        print(f"[3/6] Fetching eBay sold prices ({len(filtered_df)} cards)...")
         prices_mod.run(input_path=FILTERED_PATH, output_path=PRICES_PATH)
 
     prices_df = pd.read_csv(PRICES_PATH)
