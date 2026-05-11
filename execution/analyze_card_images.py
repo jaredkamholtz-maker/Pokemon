@@ -495,7 +495,7 @@ def _derive_from_analysis(parsed: dict) -> dict:
     notes   = (f"⚠️ {', '.join(soft_flags)}. " if soft_flags else "") + summary
 
     return {
-        "recommendation":           "SUBMIT" if grade_high >= 9 and prob >= 50 else "SKIP",
+        "recommendation":           "SUBMIT" if grade_high >= 9 and prob >= 35 else "SKIP",
         "predicted_grade":          predicted_grade,
         "psa9_or_better_probability": prob,
         "photo_quality":            photo_quality,
