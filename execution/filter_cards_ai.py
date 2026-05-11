@@ -20,6 +20,7 @@ Usage:
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -80,27 +81,34 @@ def filter_cards(df: pd.DataFrame) -> pd.DataFrame:
             for i, (_, row) in enumerate(batch_rows.iterrows())
         )
 
-        try:
-            response = client.messages.create(
-                model=MODEL,
-                max_tokens=1024,
-                # Cache system prompt across all batches — saves tokens and latency
-                system=[{"type": "text", "text": SYSTEM_PROMPT,
-                          "cache_control": {"type": "ephemeral"}}],
-                messages=[{"role": "user", "content": card_list}],
-            )
-            text = response.content[0].text.strip()
-            bracket_start = text.find("[")
-            bracket_end = text.rfind("]") + 1
-            indices = json.loads(text[bracket_start:bracket_end])
-            valid = [i for i in indices if 0 <= i < len(batch_rows)]
-            for idx in valid:
-                keep_indices.append(batch_df.index[idx])
-            print(f"    Batch {batch_num + 1}/{total_batches}: "
-                  f"kept {len(valid)}/{len(batch_rows)}")
-        except Exception as e:
-            # On any error, keep the whole batch — never silently drop cards
-            print(f"    Batch {batch_num + 1}/{total_batches}: error ({e}) — keeping all")
+        success = False
+        for attempt, backoff in enumerate([0, 15, 30], 1):
+            if backoff:
+                time.sleep(backoff)
+            try:
+                response = client.messages.create(
+                    model=MODEL,
+                    max_tokens=1024,
+                    # Cache system prompt across all batches — saves tokens and latency
+                    system=[{"type": "text", "text": SYSTEM_PROMPT,
+                              "cache_control": {"type": "ephemeral"}}],
+                    messages=[{"role": "user", "content": card_list}],
+                )
+                text = response.content[0].text.strip()
+                bracket_start = text.find("[")
+                bracket_end = text.rfind("]") + 1
+                indices = json.loads(text[bracket_start:bracket_end])
+                valid = [i for i in indices if 0 <= i < len(batch_rows)]
+                for idx in valid:
+                    keep_indices.append(batch_df.index[idx])
+                print(f"    Batch {batch_num + 1}/{total_batches}: "
+                      f"kept {len(valid)}/{len(batch_rows)}")
+                success = True
+                break
+            except Exception as e:
+                print(f"    Batch {batch_num + 1}/{total_batches}: attempt {attempt} error ({e})"
+                      + (" — retrying" if attempt < 3 else " — keeping all as fallback"))
+        if not success:
             keep_indices.extend(batch_df.index.tolist())
 
     filtered = df.loc[keep_indices].reset_index(drop=True)
