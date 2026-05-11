@@ -1,4 +1,4 @@
-"""
+""" 
 Full pipeline: discover → AI filter → prices → PSA population → EV → image analysis → email
 
 Steps:
@@ -204,13 +204,15 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
             ebay_link = f' <a href="{ebay_search_url}" style="font-size:11px;color:#e67e00;font-weight:600;">[Find on eBay]</a>'
 
         image_plain = ""
+        notes_html = ""
         if has_image_analysis and notes:
             image_plain = f"\n  Note: {notes}"
+            notes_html = f"<br><span style='font-size:11px;color:#9ca3af;font-style:italic;'>{notes}</span>"
 
         rows_html.append(f"""<tr style="border-bottom:1px solid #e5e7eb;">
   <td style="padding:10px 14px;font-weight:500;">{rank}. {card_link}{ebay_link}<br>
     <span style="font-size:12px;color:#6b7280;">{set_name}</span>
-    {{"<br><span style='font-size:11px;color:#9ca3af;font-style:italic;'>" + notes + "</span>" if has_image_analysis and notes else ""}}
+    {notes_html}
   </td>
   <td style="padding:10px 14px;text-align:right;">{raw}</td>
   <td style="padding:10px 14px;text-align:right;">{psa9}</td>
