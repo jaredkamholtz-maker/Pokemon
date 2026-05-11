@@ -354,21 +354,30 @@ def search_ebay_listings(card_name: str, set_name: str, card_number: str = "") -
         return out
 
     def _search(query: str) -> list:
-        try:
-            resp = _SESSION.get(
-                "https://api.ebay.com/buy/browse/v1/item_summary/search",
-                headers={"Authorization": f"Bearer {token}",
-                         "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"},
-                params={"q": query, "sort": "-price", "limit": str(BROWSE_LIMIT)},
-                timeout=20,
-            )
-            if not resp or resp.status_code != 200:
-                print(f"(Browse API HTTP {resp and resp.status_code})", end=" ", flush=True)
+        for wait in [30, 60, 120, None]:
+            try:
+                resp = _SESSION.get(
+                    "https://api.ebay.com/buy/browse/v1/item_summary/search",
+                    headers={"Authorization": f"Bearer {token}",
+                             "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"},
+                    params={"q": query, "sort": "-price", "limit": str(BROWSE_LIMIT)},
+                    timeout=20,
+                )
+                if resp and resp.status_code == 429:
+                    if wait is not None:
+                        print(f"(429 rate-limited, waiting {wait}s...)", end=" ", flush=True)
+                        time.sleep(wait)
+                        continue
+                    print(f"(429 rate-limited, giving up)", end=" ", flush=True)
+                    return []
+                if not resp or resp.status_code != 200:
+                    print(f"(Browse API HTTP {resp and resp.status_code})", end=" ", flush=True)
+                    return []
+                return resp.json().get("itemSummaries", [])
+            except Exception as e:
+                print(f"  Browse API error: {e}")
                 return []
-            return resp.json().get("itemSummaries", [])
-        except Exception as e:
-            print(f"  Browse API error: {e}")
-            return []
+        return []
 
     try:
         # First pass: include card number to narrow results for common Pokémon names
