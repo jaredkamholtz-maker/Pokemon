@@ -62,11 +62,9 @@ REFERENCE_ITEM_ID   = "397923543088"
 REFERENCE_CACHE     = Path(".tmp/reference_card.jpg")
 REFERENCE_COMMITTED = Path("data/reference_card.jpg")
 
-# Negative reference examples: visibly damaged cards (bent edges, heavy wear).
-# Used to calibrate Claude Vision on what a DO-NOT-SUBMIT card looks like.
+# eBay item IDs that must never appear as candidates (visibly damaged cards used
+# as negative references in earlier versions — blocked to prevent self-surfacing).
 DAMAGED_EXAMPLE_ITEM_IDS = ["376469060746", "134783144970"]
-DAMAGED_EXAMPLE_COMMITTED = [Path(f"data/damaged_example_{i+1}.jpg") for i in range(len(DAMAGED_EXAMPLE_ITEM_IDS))]
-DAMAGED_EXAMPLE_CACHE     = [Path(f".tmp/damaged_example_{i+1}.jpg")  for i in range(len(DAMAGED_EXAMPLE_ITEM_IDS))]
 
 GRADING_PROMPT = """You are a strict PSA card grader analyzing seller photos from an eBay listing. Apply the OFFICIAL PSA grading standards exactly as written below. Be conservative — most cards do not reach PSA 9 or 10. Do not give the benefit of the doubt when a defect is visible.
 
@@ -107,7 +105,7 @@ GRADING RULES:
 - Holo scratches visible at any angle = at most PSA 8 for holo cards
 - Be skeptical of stock-looking photos — many eBay sellers use database images
 
-ASSESS THE FOLLOWING. For each dimension, provide a rating, a confidence score 0.0–1.0 based on photo quality for THAT dimension, and specific observations. Keep notes concise (1 sentence max per dimension). If photo quality prevents assessment, set rating to "unknown" and confidence to 0.0. Do not guess.
+ASSESS THE FOLLOWING. For each dimension, provide a rating, a confidence score 0.0–1.0 based on photo quality for THAT dimension, and specific observations. If photo quality prevents assessment, set rating to "unknown" and confidence to 0.0. Do not guess.
 
 DIMENSIONS:
 1. centering_front: measure border widths and estimate ratio like "55/45 L/R, 50/50 T/B"
@@ -123,7 +121,7 @@ DIMENSIONS:
 PREDICTED GRADE RANGE:
 Based strictly on the PSA standards above, give the range this card would likely receive at PSA. Low = pessimistic outcome, High = optimistic outcome. Use 0 for both if ungradeable (creases, bends, water damage).
 
-RED FLAGS — check each and report true/false with reasoning (1 sentence max):
+RED FLAGS — check each and report true/false with reasoning:
 - stock_photo_suspected: photos look like generic/database images, not this specific card being sold by this seller
 - back_not_shown: no clear photo of card back
 - glare_obscures_detail: critical areas hidden by reflection
@@ -157,18 +155,6 @@ Return ONLY valid JSON, no other text:
 }"""
 
 REFERENCE_INTRO = (
-    "You are given reference images before the listing to grade.\n\n"
-    "POSITIVE REFERENCE (image 1): A card the buyer considers a strong PSA 9/10 candidate. "
-    "Use it to calibrate corner sharpness, surface cleanliness, centering, and photo quality. "
-    "Do NOT grade this card.\n\n"
-    "NEGATIVE REFERENCES (images 2 and 3): Cards with VISIBLY DESTROYED edges and bends — "
-    "they have ZERO chance of grading. Heavy whitening, bent corners, and edge damage are "
-    "clearly visible. Use these to anchor your lower bound. Any card that looks like these "
-    "must be SKIP regardless of price.\n\n"
-    "The FINAL image is the actual listing you must grade."
-)
-
-REFERENCE_INTRO_NO_DAMAGED = (
     "The first image below is a REFERENCE EXAMPLE provided by the buyer. "
     "It represents a card they consider a strong PSA 9/10 candidate — "
     "use it to calibrate your expectations for corner sharpness, surface cleanliness, "
@@ -180,6 +166,9 @@ REFERENCE_INTRO_NO_DAMAGED = (
 # inconsistent_card is intentionally soft — title filters catch wrong-item listings
 # before image analysis; here it's a warning note, not a hard block.
 _CRITICAL_FLAGS = {"stock_photo_suspected", "fake_indicators", "altered_appearance"}
+
+# Set of eBay item IDs that must never appear as candidates (our negative reference cards)
+_BLOCKED_ITEM_IDS = set(DAMAGED_EXAMPLE_ITEM_IDS)
 
 
 def _fetch_reference_image(token: str) -> str | None:
@@ -235,49 +224,6 @@ def _fetch_reference_image(token: str) -> str | None:
     return None
 
 
-def _fetch_damaged_examples(token: str) -> list[str]:
-    """
-    Load negative reference images (clearly damaged cards).
-    Priority: committed data/ → .tmp/ cache → eBay Browse API.
-    Returns a list of base64 strings (may be shorter than DAMAGED_EXAMPLE_ITEM_IDS if some fail).
-    """
-    results = []
-    for idx, item_id in enumerate(DAMAGED_EXAMPLE_ITEM_IDS):
-        committed = DAMAGED_EXAMPLE_COMMITTED[idx]
-        cache     = DAMAGED_EXAMPLE_CACHE[idx]
-        b64 = None
-        for path in (committed, cache):
-            if path.exists():
-                try:
-                    b64 = base64.standard_b64encode(path.read_bytes()).decode()
-                    break
-                except Exception:
-                    pass
-        if b64:
-            results.append(b64)
-            continue
-        try:
-            resp = _SESSION.get(
-                f"https://api.ebay.com/buy/browse/v1/item/v1|{item_id}|0",
-                headers={"Authorization": f"Bearer {token}",
-                         "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"},
-                timeout=20,
-            )
-            if resp and resp.status_code == 200:
-                image_url = resp.json().get("image", {}).get("imageUrl")
-                if image_url:
-                    img_resp = _SESSION.get(_upgrade_ebay_image_url(image_url), timeout=20)
-                    if img_resp and img_resp.status_code == 200 and img_resp.content:
-                        for path in (committed, cache):
-                            path.parent.mkdir(parents=True, exist_ok=True)
-                            path.write_bytes(img_resp.content)
-                        b64 = base64.standard_b64encode(img_resp.content).decode()
-                        results.append(b64)
-                        continue
-        except Exception as e:
-            print(f"  (damaged example {idx+1} fetch failed: {e})")
-    return results
-
 
 def _get(url: str, params: dict | None = None, max_retries: int = 3) -> object | None:
     for attempt in range(1, max_retries + 1):
@@ -299,7 +245,8 @@ def _is_graded_title(title: str) -> bool:
     t = title.lower()
     return any(kw in t for kw in [
         "psa ", "psa-", "psa9", "psa10", "psa8", "psa7", "psa6",
-        "bgs ", "cgc ", "sgc ", "graded", "gem mint",
+        "bgs ", "cgc ", "sgc ", "hga ", "aog ", "mnt ", "tag ",
+        "graded", "gem mint",
         "mint 10", "mint 9", "mint 8", "mint 7",
         "grade 10", "grade 9", "grade 8", "grade 7",
     ])
@@ -360,10 +307,15 @@ def search_ebay_listings(card_name: str, set_name: str, card_number: str = "") -
         out = []
         graded_n = multi_n = no_url_n = 0
         for item in items:
-            title = item.get("title", "")
-            url   = item.get("itemWebUrl", "")
+            title   = item.get("title", "")
+            url     = item.get("itemWebUrl", "")
+            item_id = str(item.get("itemId", ""))
             if not url:
                 no_url_n += 1
+                continue
+            # Never surface our own negative reference examples as candidates
+            if item_id in _BLOCKED_ITEM_IDS:
+                graded_n += 1
                 continue
             if _is_graded_title(title):
                 graded_n += 1
@@ -513,9 +465,16 @@ def _derive_from_analysis(parsed: dict) -> dict:
     else:
         prob = 0
 
-    # Soft flag: back not shown → halve probability
+    # No back photo → can't verify card condition; auto-disqualify
     if isinstance(red_flags.get("back_not_shown"), dict) and red_flags["back_not_shown"].get("flag"):
-        prob = prob // 2
+        return {
+            "recommendation": "SKIP",
+            "predicted_grade": predicted_grade,
+            "psa9_or_better_probability": 0,
+            "photo_quality": photo_quality,
+            "notes": "Back not shown — cannot verify card condition",
+            "red_flags_active": "back_not_shown",
+        }
 
     soft_flags = [f for f, info in red_flags.items()
                   if f not in _CRITICAL_FLAGS
@@ -525,7 +484,7 @@ def _derive_from_analysis(parsed: dict) -> dict:
     notes   = (f"⚠️ {', '.join(soft_flags)}. " if soft_flags else "") + summary
 
     return {
-        "recommendation":           "SUBMIT" if grade_high >= 9 and prob >= 30 else "SKIP",
+        "recommendation":           "SUBMIT" if grade_high >= 9 and prob >= 50 else "SKIP",
         "predicted_grade":          predicted_grade,
         "psa9_or_better_probability": prob,
         "photo_quality":            photo_quality,
@@ -540,8 +499,7 @@ def _get_dim_rating(parsed: dict, key: str) -> str | None:
 
 
 def analyze_image(card_name: str, set_name: str, card_number: str, image_b64: str,
-                  reference_b64: str | None = None,
-                  damaged_examples_b64: list[str] | None = None) -> dict:
+                  reference_b64: str | None = None) -> dict:
     load_dotenv()
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -558,15 +516,10 @@ def analyze_image(card_name: str, set_name: str, card_number: str, image_b64: st
                        .replace("{card_name}", card_name)
                        .replace("{set_name}", set_name)
                        .replace("{card_number}", card_number or "unknown"))
-        has_damaged = bool(damaged_examples_b64)
         if reference_b64:
-            intro = REFERENCE_INTRO if has_damaged else REFERENCE_INTRO_NO_DAMAGED
-            content = [{"type": "text", "text": intro}]
+            content = [{"type": "text", "text": REFERENCE_INTRO}]
             content.append({"type": "image",
                              "source": {"type": "base64", "media_type": "image/jpeg", "data": reference_b64}})
-            for dmg_b64 in (damaged_examples_b64 or []):
-                content.append({"type": "image",
-                                 "source": {"type": "base64", "media_type": "image/jpeg", "data": dmg_b64}})
             content.append({"type": "image",
                              "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}})
             content.append({"type": "text", "text": prompt_text})
@@ -614,8 +567,7 @@ def analyze_image(card_name: str, set_name: str, card_number: str, image_b64: st
 
 
 def pick_best_listing(card_name: str, set_name: str, card_number: str,
-                      listings: list[dict], reference_b64: str | None = None,
-                      damaged_examples_b64: list[str] | None = None) -> tuple[dict, dict]:
+                      listings: list[dict], reference_b64: str | None = None) -> tuple[dict, dict]:
     """
     Analyze each listing photo with Claude Vision.
     Returns (best_listing, analysis).
@@ -625,7 +577,7 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
     If a non-disqualified listing is found, that takes priority.
     If a SUBMIT listing is found, that wins.
     """
-    # Most expensive listing is the default — already filtered for
+    # Cheapest listing is always the fallback — it's already filtered for
     # graded/lot/multi-card titles, so it's a real single-card listing
     best_listing  = listings[0]
     best_analysis: dict = {"recommendation": "SKIP", "notes": "photo unverified"}
@@ -646,7 +598,7 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
             continue
 
         print("analyzing...", end=" ", flush=True)
-        analysis = analyze_image(card_name, set_name, card_number, b64, reference_b64, damaged_examples_b64)
+        analysis = analyze_image(card_name, set_name, card_number, b64, reference_b64)
         rec      = analysis.get("recommendation", "SKIP")
         prob     = analysis.get("psa9_or_better_probability") or 0
         flags    = analysis.get("red_flags_active") or ""
@@ -705,13 +657,6 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
         print("Reference image unavailable — grading without reference\n"
               "  Fix: add REFERENCE_IMAGE_URL secret, or commit data/reference_card.jpg")
 
-    damaged_examples_b64 = _fetch_damaged_examples(ref_token or "")
-    committed_count = sum(1 for p in DAMAGED_EXAMPLE_COMMITTED if p.exists())
-    if damaged_examples_b64:
-        src = "committed" if committed_count == len(DAMAGED_EXAMPLE_ITEM_IDS) else "eBay API"
-        print(f"Damaged reference examples loaded: {len(damaged_examples_b64)}/{len(DAMAGED_EXAMPLE_ITEM_IDS)} ({src})")
-    else:
-        print("Damaged reference examples unavailable — grading without negative anchors")
     print()
 
     rows = []
@@ -754,7 +699,7 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
         print(f"{len(listings)} listings ({price_range})")
 
         try:
-            best_listing, analysis = pick_best_listing(card_name, set_name, card_number, listings, reference_b64, damaged_examples_b64)
+            best_listing, analysis = pick_best_listing(card_name, set_name, card_number, listings, reference_b64)
 
             # Always set URL — pick_best_listing guarantees a listing (cheapest fallback)
             result["ebay_listing_url"] = best_listing["url"]
