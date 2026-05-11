@@ -1,0 +1,21 @@
+name: Keepalive
+
+on:
+  schedule:
+    # Run every 2 weeks to prevent GitHub from disabling the scheduled flip_analysis workflow
+    - cron: "0 12 1,15 * *"
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Re-enable flip_analysis workflow if disabled
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow enable flip_analysis.yml || true
+          echo "Keepalive ran at $(date -u)"
