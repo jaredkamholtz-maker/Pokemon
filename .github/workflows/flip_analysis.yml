@@ -1,9 +1,6 @@
 name: Pokemon Flip Analysis
 
 on:
-  schedule:
-    # 8am ET Monday and Friday (13:00 UTC)
-    - cron: "0 13 * * 1,5"
   workflow_dispatch:
     inputs:
       era:
