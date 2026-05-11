@@ -1,15 +1,15 @@
-"""
+""" 
 Full pipeline: discover → AI filter → prices → PSA population → EV → image analysis → email
 
 Steps:
   1. discover_cards: query Pokemon TCG API for all cards in target sets (~3,000 cards)
   2. filter_cards_ai: Claude Haiku pre-filter → holos, full arts, chase rares (~400-600)
   3. fetch_ebay_prices: get raw + PSA 9 + PSA 10 prices from eBay completed sales
-     Filter: raw_price < PSA 9 price (positive grading spread exists)
+     Filter: PSA 9/10 price must exceed raw by at least grading_fee + $5
   4. scrape_pokedata_population: get PSA submission counts and gem rate from 130point.com
   5. calculate_flip_ev: merge prices + population, calculate ROI (informational only)
   6. analyze_card_images: find cheapest eBay raw listing per card, analyze photos
-     with Claude Vision — this is the primary quality filter
+     with Claude Vision — top 15 by spread, this is the primary quality filter
   7. Email final shortlist: card, raw price, PSA 9/10, profit %, gem rate, predicted grade
 
 Usage:
@@ -50,6 +50,8 @@ PRICES_PATH = ".tmp/ebay_prices.csv"
 POP_PATH = ".tmp/pokedata_population.csv"
 OUTPUT_PATH = ".tmp/flip_opportunities.csv"
 SHORTLIST_PATH = ".tmp/final_shortlist.csv"
+
+IMAGE_ANALYSIS_CAP = 15  # max cards sent to Claude Vision per run
 
 
 # ── Google Sheets ───────────────────────────────────────────────────────────────
@@ -143,7 +145,6 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
     for rank, (_, row) in enumerate(opportunities.iterrows(), 1):
         name = row.get("card_name", "?")
         set_name = row.get("set_name", "?")
-        # Use the actual eBay listing price (what you'd pay) if captured; fall back to PriceCharting
         _ebay_price = row.get("ebay_price")
         _raw_price = row.get("raw_price")
         buy_price_val = _ebay_price if pd.notna(_ebay_price) else _raw_price
@@ -151,7 +152,6 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         psa9 = _fmt_price(row.get("psa9_price"))
         psa10 = _fmt_price(row.get("psa10_price"))
         is_breakeven = row.get("track") == "breakeven"
-        # Gem rate: show "52.5% (420 / 800)" for Track 1, "BE ≤ 8%" for Track 2
         gem_val = row.get("gem_rate")
         total = row.get("total_graded")
         psa9_count = row.get("psa9_count")
@@ -169,7 +169,6 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
             gem = f"BE ≤ {_fmt_pct(be)}" if pd.notna(be) and be == be else "No data"
         else:
             gem = "—"
-        # Profit %: use ROI if available, else label as breakeven opportunity
         roi_val = row.get("roi")
         if pd.notna(roi_val) and roi_val == roi_val:
             roi = _fmt_pct(roi_val)
@@ -181,7 +180,6 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         _ebay_raw = row.get("ebay_listing_url")
         ebay_listing_url = str(_ebay_raw) if pd.notna(_ebay_raw) and _ebay_raw else ""
 
-        # Broad eBay search — just card name + set, no BIN/condition filters so results always appear
         ebay_search_url = (
             "https://www.ebay.com/sch/i.html?"
             + urllib.parse.urlencode({
@@ -189,10 +187,8 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
                 "_sop": "15",
             })
         )
-        # Prefer a specific listing URL (from image analysis); fall back to search
         buy_url = ebay_listing_url or ebay_search_url
 
-        # Image analysis columns (only present when step 6 ran)
         pred_grade = row.get("predicted_grade")
         psa9p = row.get("psa9_or_better_probability")
         _notes_raw = row.get("notes")
@@ -200,7 +196,6 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
 
         card_link = f'<a href="{url}" style="color:#1a73e8;text-decoration:none;">{name}</a>' if url else name
         if ebay_listing_url:
-            # Specific listing Claude analyzed + search fallback in case it sold
             ebay_link = (
                 f' <a href="{ebay_listing_url}" style="font-size:11px;color:#e67e00;font-weight:600;">[Buy this listing]</a>'
                 f' <a href="{ebay_search_url}" style="font-size:11px;color:#6b7280;">[Search if sold]</a>'
@@ -209,13 +204,15 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
             ebay_link = f' <a href="{ebay_search_url}" style="font-size:11px;color:#e67e00;font-weight:600;">[Find on eBay]</a>'
 
         image_plain = ""
+        notes_html = ""
         if has_image_analysis and notes:
             image_plain = f"\n  Note: {notes}"
+            notes_html = f"<br><span style='font-size:11px;color:#9ca3af;font-style:italic;'>{notes}</span>"
 
         rows_html.append(f"""<tr style="border-bottom:1px solid #e5e7eb;">
   <td style="padding:10px 14px;font-weight:500;">{rank}. {card_link}{ebay_link}<br>
     <span style="font-size:12px;color:#6b7280;">{set_name}</span>
-    {"<br><span style='font-size:11px;color:#9ca3af;font-style:italic;'>" + notes + "</span>" if has_image_analysis and notes else ""}
+    {notes_html}
   </td>
   <td style="padding:10px 14px;text-align:right;">{raw}</td>
   <td style="padding:10px 14px;text-align:right;">{psa9}</td>
@@ -316,7 +313,7 @@ def run(
     print(f"Pokemon Flip Analysis  —  {today}")
     print(f"{'='*60}\n")
 
-    # Step 1: Discover cards from PokeData.io
+    # Step 1: Discover cards
     if skip_discovery and Path(DISCOVERED_PATH).exists():
         n = len(pd.read_csv(DISCOVERED_PATH))
         print(f"[1/6] Reusing {n} discovered cards from {DISCOVERED_PATH}")
@@ -355,30 +352,28 @@ def run(
         n = len(pd.read_csv(PRICES_PATH))
         print(f"[3/6] Reusing {n} price records from {PRICES_PATH}")
     else:
-        print(f"[3/6] Fetching eBay sold prices ({len(filtered_df)} cards, "
-              f"PSA 9/10 > ${min_graded_price:.0f})...")
+        print(f"[3/6] Fetching eBay sold prices ({len(filtered_df)} cards)...")
         prices_mod.run(input_path=FILTERED_PATH, output_path=PRICES_PATH)
 
     prices_df = pd.read_csv(PRICES_PATH)
-    # Keep only cards where raw price is below PSA 9 or PSA 10 price — a grading spread exists
+    # Keep only cards where the spread covers the grading fee + a small margin
+    min_spread = grading_fee + 5.0
     has_spread = (
         prices_df["raw_price"].notna() &
         (
-            (prices_df["psa9_price"].notna() & (prices_df["psa9_price"] > prices_df["raw_price"])) |
-            (prices_df["psa10_price"].notna() & (prices_df["psa10_price"] > prices_df["raw_price"]))
+            (prices_df["psa9_price"].notna() & (prices_df["psa9_price"] - prices_df["raw_price"] > min_spread)) |
+            (prices_df["psa10_price"].notna() & (prices_df["psa10_price"] - prices_df["raw_price"] > min_spread))
         )
     )
     prices_df = prices_df[has_spread]
     prices_df.to_csv(PRICES_PATH, index=False)
-    print(f"  → {len(prices_df)} cards with a positive grading spread (raw < PSA 9/10)\n")
+    print(f"  → {len(prices_df)} cards with spread > ${min_spread:.0f} (covers grading fee + margin)\n")
 
     if prices_df.empty:
         print("No cards passed the price filter — nothing to analyze.")
         return pd.DataFrame()
 
-    # Step 4: PSA population — 130point.com blocks all cloud/datacenter IPs at the
-    # network level ("Host not in allowlist"). Skip the scraper entirely and write an
-    # empty population file so calculate_flip_ev uses Track-2 breakeven for all cards.
+    # Step 4: PSA population (130point.com is IP-blocked from cloud — skip)
     print(f"[4/6] PSA population: 130point.com is IP-blocked from cloud — skipping scraper, using breakeven track.")
     pop_empty = prices_df[["card_name", "set_name", "card_number"]].copy()
     for col in ("total_graded", "psa10_count", "psa9_count", "gem_rate", "source_url", "error"):
@@ -391,12 +386,10 @@ def run(
     print(f"[5/6] Calculating flip EV...")
     df = ev_mod.run(grading_fee=grading_fee)
 
-    # Track 1: population data available — include all, sorted by ROI
     has_pop = df["gem_rate"].notna() & df["roi"].notna()
     track1 = df[has_pop].copy()
     track1["track"] = "population"
 
-    # Track 2: no population data but a grading spread exists — include all
     has_breakeven = ("breakeven_gem_rate" in df.columns) & df["breakeven_gem_rate"].notna()
     track2 = df[has_breakeven & ~has_pop].copy()
     track2["track"] = "breakeven"
@@ -407,46 +400,38 @@ def run(
         ascending=[False, True],
         na_position="last",
     )
-    # Deduplicate — keep highest-ROI row per card
     opportunities = opportunities.drop_duplicates(
         subset=["card_name", "set_name", "card_number"], keep="first"
     ).reset_index(drop=True)
 
-    # Save for image analysis step
     Path(OUTPUT_PATH).parent.mkdir(parents=True, exist_ok=True)
     opportunities.to_csv(OUTPUT_PATH, index=False)
 
     print(f"\n{'='*60}")
     print(f"{len(track1)} Track-1 cards (population data, sorted by ROI)")
     print(f"{len(track2)} Track-2 cards (no pop data, positive spread)")
-    print(f"{len(opportunities)} total opportunities → all go to image analysis")
+    print(f"{min(len(opportunities), IMAGE_ANALYSIS_CAP)}/{len(opportunities)} opportunities → Claude Vision")
     print(f"{'='*60}\n")
 
-    # Step 6: eBay image analysis (final filter on top N)
-    # analyze_card_images always saves a direct listing URL before analysis runs,
-    # so every card in the result has a specific eBay link regardless of outcome.
+    # Step 6: eBay image analysis (top IMAGE_ANALYSIS_CAP by spread)
     final = opportunities
     has_image_analysis = False
     if not skip_images and not opportunities.empty:
-        # Cooldown so step 3's eBay price calls don't exhaust the Browse API rate limit.
-        # Full scans (many cards) need a longer wait than focused era runs.
         import time as _time
-        wait_s = 120 if len(opportunities) > 20 else 30
+        wait_s = 30
         print(f"[6/6] Waiting {wait_s}s for eBay API rate limit to clear after step 3...")
         _time.sleep(wait_s)
-        n_opps = len(opportunities)
-        print(f"[6/6] Analyzing eBay listing photos ({n_opps} cards, Claude Vision)...")
+        n_opps = min(len(opportunities), IMAGE_ANALYSIS_CAP)
+        print(f"[6/6] Analyzing eBay listing photos (top {n_opps} cards, Claude Vision)...")
         shortlist = images_mod.run(input_path=OUTPUT_PATH, top_n=n_opps)
 
         analysis_csv = Path(".tmp/image_analysis.csv")
         if shortlist is not None and not shortlist.empty:
-            # SUBMIT cards: show only these with full image analysis details
             final = shortlist
             has_image_analysis = True
             Path(SHORTLIST_PATH).parent.mkdir(parents=True, exist_ok=True)
             shortlist.to_csv(SHORTLIST_PATH, index=False)
         elif analysis_csv.exists():
-            # No SUBMIT cards — show all analyzed cards; email filter drops any without a URL
             print("  No SUBMIT cards from image analysis — showing analyzed cards with eBay links.")
             final = pd.read_csv(analysis_csv)
             has_image_analysis = True
@@ -463,10 +448,28 @@ def run(
         else:
             print("  GOOGLE_SPREADSHEET_ID not set — skipping Sheets output.")
 
-    # Apply the same dedup that format_email_body does, so subject line count matches body
     if "ebay_listing_url" in final.columns:
         final = final[final["ebay_listing_url"].notna() & (final["ebay_listing_url"] != "")].copy()
     final = final.drop_duplicates(subset=["card_name", "set_name"], keep="first").copy()
+
+    # Drop cards where the actual listing price leaves no margin after grading fee
+    if "ebay_price" in final.columns and has_image_analysis:
+        def _still_profitable(row):
+            buy = row.get("ebay_price")
+            if pd.isna(buy) or buy == 0:
+                return True
+            psa9  = row.get("psa9_price")
+            psa10 = row.get("psa10_price")
+            if pd.notna(psa9)  and psa9  - buy > grading_fee:
+                return True
+            if pd.notna(psa10) and psa10 - buy > grading_fee:
+                return True
+            return False
+        before = len(final)
+        final = final[final.apply(_still_profitable, axis=1)].copy()
+        dropped = before - len(final)
+        if dropped:
+            print(f"  Dropped {dropped} card(s) whose actual listing price left no margin after grading fee.")
 
     # Email
     if not skip_email:
@@ -474,7 +477,6 @@ def run(
         subject = f"Your {date.today().strftime('%m/%d')} Pokenalysis: {len(final)} Opportunit{'y' if len(final) == 1 else 'ies'} Found"
         send_email(html_body, plain_body, subject)
 
-    # Print summary + eBay URL diagnostic
     if final.empty:
         print("No cards met all criteria today.")
     else:
@@ -482,7 +484,6 @@ def run(
                 "gem_rate", "roi", "predicted_grade", "psa9_or_better_probability"]
         print(final[[c for c in cols if c in final.columns]].to_string(index=False))
 
-    # Show eBay URL status for every card so we can diagnose in CI logs
     if "ebay_listing_url" in final.columns:
         print("\n── eBay listing URLs ──")
         for _, row in final.iterrows():
@@ -500,18 +501,12 @@ def run(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pokemon card flip analysis")
     parser.add_argument("--target-sets", default="data/target_sets.csv")
-    parser.add_argument("--era", default=None,
-                        help="Filter to one era: mega-evolution, sword-shield, scarlet-violet")
-    parser.add_argument("--sets", default=None,
-                        help="Comma-separated set names, e.g. '151,Evolving Skies'")
-    parser.add_argument("--skip-discovery", action="store_true",
-                        help="Reuse last discovered_cards.csv (skip PokeData.io API call)")
-    parser.add_argument("--skip-ai-filter", action="store_true",
-                        help="Reuse last filtered_cards.csv (skip Claude Haiku step)")
-    parser.add_argument("--skip-prices", action="store_true",
-                        help="Reuse last tcgplayer_prices.csv (skip PriceCharting fetch)")
-    parser.add_argument("--skip-images", action="store_true",
-                        help="Skip eBay image analysis step (faster, no Claude Vision credits)")
+    parser.add_argument("--era", default=None)
+    parser.add_argument("--sets", default=None)
+    parser.add_argument("--skip-discovery", action="store_true")
+    parser.add_argument("--skip-ai-filter", action="store_true")
+    parser.add_argument("--skip-prices", action="store_true")
+    parser.add_argument("--skip-images", action="store_true")
     parser.add_argument("--skip-sheets", action="store_true")
     parser.add_argument("--skip-email", action="store_true")
     args = parser.parse_args()

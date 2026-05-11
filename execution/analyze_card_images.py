@@ -50,7 +50,7 @@ INPUT_FILE = Path(".tmp/flip_opportunities.csv")
 OUTPUT_ANALYSIS = Path(".tmp/image_analysis.csv")
 OUTPUT_SHORTLIST = Path(".tmp/final_shortlist.csv")
 
-MAX_LISTINGS = 5        # analyze the top 5 most expensive ungraded listings
+MAX_LISTINGS = 3        # analyze the top 3 most expensive ungraded listings
 BROWSE_LIMIT = 50       # how many results to fetch from Browse API before filtering
 RATE_DELAY = 0.5
 MODEL = "claude-sonnet-4-6"
@@ -259,8 +259,16 @@ def _is_multi_card_listing(title: str) -> bool:
         "choose your", "choose a card", "your choice",
         "lot of", " lot ", "bundle", "set of", "complete set", "full set", "sealed set",
         "booster box", "booster pack", "sealed box", "display box",
-        "x2 ", "x3 ", "x4 ", "x5 ", " x2", " x3", " x4", " x5",
-        "2x ", "3x ", "4x ", "5x ",
+        "elite trainer", " etb", "etb ",
+        "collection box", "collection set", "premium collection", "special collection",
+        "theme deck", "starter deck", "battle deck",
+        "blister pack", "blister box",
+        "tin ", " tin,", " tin.",
+        "vmax box", "v box", "gx box", "ex box",
+        "jumbo card", "oversized",
+        "x2 ", "x3 ", "x4 ", "x5 ", "x10 ", "x20 ", "x50 ",
+        " x2", " x3", " x4", " x5",
+        "2x ", "3x ", "4x ", "5x ", "10x ", "20x ",
         "wholesale",
     ])
 
@@ -343,29 +351,40 @@ def search_ebay_listings(card_name: str, set_name: str, card_number: str = "") -
             print(f"(graded={graded_n} lot={multi_n} no_url={no_url_n} raw={len(out)})", end=" ", flush=True)
         return out
 
-    try:
-        resp = _SESSION.get(
-            "https://api.ebay.com/buy/browse/v1/item_summary/search",
-            headers={"Authorization": f"Bearer {token}",
-                     "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"},
-            params={"q": f"{card_name} {set_name} {card_number} pokemon",
-                    "sort": "-price",
-                    "limit": str(BROWSE_LIMIT)},
-            timeout=20,
-        )
-        if not resp or resp.status_code != 200:
-            print(f"(Browse API HTTP {resp and resp.status_code})", end=" ", flush=True)
+    def _search(query: str) -> list:
+        try:
+            resp = _SESSION.get(
+                "https://api.ebay.com/buy/browse/v1/item_summary/search",
+                headers={"Authorization": f"Bearer {token}",
+                         "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"},
+                params={"q": query, "sort": "-price", "limit": str(BROWSE_LIMIT)},
+                timeout=20,
+            )
+            if not resp or resp.status_code != 200:
+                print(f"(Browse API HTTP {resp and resp.status_code})", end=" ", flush=True)
+                return []
+            return resp.json().get("itemSummaries", [])
+        except Exception as e:
+            print(f"  Browse API error: {e}")
             return []
 
-        items = resp.json().get("itemSummaries", [])
+    try:
+        # First pass: include card number to narrow results for common Pokémon names
+        query = f"{card_name} {set_name} {card_number} pokemon".strip()
+        items = _search(query)
         print(f"(API={len(items)})", end=" ", flush=True)
 
         candidates = _parse_items(items, strict=True)
-
-        # Fallback: relax lot filter if strict pass found nothing
         if not candidates:
-            print("(fallback: relaxing lot filter)", end=" ", flush=True)
             candidates = _parse_items(items, strict=False)
+
+        # Fallback: drop card number if first pass found nothing
+        if not candidates and card_number:
+            print("(fallback: dropping card number)", end=" ", flush=True)
+            items = _search(f"{card_name} {set_name} pokemon")
+            candidates = _parse_items(items, strict=True)
+            if not candidates:
+                candidates = _parse_items(items, strict=False)
 
         if not candidates:
             print("(0 candidates after all filters)", end=" ", flush=True)
@@ -484,7 +503,7 @@ def _derive_from_analysis(parsed: dict) -> dict:
     notes   = (f"⚠️ {', '.join(soft_flags)}. " if soft_flags else "") + summary
 
     return {
-        "recommendation":           "SUBMIT" if grade_high >= 9 and prob >= 50 else "SKIP",
+        "recommendation":           "SUBMIT" if grade_high >= 9 and prob >= 35 else "SKIP",
         "predicted_grade":          predicted_grade,
         "psa9_or_better_probability": prob,
         "photo_quality":            photo_quality,
