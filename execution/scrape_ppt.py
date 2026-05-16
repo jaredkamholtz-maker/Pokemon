@@ -8,7 +8,7 @@ Requires Playwright — install with:
     playwright install chromium
 
 Runs a real browser locally (bypasses IP block that affects cloud runners).
-Intercepts the card data API response that the browser fetches after page load.
+Extracts data from embedded Next.js RSC JSON in the page HTML — no clicking needed.
 
 Output: .tmp/ppt_cards.csv
     card_name, set_name, card_number, printing, rarity,
@@ -23,6 +23,118 @@ from pathlib import Path
 
 OUTPUT_FILE = Path(".tmp/ppt_cards.csv")
 BASE_URL = "https://www.pokemonpricetracker.com/psa-analysis"
+
+
+def _extract_cards_from_html(html: str) -> list[dict]:
+    """
+    Parse Next.js RSC payload from self.__next_f.push(...) script tags.
+    Uses character-by-character bracket counting so nested JSON is handled correctly.
+    """
+    card_list: list[dict] = []
+    seen_ids: set = set()
+    search_str = "self.__next_f.push("
+    pos = 0
+
+    while True:
+        idx = html.find(search_str, pos)
+        if idx == -1:
+            break
+
+        # Walk from the opening paren, counting depth to find the matching close
+        arg_start = idx + len(search_str)
+        depth = 0
+        in_string = False
+        escape = False
+        i = arg_start
+
+        while i < len(html):
+            c = html[i]
+            if escape:
+                escape = False
+            elif in_string:
+                if c == "\\":
+                    escape = True
+                elif c == '"':
+                    in_string = False
+            else:
+                if c == '"':
+                    in_string = True
+                elif c in "([{":
+                    depth += 1
+                elif c in ")]}":
+                    if depth == 0:
+                        break
+                    depth -= 1
+            i += 1
+
+        raw = html[arg_start:i]
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            pos = idx + 1
+            continue
+
+        if not isinstance(payload, list) or len(payload) < 2:
+            pos = idx + 1
+            continue
+
+        value = payload[1]
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                pos = idx + 1
+                continue
+
+        _harvest_cards(value, card_list, seen_ids)
+        pos = idx + 1
+
+    # Diagnostics when nothing found
+    if not card_list:
+        push_count = html.count(search_str)
+        raw_count = html.count('"rawPrice"')
+        print(f"  Debug: {push_count} __next_f.push() calls found, "
+              f"{raw_count} occurrences of '\"rawPrice\"' in HTML")
+        if raw_count > 0:
+            first = html.find('"rawPrice"')
+            print(f"  Context: ...{html[max(0, first-120):first+120]}...")
+        elif push_count == 0:
+            print(f"  First 500 chars of HTML: {html[:500]}")
+
+    return card_list
+
+
+def _looks_like_card(obj: dict) -> bool:
+    return (
+        isinstance(obj, dict)
+        and "rawPrice" in obj
+        and "psaPrices" in obj
+        and "name" in obj
+    )
+
+
+def _harvest_cards(node, card_list: list, seen_ids: set):
+    """Recursively walk JSON, collecting card objects."""
+    if isinstance(node, list):
+        cards_in_node = [x for x in node if _looks_like_card(x)]
+        if cards_in_node:
+            for card in cards_in_node:
+                uid = (card.get("name"), card.get("setName"), card.get("number"))
+                if uid not in seen_ids:
+                    seen_ids.add(uid)
+                    card_list.append(_parse_card(card))
+        else:
+            for item in node:
+                _harvest_cards(item, card_list, seen_ids)
+    elif isinstance(node, dict):
+        if _looks_like_card(node):
+            uid = (node.get("name"), node.get("setName"), node.get("number"))
+            if uid not in seen_ids:
+                seen_ids.add(uid)
+                card_list.append(_parse_card(node))
+        else:
+            for v in node.values():
+                _harvest_cards(v, card_list, seen_ids)
 
 
 def _parse_card(card: dict) -> dict:
@@ -49,106 +161,57 @@ def _parse_card(card: dict) -> dict:
     }
 
 
-def _looks_like_card(obj) -> bool:
-    return (
-        isinstance(obj, dict)
-        and "rawPrice" in obj
-        and "psaPrices" in obj
-        and "name" in obj
-    )
-
-
-def _harvest_cards(node, card_list: list, seen_ids: set):
-    """Recursively walk a JSON structure collecting card objects."""
-    if isinstance(node, list):
-        cards = [x for x in node if _looks_like_card(x)]
-        if cards:
-            for card in cards:
-                uid = (card.get("name"), card.get("setName"), card.get("number"))
-                if uid not in seen_ids:
-                    seen_ids.add(uid)
-                    card_list.append(_parse_card(card))
-        else:
-            for item in node:
-                _harvest_cards(item, card_list, seen_ids)
-    elif isinstance(node, dict):
-        if _looks_like_card(node):
-            uid = (node.get("name"), node.get("setName"), node.get("number"))
-            if uid not in seen_ids:
-                seen_ids.add(uid)
-                card_list.append(_parse_card(node))
-        else:
-            for v in node.values():
-                _harvest_cards(v, card_list, seen_ids)
-
-
-def run(output_path: str = str(OUTPUT_FILE), headless: bool = True) -> list[dict]:
+def run(output_path: str = str(OUTPUT_FILE), headless: bool = True,
+        use_cache: bool = False) -> list[dict]:
     """
-    Open pokemonpricetracker.com/psa-analysis in a browser, intercept the card
-    data API response, and extract all cards.
+    Fetch pokemonpricetracker.com/psa-analysis and extract all card data.
+
+    Args:
+        output_path: CSV destination
+        headless: run Playwright without a visible browser (required on Linux without X)
+        use_cache: parse .tmp/ppt_debug.html instead of fetching (useful for debugging)
     """
     from playwright.sync_api import sync_playwright
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    debug_path = Path(".tmp/ppt_debug.html")
 
-    captured: list[dict] = []  # raw JSON responses that contain card data
-    card_list: list[dict] = []
-    seen_ids: set = set()
+    if use_cache and debug_path.exists():
+        print(f"Using cached HTML from {debug_path}")
+        html = debug_path.read_text(encoding="utf-8")
+    else:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=headless)
+            page = browser.new_page(ignore_https_errors=True)
+            page.set_extra_http_headers({"User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )})
 
-    def handle_response(response):
-        url = response.url
-        # Card data comes from the site's own API — look for any JSON response
-        # that contains card-shaped objects
-        if "pokemonpricetracker.com" not in url:
-            return
-        ct = response.headers.get("content-type", "")
-        if "json" not in ct:
-            return
-        try:
-            body = response.json()
-            _harvest_cards(body, card_list, seen_ids)
-            if card_list:
-                print(f"  Captured {len(card_list)} cards from: {url}")
-                captured.append(url)
-        except Exception:
-            pass
+            print(f"Loading {BASE_URL} ...")
+            page.goto(BASE_URL, wait_until="networkidle", timeout=60_000)
+            time.sleep(3)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        page = browser.new_page(ignore_https_errors=True)
-        page.set_extra_http_headers({"User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        )})
+            html = page.content()
+            browser.close()
 
-        page.on("response", handle_response)
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        debug_path.write_text(html, encoding="utf-8")
+        print(f"Page HTML saved to {debug_path} ({len(html):,} chars)")
 
-        print(f"Loading {BASE_URL} ...")
-        page.goto(BASE_URL, wait_until="networkidle", timeout=60_000)
+    print("Parsing embedded Next.js JSON...")
+    results = _extract_cards_from_html(html)
+    print(f"Extracted {len(results)} cards")
 
-        # Give the page extra time to finish any deferred API calls
-        time.sleep(5)
-
-        # Also wait for any pending network activity to settle
-        try:
-            page.wait_for_load_state("networkidle", timeout=10_000)
-        except Exception:
-            pass
-
-        browser.close()
-
-    print(f"Extracted {len(card_list)} cards total")
-
-    if not card_list:
-        print("No card data captured.")
-        print("Tip: check that the site is reachable and not IP-blocking this machine.")
+    if not results:
+        print("No data found — check .tmp/ppt_debug.html to inspect the page structure")
         return []
 
-    # Sample output
-    for r in card_list[:3]:
+    for r in results[:3]:
         print(f"  {r['card_name']} | {r['set_name']} | raw=${r['raw_price']} "
-              f"psa9=${r['psa9_price']} psa10=${r['psa10_price']}")
+              f"psa9=${r['psa9_price']} psa10=${r['psa10_price']} "
+              f"psa10_chance={r['psa10_chance']}")
 
     fieldnames = [
         "card_name", "set_name", "card_number", "printing", "rarity",
@@ -158,10 +221,10 @@ def run(output_path: str = str(OUTPUT_FILE), headless: bool = True) -> list[dict
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(card_list)
-    print(f"Saved {len(card_list)} cards → {output_path}")
+        writer.writerows(results)
+    print(f"Saved {len(results)} cards → {output_path}")
 
-    return card_list
+    return results
 
 
 if __name__ == "__main__":
@@ -172,5 +235,7 @@ if __name__ == "__main__":
                         help="Run without visible browser (default: True)")
     parser.add_argument("--no-headless", dest="headless", action="store_false",
                         help="Show browser window (requires X server)")
+    parser.add_argument("--use-cache", action="store_true",
+                        help="Parse existing .tmp/ppt_debug.html instead of fetching fresh")
     args = parser.parse_args()
-    run(output_path=args.output, headless=args.headless)
+    run(output_path=args.output, headless=args.headless, use_cache=args.use_cache)
