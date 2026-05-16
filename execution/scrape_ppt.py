@@ -8,15 +8,19 @@ Requires Playwright — install with:
     playwright install chromium
 
 Runs a real browser locally (bypasses IP block that affects cloud runners).
-Extracts card data from the rendered DOM (cards load client-side).
+Paginates through all pages and optionally filters to target sets.
 
 Output: .tmp/ppt_cards.csv
     card_name, set_name, card_number, rarity,
     raw_price, psa10_chance, expected_profit, roi_pct
+
+Usage:
+    python3 execution/scrape_ppt.py                        # top 100 cards (page 1 only)
+    python3 execution/scrape_ppt.py --all-pages            # all pages (~10 min)
+    python3 execution/scrape_ppt.py --all-pages --target-sets data/target_sets.csv
 """
 
 import csv
-import json
 import time
 from pathlib import Path
 
@@ -29,53 +33,78 @@ _EXTRACT_JS = """() => {
         const text = card.innerText || '';
         const lines = text.split('\\n').map(l => l.trim()).filter(l => l);
 
-        // ROI % — e.g. "1908% ROI"
-        const roiMatch = text.match(/([\\d,]+(?:\\.\\d+)?)%\\s*ROI/);
-
-        // Raw price — label then value on next line
-        const rawMatch = text.match(/RAW PRICE:[^\\n]*\\n\\s*\\$?([\\d,]+(?:\\.\\d+)?)/);
-
-        // PSA 10 chance — e.g. "PSA 10 CHANCE:\\n6%"
+        const roiMatch   = text.match(/([\\d,]+(?:\\.\\d+)?)%\\s*ROI/);
+        const rawMatch   = text.match(/RAW PRICE:[^\\n]*\\n\\s*\\$?([\\d,]+(?:\\.\\d+)?)/);
         const psa10Match = text.match(/PSA 10 CHANCE:[^\\n]*\\n\\s*([\\d.]+)%/);
+        const profMatch  = text.match(/EXP\\.\\s*PROFIT:[^\\n]*\\n\\s*\\$?([\\d,]+(?:\\.\\d+)?)/);
 
-        // Expected profit — e.g. "EXP. PROFIT:\\n$954.16"
-        const profitMatch = text.match(/EXP\\.\\s*PROFIT:[^\\n]*\\n\\s*\\$?([\\d,]+(?:\\.\\d+)?)/);
-
-        // Card name: line after "VIEW FULL ANALYSIS"
-        const vfaIdx = lines.indexOf('VIEW FULL ANALYSIS');
+        const vfaIdx  = lines.indexOf('VIEW FULL ANALYSIS');
         const cardName = vfaIdx >= 0 ? (lines[vfaIdx + 1] || '') : '';
 
-        // Set info: "AQUAPOLIS · #H11/H32 · HOLO RARE"
         const setLine = lines.find(l => l.includes('\\u00b7') || l.includes('·')) || '';
-        const parts = setLine.split(/\\s*[·\\u00b7]\\s*/).map(p => p.trim());
-        const setName   = parts[0] || '';
-        const cardNum   = (parts[1] || '').replace(/^#/, '').trim();
-        const rarity    = parts[2] || '';
+        const parts   = setLine.split(/\\s*[·\\u00b7]\\s*/).map(p => p.trim());
 
         const parse = s => s ? parseFloat(s.replace(/,/g, '')) : null;
-
         return {
             card_name:       cardName,
-            set_name:        setName,
-            card_number:     cardNum,
-            rarity:          rarity,
+            set_name:        parts[0] || '',
+            card_number:     (parts[1] || '').replace(/^#/, '').trim(),
+            rarity:          parts[2] || '',
             roi_pct:         roiMatch  ? parse(roiMatch[1])  : null,
             raw_price:       rawMatch  ? parse(rawMatch[1])  : null,
             psa10_chance:    psa10Match ? parse(psa10Match[1]) / 100 : null,
-            expected_profit: profitMatch ? parse(profitMatch[1]) : null,
+            expected_profit: profMatch  ? parse(profMatch[1]) : null,
         };
     });
 }"""
 
 
-def run(output_path: str = str(OUTPUT_FILE), headless: bool = True) -> list[dict]:
-    """
-    Open pokemonpricetracker.com/psa-analysis, wait for cards to render,
-    then extract all 100 cards from the DOM.
-    """
+def _load_target_sets(path: str) -> set[str]:
+    """Return a set of lowercased set names from target_sets.csv."""
+    p = Path(path)
+    if not p.exists():
+        print(f"  Warning: target sets file not found: {path}")
+        return set()
+    import csv as _csv
+    with open(p, newline="", encoding="utf-8") as f:
+        return {row["set_name"].strip().lower() for row in _csv.DictReader(f) if row.get("set_name")}
+
+
+def _matches_target(card_set: str, target_sets: set[str]) -> bool:
+    if not target_sets:
+        return True
+    return card_set.strip().lower() in target_sets
+
+
+def _click_page(page, page_num: int) -> bool:
+    """Click a page number button. Returns True if the button was found."""
+    try:
+        clicked = page.evaluate(f"""() => {{
+            const btns = Array.from(document.querySelectorAll('button, a'));
+            const btn = btns.find(b => b.innerText.trim() === '{page_num}');
+            if (btn) {{ btn.click(); return true; }}
+            return false;
+        }}""")
+        return clicked
+    except Exception:
+        return False
+
+
+def run(
+    output_path: str = str(OUTPUT_FILE),
+    headless: bool = True,
+    all_pages: bool = False,
+    target_sets_path: str | None = None,
+) -> list[dict]:
     from playwright.sync_api import sync_playwright
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    target_sets = _load_target_sets(target_sets_path) if target_sets_path else set()
+    if target_sets:
+        print(f"Filtering to {len(target_sets)} target sets")
+
+    all_cards: list[dict] = []
+    seen_ids: set = set()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -88,50 +117,82 @@ def run(output_path: str = str(OUTPUT_FILE), headless: bool = True) -> list[dict
 
         print(f"Loading {BASE_URL} ...")
         page.goto(BASE_URL, wait_until="networkidle", timeout=60_000)
-
-        # Wait for at least one card to appear in the DOM
-        try:
-            page.wait_for_selector('div[class*="bg-card"][class*="text-card"]', timeout=20_000)
-        except Exception:
-            print("  Card elements didn't appear within 20s — trying anyway")
-
+        page.wait_for_selector('div[class*="bg-card"][class*="text-card"]', timeout=20_000)
         time.sleep(3)
 
-        results = page.evaluate(_EXTRACT_JS)
+        # Detect total pages
+        total_pages = page.evaluate("""() => {
+            const btns = Array.from(document.querySelectorAll('button, a'));
+            const nums = btns.map(b => parseInt(b.innerText.trim())).filter(n => !isNaN(n) && n > 1);
+            return nums.length ? Math.max(...nums) : 1;
+        }""")
+        pages_to_scrape = total_pages if all_pages else 1
+        print(f"  Site has {total_pages} pages — scraping {pages_to_scrape}")
+
+        for page_num in range(1, pages_to_scrape + 1):
+            if page_num > 1:
+                if not _click_page(page, page_num):
+                    print(f"  Page {page_num}: button not found, stopping")
+                    break
+                time.sleep(3)
+                try:
+                    page.wait_for_function(
+                        f"""() => document.querySelectorAll('div[class*="bg-card"]').length > 0""",
+                        timeout=10_000,
+                    )
+                except Exception:
+                    pass
+
+            cards = page.evaluate(_EXTRACT_JS)
+            added = 0
+            for card in cards:
+                if not card.get("card_name") or not card.get("raw_price"):
+                    continue
+                if not _matches_target(card.get("set_name", ""), target_sets):
+                    continue
+                uid = (card["card_name"], card["set_name"], card["card_number"])
+                if uid not in seen_ids:
+                    seen_ids.add(uid)
+                    all_cards.append(card)
+                    added += 1
+
+            print(f"  Page {page_num}/{pages_to_scrape}: +{added} cards (total {len(all_cards)})")
+
         browser.close()
 
-    # Filter out empty/malformed entries
-    results = [r for r in results if r.get("card_name") and r.get("raw_price")]
-    print(f"Extracted {len(results)} cards")
-
-    if not results:
-        print("No cards found. Run with --no-headless to see what the browser shows.")
+    print(f"\nExtracted {len(all_cards)} cards total")
+    if not all_cards:
+        print("No cards found. Try running without --target-sets to verify scraping works.")
         return []
 
-    # Sample output
-    for r in results[:3]:
+    for r in all_cards[:3]:
         print(f"  {r['card_name']} | {r['set_name']} | raw=${r['raw_price']} "
-              f"profit=${r['expected_profit']} roi={r['roi_pct']}% "
-              f"psa10={r['psa10_chance']}")
+              f"profit=${r['expected_profit']} roi={r['roi_pct']}%")
 
-    fieldnames = [
-        "card_name", "set_name", "card_number", "rarity",
-        "raw_price", "psa10_chance", "expected_profit", "roi_pct",
-    ]
+    fieldnames = ["card_name", "set_name", "card_number", "rarity",
+                  "raw_price", "psa10_chance", "expected_profit", "roi_pct"]
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(results)
-    print(f"Saved {len(results)} cards → {output_path}")
-
-    return results
+        writer.writerows(all_cards)
+    print(f"Saved {len(all_cards)} cards → {output_path}")
+    return all_cards
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", default=str(OUTPUT_FILE))
+    parser.add_argument("--all-pages", action="store_true",
+                        help="Scrape all pages (~10 min). Default: page 1 only.")
+    parser.add_argument("--target-sets", default=None, metavar="PATH",
+                        help="CSV with set_name column — filter to these sets only.")
     parser.add_argument("--headless", action="store_true", default=True)
     parser.add_argument("--no-headless", dest="headless", action="store_false")
     args = parser.parse_args()
-    run(output_path=args.output, headless=args.headless)
+    run(
+        output_path=args.output,
+        headless=args.headless,
+        all_pages=args.all_pages,
+        target_sets_path=args.target_sets,
+    )
