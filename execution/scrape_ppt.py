@@ -8,7 +8,6 @@ Requires Playwright — install with:
     playwright install chromium
 
 Runs a real browser locally (bypasses IP block that affects cloud runners).
-Injects a JS fetch interceptor before page load to capture the card data API call.
 
 Output: .tmp/ppt_cards.csv
     card_name, set_name, card_number, printing, rarity,
@@ -18,45 +17,12 @@ Output: .tmp/ppt_cards.csv
 
 import csv
 import json
+import re
 import time
 from pathlib import Path
 
 OUTPUT_FILE = Path(".tmp/ppt_cards.csv")
 BASE_URL = "https://www.pokemonpricetracker.com/psa-analysis"
-
-# Injected before page load — wraps fetch() and XHR to capture JSON payloads
-_INTERCEPT_SCRIPT = """
-window._pptCaptures = [];
-const _origFetch = window.fetch;
-window.fetch = async function(...args) {
-    const resp = await _origFetch(...args);
-    try {
-        const clone = resp.clone();
-        const text = await clone.text();
-        if (text.includes('"rawPrice"') || text.includes('"psaPrices"')) {
-            window._pptCaptures.push({url: String(args[0]), body: text});
-        }
-    } catch(e) {}
-    return resp;
-};
-const _origOpen = XMLHttpRequest.prototype.open;
-const _origSend = XMLHttpRequest.prototype.send;
-XMLHttpRequest.prototype.open = function(m, url) {
-    this._pptUrl = url;
-    return _origOpen.apply(this, arguments);
-};
-XMLHttpRequest.prototype.send = function() {
-    this.addEventListener('load', function() {
-        try {
-            const text = this.responseText;
-            if (text && (text.includes('"rawPrice"') || text.includes('"psaPrices"'))) {
-                window._pptCaptures.push({url: this._pptUrl, body: text});
-            }
-        } catch(e) {}
-    });
-    return _origSend.apply(this, arguments);
-};
-"""
 
 
 def _parse_card(card: dict) -> dict:
@@ -115,11 +81,72 @@ def _harvest_cards(node, card_list: list, seen_ids: set):
                 _harvest_cards(v, card_list, seen_ids)
 
 
+def _extract_from_next_f(html: str) -> list[dict]:
+    """
+    Parse __next_f.push() payloads using bracket-counting (not regex).
+    """
+    card_list: list[dict] = []
+    seen_ids: set = set()
+    search_str = "self.__next_f.push("
+    pos = 0
+
+    while True:
+        idx = html.find(search_str, pos)
+        if idx == -1:
+            break
+
+        arg_start = idx + len(search_str)
+        depth = 0
+        in_string = False
+        escape = False
+        i = arg_start
+
+        while i < len(html):
+            c = html[i]
+            if escape:
+                escape = False
+            elif in_string:
+                if c == "\\":
+                    escape = True
+                elif c == '"':
+                    in_string = False
+            else:
+                if c == '"':
+                    in_string = True
+                elif c in "([{":
+                    depth += 1
+                elif c in ")]}":
+                    if depth == 0:
+                        break
+                    depth -= 1
+            i += 1
+
+        raw = html[arg_start:i]
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            pos = idx + 1
+            continue
+
+        if not isinstance(payload, list) or len(payload) < 2:
+            pos = idx + 1
+            continue
+
+        value = payload[1]
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                pos = idx + 1
+                continue
+
+        _harvest_cards(value, card_list, seen_ids)
+        pos = idx + 1
+
+    return card_list
+
+
 def run(output_path: str = str(OUTPUT_FILE), headless: bool = True) -> list[dict]:
-    """
-    Open pokemonpricetracker.com/psa-analysis, intercept the card data fetch call,
-    and extract all cards from the JSON payload.
-    """
     from playwright.sync_api import sync_playwright
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -135,38 +162,83 @@ def run(output_path: str = str(OUTPUT_FILE), headless: bool = True) -> list[dict
             "Chrome/124.0.0.0 Safari/537.36"
         )})
 
-        # Inject fetch/XHR interceptor before any page scripts run
-        page.add_init_script(_INTERCEPT_SCRIPT)
-
         print(f"Loading {BASE_URL} ...")
         page.goto(BASE_URL, wait_until="networkidle", timeout=60_000)
-        time.sleep(5)  # wait for any deferred API calls
+        time.sleep(5)
 
-        # Retrieve whatever was captured by the JS interceptor
-        captures = page.evaluate("window._pptCaptures || []")
-        browser.close()
-
-    print(f"Intercepted {len(captures)} API response(s) containing card data")
-
-    for cap in captures:
-        url = cap.get("url", "?")
-        body_text = cap.get("body", "")
-        print(f"  URL: {url[:120]}")
+        # --- Strategy 1: read window.__next_f via evaluate ---
+        next_f_raw = page.evaluate("""() => {
+            try {
+                return JSON.stringify(window.__next_f || []);
+            } catch(e) { return '[]'; }
+        }""")
         try:
-            body = json.loads(body_text)
-            before = len(card_list)
-            _harvest_cards(body, card_list, seen_ids)
-            print(f"  → extracted {len(card_list) - before} cards")
-        except json.JSONDecodeError as e:
-            print(f"  → JSON parse error: {e}")
+            next_f = json.loads(next_f_raw)
+            print(f"window.__next_f has {len(next_f)} entries")
+            for entry in next_f:
+                _harvest_cards(entry, card_list, seen_ids)
+        except Exception as e:
+            print(f"  window.__next_f read error: {e}")
+
+        # --- Strategy 2: parse the page HTML __next_f push calls ---
+        if not card_list:
+            html = page.content()
+            cards_from_html = _extract_from_next_f(html)
+            card_list.extend(cards_from_html)
+            seen_ids.update(
+                (c["card_name"], c["set_name"], c["card_number"]) for c in cards_from_html
+            )
+
+        # --- Diagnostics if still empty ---
+        if not card_list:
+            html = page.content()
+
+            # Search for any price-related field names in the page
+            price_fields = set(re.findall(r'"([a-zA-Z]*[Pp]rice[a-zA-Z]*)":', html))
+            print(f"  Price-related fields in HTML: {price_fields or 'none'}")
+
+            # Show first 300 chars of each __next_f push to understand structure
+            push_idx = 0
+            search_str = "self.__next_f.push("
+            pos = 0
+            while push_idx < 3:
+                idx = html.find(search_str, pos)
+                if idx == -1:
+                    break
+                print(f"  push[{push_idx}]: {html[idx:idx+150]!r}")
+                pos = idx + 1
+                push_idx += 1
+
+            # Try reading window globals for any card-shaped data
+            globals_info = page.evaluate("""() => {
+                const keys = Object.keys(window).filter(k =>
+                    !['location','document','navigator','history','screen',
+                      'performance','console','fetch','XMLHttpRequest',
+                      '__next','__NEXT_DATA__'].includes(k)
+                    && typeof window[k] !== 'function'
+                    && typeof window[k] !== 'undefined'
+                );
+                const result = {};
+                for (const k of keys.slice(0, 30)) {
+                    try {
+                        const v = JSON.stringify(window[k]);
+                        if (v && v.length < 500) result[k] = v;
+                    } catch(e) {}
+                }
+                // Also check __NEXT_DATA__ specifically
+                if (window.__NEXT_DATA__) {
+                    result['__NEXT_DATA__'] = JSON.stringify(window.__NEXT_DATA__).slice(0, 500);
+                }
+                return result;
+            }""")
+            print(f"  Window globals: {globals_info}")
+
+        browser.close()
 
     print(f"Extracted {len(card_list)} cards total")
 
     if not card_list:
-        print("No card data captured.")
-        if not captures:
-            print("The fetch interceptor saw no matching API calls.")
-            print("The site may load data differently (WebSocket, SSE, or pre-rendered).")
+        print("Could not find card data. Check the diagnostic output above.")
         return []
 
     for r in card_list[:3]:
@@ -191,9 +263,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", default=str(OUTPUT_FILE))
-    parser.add_argument("--headless", action="store_true", default=True,
-                        help="Run without visible browser (default: True)")
-    parser.add_argument("--no-headless", dest="headless", action="store_false",
-                        help="Show browser window (requires X server)")
+    parser.add_argument("--headless", action="store_true", default=True)
+    parser.add_argument("--no-headless", dest="headless", action="store_false")
     args = parser.parse_args()
     run(output_path=args.output, headless=args.headless)
