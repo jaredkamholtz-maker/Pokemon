@@ -2,21 +2,12 @@ name: Pokemon Flip Analysis
 
 on:
   workflow_dispatch:
-    inputs:
-      era:
-        description: "Limit scan to one era (leave blank for full run)"
-        required: false
-        default: ""
-        type: choice
-        options:
-          - ""
-          - mega-evolution
-          - sword-shield
-          - scarlet-violet
-      sets:
-        description: "Comma-separated set names (overrides era, leave blank to use era/full)"
-        required: false
-        default: ""
+
+# NOTE: This workflow requires .tmp/ppt_cards.csv to be present.
+# pokemonpricetracker.com blocks GitHub Actions IPs, so you must:
+#   1. Run `python execution/scrape_ppt.py` on your local machine
+#   2. Upload .tmp/ppt_cards.csv as a workflow artifact or commit it temporarily
+# The workflow runs image analysis + email on whatever ppt_cards.csv is present.
 
 jobs:
   analyze:
@@ -39,11 +30,6 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GRADING_FEE: ${{ secrets.GRADING_FEE }}
           SELLING_FEE_RATE: ${{ secrets.SELLING_FEE_RATE }}
-          MIN_ROI: ${{ secrets.MIN_ROI }}
-          MIN_GEM_RATE: ${{ secrets.MIN_GEM_RATE }}
-          MIN_POP_COUNT: ${{ secrets.MIN_POP_COUNT }}
-          MAX_RAW_PRICE: ${{ secrets.MAX_RAW_PRICE }}
-          MAX_BREAKEVEN_GEM_RATE: ${{ secrets.MAX_BREAKEVEN_GEM_RATE }}
           GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
           EBAY_APP_ID: ${{ secrets.EBAY_APP_ID }}
           EBAY_CERT_ID: ${{ secrets.EBAY_CERT_ID }}
@@ -52,13 +38,7 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-          INPUT_SETS: ${{ github.event.inputs.sets }}
-          INPUT_ERA: ${{ github.event.inputs.era }}
-        run: |
-          ARGS=()
-          [ -n "$INPUT_SETS" ] && ARGS+=(--sets "$INPUT_SETS")
-          [ -n "$INPUT_ERA" ] && ARGS+=(--era "$INPUT_ERA")
-          python execution/run_analysis.py "${ARGS[@]}"
+        run: python execution/run_analysis.py
 
       - name: Upload results
         if: always()
