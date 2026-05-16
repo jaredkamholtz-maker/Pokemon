@@ -56,7 +56,19 @@ def run(output_path: str = str(OUTPUT_FILE), headless: bool = False) -> list[dic
 
         print(f"Loading {BASE_URL}...")
         page.goto(BASE_URL, wait_until="networkidle", timeout=30000)
-        time.sleep(2)
+        time.sleep(3)
+
+        # Dump page HTML for debugging
+        html = page.content()
+        debug_path = Path(".tmp/ppt_debug.html")
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        debug_path.write_text(html, encoding="utf-8")
+        print(f"Page HTML saved to {debug_path} ({len(html)} chars)")
+        print(f"Page title: {page.title()}")
+
+        # Also print all unique tag names and a sample of text content
+        body_text = page.inner_text("body")
+        print(f"\n── First 2000 chars of page text ──\n{body_text[:2000]}\n──────────────────────────────────\n")
 
         # Find all rows in the main table
         rows = page.query_selector_all("table tbody tr, [role='row']")
