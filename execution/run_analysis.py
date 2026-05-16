@@ -307,24 +307,38 @@ def run(
     df = pd.read_csv(ppt_path)
     print(f"[1/3] Loaded {len(df)} cards from {ppt_path}")
 
-    # Normalize ROI to decimal (PPT stores as percent, e.g. 335.69 means 335.69%)
+    # Normalize ROI to decimal (PPT stores as percent, e.g. 1908 means 1908%)
     if "roi_pct" in df.columns:
         df["roi"] = df["roi_pct"] / 100
+    # Compatibility: older CSVs may have gem_rate / total_population columns
     if "total_population" in df.columns:
         df["total_graded"] = df["total_population"]
-    df["track"] = df["gem_rate"].apply(lambda x: "population" if pd.notna(x) else "breakeven")
-
-    # Step 2: Filter by spread (PSA price must cover grading fee + margin)
-    min_spread = grading_fee + 5.0
-    has_spread = (
-        df["raw_price"].notna() &
-        (
-            (df["psa9_price"].notna() & (df["psa9_price"] - df["raw_price"] > min_spread)) |
-            (df["psa10_price"].notna() & (df["psa10_price"] - df["raw_price"] > min_spread))
-        )
+    df["track"] = df.get("gem_rate", pd.Series(dtype=float)).apply(
+        lambda x: "population" if pd.notna(x) else "breakeven"
     )
-    df = df[has_spread].copy()
-    print(f"  → {len(df)} cards with spread > ${min_spread:.0f} (covers grading fee + margin)")
+
+    # Step 2: Filter — expected_profit must exceed grading fee + margin
+    # (PPT already computes expected profit accounting for grading probabilities)
+    min_profit = grading_fee + 5.0
+    if "expected_profit" in df.columns and df["expected_profit"].notna().any():
+        has_profit = df["raw_price"].notna() & df["expected_profit"].notna() & (df["expected_profit"] > min_profit)
+        df = df[has_profit].copy()
+        print(f"  → {len(df)} cards with expected profit > ${min_profit:.0f}")
+    elif "psa9_price" in df.columns or "psa10_price" in df.columns:
+        # Legacy CSV with individual PSA prices
+        min_spread = min_profit
+        has_spread = (
+            df["raw_price"].notna() &
+            (
+                (df["psa9_price"].notna() & (df["psa9_price"] - df["raw_price"] > min_spread)) |
+                (df["psa10_price"].notna() & (df["psa10_price"] - df["raw_price"] > min_spread))
+            )
+        )
+        df = df[has_spread].copy()
+        print(f"  → {len(df)} cards with PSA spread > ${min_spread:.0f}")
+    else:
+        print("  No profit/price columns found to filter on — using all cards")
+        print(f"  Columns available: {list(df.columns)}")
 
     if df.empty:
         print("No cards passed the spread filter.")
