@@ -8,7 +8,7 @@ Requires Playwright — install with:
     playwright install chromium
 
 Runs a real browser locally (bypasses IP block that affects cloud runners).
-Intercepts the card data API response that the browser fetches after page load.
+Injects a JS fetch interceptor before page load to capture the card data API call.
 
 Output: .tmp/ppt_cards.csv
     card_name, set_name, card_number, printing, rarity,
@@ -23,6 +23,40 @@ from pathlib import Path
 
 OUTPUT_FILE = Path(".tmp/ppt_cards.csv")
 BASE_URL = "https://www.pokemonpricetracker.com/psa-analysis"
+
+# Injected before page load — wraps fetch() and XHR to capture JSON payloads
+_INTERCEPT_SCRIPT = """
+window._pptCaptures = [];
+const _origFetch = window.fetch;
+window.fetch = async function(...args) {
+    const resp = await _origFetch(...args);
+    try {
+        const clone = resp.clone();
+        const text = await clone.text();
+        if (text.includes('"rawPrice"') || text.includes('"psaPrices"')) {
+            window._pptCaptures.push({url: String(args[0]), body: text});
+        }
+    } catch(e) {}
+    return resp;
+};
+const _origOpen = XMLHttpRequest.prototype.open;
+const _origSend = XMLHttpRequest.prototype.send;
+XMLHttpRequest.prototype.open = function(m, url) {
+    this._pptUrl = url;
+    return _origOpen.apply(this, arguments);
+};
+XMLHttpRequest.prototype.send = function() {
+    this.addEventListener('load', function() {
+        try {
+            const text = this.responseText;
+            if (text && (text.includes('"rawPrice"') || text.includes('"psaPrices"'))) {
+                window._pptCaptures.push({url: this._pptUrl, body: text});
+            }
+        } catch(e) {}
+    });
+    return _origSend.apply(this, arguments);
+};
+"""
 
 
 def _parse_card(card: dict) -> dict:
@@ -59,7 +93,6 @@ def _looks_like_card(obj) -> bool:
 
 
 def _harvest_cards(node, card_list: list, seen_ids: set):
-    """Recursively walk a JSON structure collecting card objects."""
     if isinstance(node, list):
         cards = [x for x in node if _looks_like_card(x)]
         if cards:
@@ -84,34 +117,14 @@ def _harvest_cards(node, card_list: list, seen_ids: set):
 
 def run(output_path: str = str(OUTPUT_FILE), headless: bool = True) -> list[dict]:
     """
-    Open pokemonpricetracker.com/psa-analysis in a browser, intercept the card
-    data API response, and extract all cards.
+    Open pokemonpricetracker.com/psa-analysis, intercept the card data fetch call,
+    and extract all cards from the JSON payload.
     """
     from playwright.sync_api import sync_playwright
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-
-    captured: list[dict] = []  # raw JSON responses that contain card data
     card_list: list[dict] = []
     seen_ids: set = set()
-
-    def handle_response(response):
-        url = response.url
-        # Card data comes from the site's own API — look for any JSON response
-        # that contains card-shaped objects
-        if "pokemonpricetracker.com" not in url:
-            return
-        ct = response.headers.get("content-type", "")
-        if "json" not in ct:
-            return
-        try:
-            body = response.json()
-            _harvest_cards(body, card_list, seen_ids)
-            if card_list:
-                print(f"  Captured {len(card_list)} cards from: {url}")
-                captured.append(url)
-        except Exception:
-            pass
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -122,30 +135,40 @@ def run(output_path: str = str(OUTPUT_FILE), headless: bool = True) -> list[dict
             "Chrome/124.0.0.0 Safari/537.36"
         )})
 
-        page.on("response", handle_response)
+        # Inject fetch/XHR interceptor before any page scripts run
+        page.add_init_script(_INTERCEPT_SCRIPT)
 
         print(f"Loading {BASE_URL} ...")
         page.goto(BASE_URL, wait_until="networkidle", timeout=60_000)
+        time.sleep(5)  # wait for any deferred API calls
 
-        # Give the page extra time to finish any deferred API calls
-        time.sleep(5)
-
-        # Also wait for any pending network activity to settle
-        try:
-            page.wait_for_load_state("networkidle", timeout=10_000)
-        except Exception:
-            pass
-
+        # Retrieve whatever was captured by the JS interceptor
+        captures = page.evaluate("window._pptCaptures || []")
         browser.close()
+
+    print(f"Intercepted {len(captures)} API response(s) containing card data")
+
+    for cap in captures:
+        url = cap.get("url", "?")
+        body_text = cap.get("body", "")
+        print(f"  URL: {url[:120]}")
+        try:
+            body = json.loads(body_text)
+            before = len(card_list)
+            _harvest_cards(body, card_list, seen_ids)
+            print(f"  → extracted {len(card_list) - before} cards")
+        except json.JSONDecodeError as e:
+            print(f"  → JSON parse error: {e}")
 
     print(f"Extracted {len(card_list)} cards total")
 
     if not card_list:
         print("No card data captured.")
-        print("Tip: check that the site is reachable and not IP-blocking this machine.")
+        if not captures:
+            print("The fetch interceptor saw no matching API calls.")
+            print("The site may load data differently (WebSocket, SSE, or pre-rendered).")
         return []
 
-    # Sample output
     for r in card_list[:3]:
         print(f"  {r['card_name']} | {r['set_name']} | raw=${r['raw_price']} "
               f"psa9=${r['psa9_price']} psa10=${r['psa10_price']}")
