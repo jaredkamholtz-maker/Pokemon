@@ -18,7 +18,6 @@ Output: .tmp/ppt_cards.csv
 
 import csv
 import json
-import re
 import time
 from pathlib import Path
 
@@ -29,32 +28,79 @@ BASE_URL = "https://www.pokemonpricetracker.com/psa-analysis"
 def _extract_cards_from_html(html: str) -> list[dict]:
     """
     Parse Next.js RSC payload from self.__next_f.push(...) script tags.
+    Uses bracket-counting (not regex) so nested structures are handled correctly.
     Returns a flat list of card dicts.
     """
-    # Collect all push() payloads
-    chunks = re.findall(r'self\.__next_f\.push\(\s*(\[.*?\])\s*\)', html, re.DOTALL)
-
     card_list: list[dict] = []
     seen_ids: set = set()
 
-    for chunk in chunks:
+    search_str = "self.__next_f.push("
+    pos = 0
+
+    while True:
+        idx = html.find(search_str, pos)
+        if idx == -1:
+            break
+
+        # Walk forward from the opening paren, counting brackets
+        arg_start = idx + len(search_str)
+        depth = 0
+        in_string = False
+        escape = False
+        i = arg_start
+
+        while i < len(html):
+            c = html[i]
+            if escape:
+                escape = False
+            elif in_string:
+                if c == "\\":
+                    escape = True
+                elif c == '"':
+                    in_string = False
+            else:
+                if c == '"':
+                    in_string = True
+                elif c in "([{":
+                    depth += 1
+                elif c in ")]}":
+                    if depth == 0:
+                        break
+                    depth -= 1
+            i += 1
+
+        raw = html[arg_start:i]
         try:
-            payload = json.loads(chunk)
+            payload = json.loads(raw)
         except json.JSONDecodeError:
+            pos = idx + 1
             continue
 
         # payload is [key, value] — value may be a JSON string or object
         if not isinstance(payload, list) or len(payload) < 2:
+            pos = idx + 1
             continue
+
         value = payload[1]
         if isinstance(value, str):
             try:
                 value = json.loads(value)
             except json.JSONDecodeError:
-                pass
+                pos = idx + 1
+                continue
 
         # Walk the structure looking for arrays of card objects
         _harvest_cards(value, card_list, seen_ids)
+        pos = idx + 1
+
+    # Diagnostic: if still nothing found, show how many rawPrice occurrences exist
+    if not card_list:
+        count = html.count('"rawPrice"')
+        print(f"  Debug: found {count} occurrences of '\"rawPrice\"' in HTML")
+        if count > 0:
+            # Show 200 chars of context around first occurrence
+            first = html.find('"rawPrice"')
+            print(f"  Context: ...{html[max(0,first-100):first+100]}...")
 
     return card_list
 
