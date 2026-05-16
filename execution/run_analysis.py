@@ -320,10 +320,16 @@ def run(
     # Step 2: Filter — expected_profit must exceed grading fee + margin
     # (PPT already computes expected profit accounting for grading probabilities)
     min_profit = grading_fee + 5.0
+    min_raw_price = 10.0
     if "expected_profit" in df.columns and df["expected_profit"].notna().any():
-        has_profit = df["raw_price"].notna() & df["expected_profit"].notna() & (df["expected_profit"] > min_profit)
+        has_profit = (
+            df["raw_price"].notna() &
+            (df["raw_price"] >= min_raw_price) &
+            df["expected_profit"].notna() &
+            (df["expected_profit"] > min_profit)
+        )
         df = df[has_profit].copy()
-        print(f"  → {len(df)} cards with expected profit > ${min_profit:.0f}")
+        print(f"  → {len(df)} cards with raw_price >= ${min_raw_price:.0f} and expected profit > ${min_profit:.0f}")
     elif "psa9_price" in df.columns or "psa10_price" in df.columns:
         # Legacy CSV with individual PSA prices
         min_spread = min_profit
