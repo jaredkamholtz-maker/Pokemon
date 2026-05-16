@@ -18,7 +18,6 @@ Output: .tmp/ppt_cards.csv
 
 import csv
 import json
-import re
 import time
 from pathlib import Path
 
@@ -29,32 +28,78 @@ BASE_URL = "https://www.pokemonpricetracker.com/psa-analysis"
 def _extract_cards_from_html(html: str) -> list[dict]:
     """
     Parse Next.js RSC payload from self.__next_f.push(...) script tags.
-    Returns a flat list of card dicts.
+    Uses character-by-character bracket counting so nested JSON is handled correctly.
     """
-    # Collect all push() payloads
-    chunks = re.findall(r'self\.__next_f\.push\(\s*(\[.*?\])\s*\)', html, re.DOTALL)
-
     card_list: list[dict] = []
     seen_ids: set = set()
+    search_str = "self.__next_f.push("
+    pos = 0
 
-    for chunk in chunks:
+    while True:
+        idx = html.find(search_str, pos)
+        if idx == -1:
+            break
+
+        # Walk from the opening paren, counting depth to find the matching close
+        arg_start = idx + len(search_str)
+        depth = 0
+        in_string = False
+        escape = False
+        i = arg_start
+
+        while i < len(html):
+            c = html[i]
+            if escape:
+                escape = False
+            elif in_string:
+                if c == "\\":
+                    escape = True
+                elif c == '"':
+                    in_string = False
+            else:
+                if c == '"':
+                    in_string = True
+                elif c in "([{":
+                    depth += 1
+                elif c in ")]}":
+                    if depth == 0:
+                        break
+                    depth -= 1
+            i += 1
+
+        raw = html[arg_start:i]
         try:
-            payload = json.loads(chunk)
+            payload = json.loads(raw)
         except json.JSONDecodeError:
+            pos = idx + 1
             continue
 
-        # payload is [key, value] — value may be a JSON string or object
         if not isinstance(payload, list) or len(payload) < 2:
+            pos = idx + 1
             continue
+
         value = payload[1]
         if isinstance(value, str):
             try:
                 value = json.loads(value)
             except json.JSONDecodeError:
-                pass
+                pos = idx + 1
+                continue
 
-        # Walk the structure looking for arrays of card objects
         _harvest_cards(value, card_list, seen_ids)
+        pos = idx + 1
+
+    # Diagnostics when nothing found
+    if not card_list:
+        push_count = html.count(search_str)
+        raw_count = html.count('"rawPrice"')
+        print(f"  Debug: {push_count} __next_f.push() calls found, "
+              f"{raw_count} occurrences of '\"rawPrice\"' in HTML")
+        if raw_count > 0:
+            first = html.find('"rawPrice"')
+            print(f"  Context: ...{html[max(0, first-120):first+120]}...")
+        elif push_count == 0:
+            print(f"  First 500 chars of HTML: {html[:500]}")
 
     return card_list
 
@@ -69,9 +114,8 @@ def _looks_like_card(obj: dict) -> bool:
 
 
 def _harvest_cards(node, card_list: list, seen_ids: set):
-    """Recursively walk JSON, collect card objects."""
+    """Recursively walk JSON, collecting card objects."""
     if isinstance(node, list):
-        # Check if this list IS the card array
         cards_in_node = [x for x in node if _looks_like_card(x)]
         if cards_in_node:
             for card in cards_in_node:
@@ -97,10 +141,7 @@ def _parse_card(card: dict) -> dict:
     psa_prices = card.get("psaPrices") or {}
     psa10_data = psa_prices.get("psa10") or {}
     psa9_data  = psa_prices.get("psa9")  or {}
-
     grading_probs = card.get("gradingProbabilities") or {}
-    psa10_chance = grading_probs.get("psa10")
-    psa9_chance  = grading_probs.get("psa9")
 
     return {
         "card_name":        card.get("name", ""),
@@ -111,8 +152,8 @@ def _parse_card(card: dict) -> dict:
         "raw_price":        card.get("rawPrice"),
         "psa9_price":       psa9_data.get("price"),
         "psa10_price":      psa10_data.get("price"),
-        "psa10_chance":     psa10_chance,
-        "psa9_chance":      psa9_chance,
+        "psa10_chance":     grading_probs.get("psa10"),
+        "psa9_chance":      grading_probs.get("psa9"),
         "roi_pct":          card.get("roiPercentage"),
         "expected_profit":  card.get("potentialProfit"),
         "total_population": card.get("totalPopulation"),
@@ -127,8 +168,8 @@ def run(output_path: str = str(OUTPUT_FILE), headless: bool = True,
 
     Args:
         output_path: CSV destination
-        headless: run Playwright without a visible browser (required in Codespace)
-        use_cache: if True and .tmp/ppt_debug.html exists, parse that instead of fetching
+        headless: run Playwright without a visible browser (required on Linux without X)
+        use_cache: parse .tmp/ppt_debug.html instead of fetching (useful for debugging)
     """
     from playwright.sync_api import sync_playwright
 
@@ -159,22 +200,19 @@ def run(output_path: str = str(OUTPUT_FILE), headless: bool = True,
         debug_path.write_text(html, encoding="utf-8")
         print(f"Page HTML saved to {debug_path} ({len(html):,} chars)")
 
-    # --- parse embedded JSON ---
     print("Parsing embedded Next.js JSON...")
     results = _extract_cards_from_html(html)
     print(f"Extracted {len(results)} cards")
 
     if not results:
-        print("No data found — check ppt_debug.html to inspect the page structure")
+        print("No data found — check .tmp/ppt_debug.html to inspect the page structure")
         return []
 
-    # Print a sample
     for r in results[:3]:
         print(f"  {r['card_name']} | {r['set_name']} | raw=${r['raw_price']} "
               f"psa9=${r['psa9_price']} psa10=${r['psa10_price']} "
               f"psa10_chance={r['psa10_chance']}")
 
-    # Save CSV
     fieldnames = [
         "card_name", "set_name", "card_number", "printing", "rarity",
         "raw_price", "psa9_price", "psa10_price", "psa10_chance", "psa9_chance",
@@ -198,6 +236,6 @@ if __name__ == "__main__":
     parser.add_argument("--no-headless", dest="headless", action="store_false",
                         help="Show browser window (requires X server)")
     parser.add_argument("--use-cache", action="store_true",
-                        help="Parse .tmp/ppt_debug.html instead of fetching fresh")
+                        help="Parse existing .tmp/ppt_debug.html instead of fetching fresh")
     args = parser.parse_args()
     run(output_path=args.output, headless=args.headless, use_cache=args.use_cache)
