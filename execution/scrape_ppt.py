@@ -21,6 +21,7 @@ Usage:
 """
 
 import csv
+import re
 import time
 from pathlib import Path
 
@@ -67,13 +68,25 @@ def _load_target_sets(path: str) -> set[str]:
         return set()
     import csv as _csv
     with open(p, newline="", encoding="utf-8") as f:
-        return {row["set_name"].strip().lower() for row in _csv.DictReader(f) if row.get("set_name")}
+        return {row["set_name"].strip() for row in _csv.DictReader(f) if row.get("set_name")}
+
+
+def _norm(s: str) -> str:
+    return re.sub(r'[^a-z0-9]', '', s.lower())
 
 
 def _matches_target(card_set: str, target_sets: set[str]) -> bool:
     if not target_sets:
         return True
-    return card_set.strip().lower() in target_sets
+    ppt = _norm(card_set)
+    for t in target_sets:
+        tn = _norm(t)
+        # Exact normalized match, or target is a long-enough substring of PPT name
+        # (handles "XY - ROARING SKIES" matching target "Roaring Skies")
+        # Short targets (≤3 chars like "xy", "151") require exact match to avoid false positives
+        if tn == ppt or (len(tn) >= 4 and tn in ppt):
+            return True
+    return False
 
 
 def _click_page(page, page_num: int) -> bool:
