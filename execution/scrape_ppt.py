@@ -97,21 +97,24 @@ def run(output_path: str = str(OUTPUT_FILE), headless: bool = True) -> list[dict
 
     def handle_response(response):
         url = response.url
-        # Card data comes from the site's own API — look for any JSON response
-        # that contains card-shaped objects
-        if "pokemonpricetracker.com" not in url:
-            return
+        status = response.status
         ct = response.headers.get("content-type", "")
-        if "json" not in ct:
+        # Log every non-trivial response to help identify where card data comes from
+        if any(ext in url for ext in (".js", ".css", ".png", ".ico", ".woff")):
+            return
+        print(f"  [{status}] {ct[:30]:30s} {url[:100]}")
+        if "json" not in ct and "text" not in ct:
             return
         try:
-            body = response.json()
+            text = response.text()
+            if "rawPrice" not in text:
+                return
+            body = json.loads(text)
             _harvest_cards(body, card_list, seen_ids)
-            if card_list:
-                print(f"  Captured {len(card_list)} cards from: {url}")
-                captured.append(url)
-        except Exception:
-            pass
+            print(f"  *** Captured {len(card_list)} cards from: {url}")
+            captured.append(url)
+        except Exception as e:
+            print(f"  (parse error: {e})")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
