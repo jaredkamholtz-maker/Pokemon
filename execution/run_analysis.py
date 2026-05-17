@@ -415,14 +415,20 @@ def run(
     )
     if needs_psa_prices and not final.empty:
         try:
-            from execution.fetch_ebay_prices import fetch_card_prices
+            import fetch_ebay_prices as _feb
+            app_id  = os.environ.get("EBAY_APP_ID", "")
+            cert_id = os.environ.get("EBAY_CERT_ID", "")
+            token = _feb._get_oauth_token(app_id, cert_id) if app_id and cert_id else None
+            if not token:
+                raise RuntimeError("EBAY_APP_ID / EBAY_CERT_ID not set or token failed")
             print(f"[3b] Fetching eBay PSA 9/10 sold prices for {len(final)} cards...")
             psa9_vals, psa10_vals = [], []
             for _, row in final.iterrows():
-                prices = fetch_card_prices(
+                prices = _feb.fetch_card_prices(
                     row.get("card_name", ""),
                     row.get("set_name", ""),
                     row.get("card_number", ""),
+                    token,
                 )
                 psa9_vals.append(prices.get("psa9_price"))
                 psa10_vals.append(prices.get("psa10_price"))
