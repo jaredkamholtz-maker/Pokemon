@@ -105,70 +105,55 @@ def _parse_detail_prices(text: str) -> dict:
 
 
 def _fetch_detail_prices(page, cards: list[dict]) -> list[dict]:
-    """Click VIEW FULL ANALYSIS for each card, scrape PSA prices, go back."""
-    debug_printed = False
+    """Intercept the API call made when VIEW FULL ANALYSIS is clicked."""
 
-    for i, card in enumerate(cards):
-        card_name = card["card_name"]
+    # Capture the first card to discover the API endpoint and response shape
+    captured = {}
+
+    def _on_response(response):
+        url = response.url
+        # Skip static assets, images, analytics
+        if any(x in url for x in ['.js', '.css', '.png', '.svg', 'analytics', 'fonts']):
+            return
+        if response.request.method not in ('GET', 'POST'):
+            return
         try:
-            # Click the VFA element for this card by matching card name in text
-            escaped = card_name.replace("'", "\\'")
-            clicked = page.evaluate(f"""() => {{
-                const allCards = document.querySelectorAll('div[class*="bg-card"][class*="text-card"]');
-                for (const c of allCards) {{
-                    if ((c.innerText || '').includes('{escaped}')) {{
-                        const vfa = Array.from(c.querySelectorAll('*')).find(
-                            el => el.children.length === 0 && (el.innerText || '').trim() === 'VIEW FULL ANALYSIS'
-                        );
-                        if (vfa) {{ vfa.click(); return true; }}
-                    }}
-                }}
-                return false;
-            }}""")
+            body = response.json()
+            captured[url] = body
+        except Exception:
+            pass
 
-            if not clicked:
-                print(f"  [{i+1}/{len(cards)}] {card_name}: VFA button not found")
-                card["psa9_price"] = None
-                card["psa10_price"] = None
-                continue
+    page.on('response', _on_response)
 
-            # Give the page time to react (modal open or navigation)
-            time.sleep(3)
-            detail_url = page.url
-            # Grab full page text — covers both navigation AND modal/drawer overlays
-            text = page.evaluate("() => document.body.innerText || ''")
+    # Click VFA on first card to discover the API
+    first = cards[0]
+    escaped = first["card_name"].replace("'", "\\'")
+    page.evaluate(f"""() => {{
+        const allCards = document.querySelectorAll('div[class*="bg-card"][class*="text-card"]');
+        for (const c of allCards) {{
+            if ((c.innerText || '').includes('{escaped}')) {{
+                const vfa = Array.from(c.querySelectorAll('*')).find(
+                    el => el.children.length === 0 && (el.innerText || '').trim() === 'VIEW FULL ANALYSIS'
+                );
+                if (vfa) {{ vfa.click(); return; }}
+                c.click(); return;
+            }}
+        }}
+    }}""")
+    time.sleep(4)
+    page.off('response', _on_response)
 
-            if not debug_printed:
-                print(f"\n── After click: URL={detail_url} ──")
-                print(text[:1200])
-                print("──────────────────────────────────────────\n")
-                debug_printed = True
+    print(f"\n── API calls captured after VFA click ({len(captured)}) ──")
+    import json
+    for url, body in list(captured.items())[:10]:
+        body_str = json.dumps(body)[:300]
+        print(f"  {url}\n    {body_str}\n")
+    print("──────────────────────────────────────────\n")
 
-            prices = _parse_detail_prices(text)
-            card["psa9_price"]  = prices["psa9_price"]
-            card["psa10_price"] = prices["psa10_price"]
-            card["detail_url"]  = detail_url
-            print(f"  [{i+1}/{len(cards)}] {card_name}: PSA9=${prices['psa9_price']} PSA10=${prices['psa10_price']}")
-
-        except Exception as e:
-            print(f"  [{i+1}/{len(cards)}] {card_name}: error — {e}")
-            card["psa9_price"] = None
-            card["psa10_price"] = None
-
-        finally:
-            # Return to listing — press Escape (closes modal) then go back if URL changed
-            try:
-                page.keyboard.press("Escape")
-                time.sleep(0.5)
-                if BASE_URL.rstrip('/') not in page.url:
-                    page.go_back(wait_until="networkidle", timeout=15_000)
-                page.wait_for_selector('div[class*="bg-card"][class*="text-card"]', timeout=10_000)
-                time.sleep(1)
-            except Exception:
-                page.goto(BASE_URL, wait_until="networkidle", timeout=30_000)
-                page.wait_for_selector('div[class*="bg-card"][class*="text-card"]', timeout=10_000)
-                time.sleep(2)
-
+    # For now return cards with None prices — will implement once API is known
+    for card in cards:
+        card.setdefault("psa9_price", None)
+        card.setdefault("psa10_price", None)
     return cards
 
 
