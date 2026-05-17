@@ -284,33 +284,6 @@ def run(
 
             print(f"  Page {page_num}/{pages_to_scrape}: +{added} cards (total {len(all_cards)})")
 
-        # Debug: dump first card HTML to understand link structure
-        if all_cards:
-            first_url = all_cards[0].get('detail_url') or '[EMPTY — link not found]'
-            print(f"  First card detail URL: {first_url}")
-            if not all_cards[0].get('detail_url'):
-                html_sample = page.evaluate("""() => {
-                    const card = document.querySelector('div[class*="bg-card"][class*="text-card"]');
-                    if (!card) return 'NO CARD FOUND';
-                    // Check parent and grandparent for links
-                    const p1 = card.parentElement;
-                    const p2 = p1 ? p1.parentElement : null;
-                    const p3 = p2 ? p2.parentElement : null;
-                    return JSON.stringify({
-                        card_tag: card.tagName,
-                        card_links: Array.from(card.querySelectorAll('a')).map(a => a.href),
-                        parent_tag: p1 ? p1.tagName : null,
-                        parent_href: (p1 && p1.tagName === 'A') ? p1.href : null,
-                        parent_links: p1 ? Array.from(p1.querySelectorAll('a')).map(a => a.href) : [],
-                        gp_tag: p2 ? p2.tagName : null,
-                        gp_href: (p2 && p2.tagName === 'A') ? p2.href : null,
-                        gp_links: p2 ? Array.from(p2.querySelectorAll('a')).map(a => a.href) : [],
-                        ggp_tag: p3 ? p3.tagName : null,
-                        ggp_href: (p3 && p3.tagName === 'A') ? p3.href : null,
-                    });
-                }""")
-                print(f"  DOM debug: {html_sample}")
-
         # Visit each card's detail page to get PSA 9/10 prices
         if detail_prices and all_cards:
             print(f"\nFetching PSA 9/10 prices from {len(all_cards)} detail pages (~{len(all_cards)*3//60+1} min)...")
