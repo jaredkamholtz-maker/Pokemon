@@ -367,11 +367,6 @@ def _derive_recommendation_ximilar(ximilar: dict | None, flags_result: dict) -> 
                 "photo_quality": "disqualified", "notes": f"Disqualified: {', '.join(active_critical)}",
                 "red_flags_active": ", ".join(active_critical)}
 
-    if isinstance(red_flags.get("back_not_shown"), dict) and red_flags["back_not_shown"].get("flag"):
-        return {"recommendation": "SKIP", "predicted_grade": None, "psa9_or_better_probability": 0,
-                "photo_quality": photo_quality, "notes": "Back not shown — cannot verify card condition",
-                "red_flags_active": "back_not_shown"}
-
     if photo_quality == "poor":
         return {"recommendation": "SKIP", "predicted_grade": None, "psa9_or_better_probability": 0,
                 "photo_quality": "poor",
@@ -687,17 +682,6 @@ def _derive_from_analysis(parsed: dict) -> dict:
         prob       = int(overlap * 70 * grade_conf)
     else:
         prob = 0
-
-    # No back photo → can't verify card condition; auto-disqualify
-    if isinstance(red_flags.get("back_not_shown"), dict) and red_flags["back_not_shown"].get("flag"):
-        return {
-            "recommendation": "SKIP",
-            "predicted_grade": predicted_grade,
-            "psa9_or_better_probability": 0,
-            "photo_quality": photo_quality,
-            "notes": "Back not shown — cannot verify card condition",
-            "red_flags_active": "back_not_shown",
-        }
 
     soft_flags = [f for f, info in red_flags.items()
                   if f not in _CRITICAL_FLAGS
