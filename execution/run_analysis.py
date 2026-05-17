@@ -137,8 +137,19 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         _raw_price = row.get("raw_price")
         buy_price_val = _ebay_price if pd.notna(_ebay_price) else _raw_price
         raw = _fmt_price(buy_price_val)
-        psa9 = _fmt_price(row.get("psa9_price"))
-        psa10 = _fmt_price(row.get("psa10_price"))
+        # Use PPT expected_profit/roi/psa10_chance when PSA prices not available
+        psa9_price_val  = row.get("psa9_price")
+        psa10_price_val = row.get("psa10_price")
+        has_psa_prices  = pd.notna(psa9_price_val) or pd.notna(psa10_price_val)
+        if has_psa_prices:
+            psa9  = _fmt_price(psa9_price_val)
+            psa10 = _fmt_price(psa10_price_val)
+        else:
+            exp_profit = row.get("expected_profit")
+            roi_pct    = row.get("roi_pct") or (row.get("roi", 0) * 100 if pd.notna(row.get("roi")) else None)
+            psa10_ch   = row.get("psa10_chance")
+            psa9  = f"{_fmt_price(exp_profit)} exp. profit" if pd.notna(exp_profit) else "—"
+            psa10 = f"{roi_pct:.0f}% ROI" if pd.notna(roi_pct) and roi_pct == roi_pct else "—"
         is_breakeven = row.get("track") == "breakeven"
         gem_val = row.get("gem_rate")
         total = row.get("total_graded")
@@ -152,6 +163,8 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
                 gem = f"{pct} ({int(psa9_count + psa10_count):,} / {int(total):,}{src_label})"
             else:
                 gem = pct
+        elif pd.notna(row.get("psa10_chance")) and row.get("psa10_chance") == row.get("psa10_chance"):
+            gem = f"{row['psa10_chance'] * 100:.0f}% PSA 10 chance"
         elif is_breakeven:
             be = row.get("breakeven_gem_rate")
             gem = f"BE ≤ {_fmt_pct(be)}" if pd.notna(be) and be == be else "No data"
@@ -228,9 +241,9 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
     <tr style="background:#f1f5f9;text-align:left;">
       <th style="padding:10px 14px;">Card</th>
       <th style="padding:10px 14px;text-align:right;">{"Buy Price (eBay)" if has_image_analysis else "Raw (Ungraded)"}</th>
-      <th style="padding:10px 14px;text-align:right;">PSA 9</th>
-      <th style="padding:10px 14px;text-align:right;">PSA 10</th>
-      <th style="padding:10px 14px;text-align:right;">Gem Rate (gem / total)</th>
+      <th style="padding:10px 14px;text-align:right;">Exp. Profit</th>
+      <th style="padding:10px 14px;text-align:right;">ROI</th>
+      <th style="padding:10px 14px;text-align:right;">PSA 10 Chance / Gem Rate</th>
     </tr>
   </thead>
   <tbody>
@@ -320,10 +333,16 @@ def run(
     # Step 2: Filter — expected_profit must exceed grading fee + margin
     # (PPT already computes expected profit accounting for grading probabilities)
     min_profit = grading_fee + 5.0
+    min_raw_price = 10.0
     if "expected_profit" in df.columns and df["expected_profit"].notna().any():
-        has_profit = df["raw_price"].notna() & df["expected_profit"].notna() & (df["expected_profit"] > min_profit)
+        has_profit = (
+            df["raw_price"].notna() &
+            (df["raw_price"] >= min_raw_price) &
+            df["expected_profit"].notna() &
+            (df["expected_profit"] > min_profit)
+        )
         df = df[has_profit].copy()
-        print(f"  → {len(df)} cards with expected profit > ${min_profit:.0f}")
+        print(f"  → {len(df)} cards with raw_price >= ${min_raw_price:.0f} and expected profit > ${min_profit:.0f}")
     elif "psa9_price" in df.columns or "psa10_price" in df.columns:
         # Legacy CSV with individual PSA prices
         min_spread = min_profit
@@ -352,8 +371,8 @@ def run(
     Path(OUTPUT_PATH).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(OUTPUT_PATH, index=False)
 
-    n_for_vision = min(len(df), IMAGE_ANALYSIS_CAP)
-    print(f"  → {n_for_vision}/{len(df)} cards → Claude Vision\n")
+    n_for_vision = IMAGE_ANALYSIS_CAP  # target; analyze_card_images scans a 5x pool internally
+    print(f"  → up to {n_for_vision} qualifying cards from pool of {len(df)} → image analysis\n")
 
     # Step 3: eBay image analysis (top IMAGE_ANALYSIS_CAP by expected profit)
     final = df
@@ -389,24 +408,27 @@ def run(
         final = final[final["ebay_listing_url"].notna() & (final["ebay_listing_url"] != "")].copy()
     final = final.drop_duplicates(subset=["card_name", "set_name"], keep="first").copy()
 
-    # Drop cards where the actual listing price leaves no margin after grading fee
+    # Drop cards where the actual eBay listing price leaves no margin after grading fee.
     if "ebay_price" in final.columns and has_image_analysis:
-        def _still_profitable(row):
-            buy = row.get("ebay_price")
-            if pd.isna(buy) or buy == 0:
-                return True
-            psa9  = row.get("psa9_price")
-            psa10 = row.get("psa10_price")
-            if pd.notna(psa9)  and psa9  - buy > grading_fee:
-                return True
-            if pd.notna(psa10) and psa10 - buy > grading_fee:
-                return True
-            return False
-        before = len(final)
-        final = final[final.apply(_still_profitable, axis=1)].copy()
-        dropped = before - len(final)
-        if dropped:
-            print(f"  Dropped {dropped} card(s) whose actual listing price left no margin after grading fee.")
+        has_psa_prices = (("psa9_price" in final.columns and final["psa9_price"].notna().any()) or
+                          ("psa10_price" in final.columns and final["psa10_price"].notna().any()))
+        if has_psa_prices:
+            def _still_profitable(row):
+                buy = row.get("ebay_price")
+                if pd.isna(buy) or buy == 0:
+                    return True
+                psa9  = row.get("psa9_price")
+                psa10 = row.get("psa10_price")
+                if pd.notna(psa9)  and psa9  - buy > grading_fee:
+                    return True
+                if pd.notna(psa10) and psa10 - buy > grading_fee:
+                    return True
+                return False
+            before = len(final)
+            final = final[final.apply(_still_profitable, axis=1)].copy()
+            dropped = before - len(final)
+            if dropped:
+                print(f"  Dropped {dropped} card(s) whose actual listing price left no margin after grading fee.")
 
     # Email
     if not skip_email:

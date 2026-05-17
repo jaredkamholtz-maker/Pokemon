@@ -50,7 +50,7 @@ INPUT_FILE = Path(".tmp/flip_opportunities.csv")
 OUTPUT_ANALYSIS = Path(".tmp/image_analysis.csv")
 OUTPUT_SHORTLIST = Path(".tmp/final_shortlist.csv")
 
-MAX_LISTINGS = 3        # analyze the top 3 most expensive ungraded listings
+MAX_LISTINGS = 6        # analyze up to 6 ungraded listings per card
 BROWSE_LIMIT = 50       # how many results to fetch from Browse API before filtering
 RATE_DELAY = 0.5
 MODEL = "claude-sonnet-4-6"
@@ -65,6 +65,9 @@ REFERENCE_COMMITTED = Path("data/reference_card.jpg")
 # eBay item IDs that must never appear as candidates (visibly damaged cards used
 # as negative references in earlier versions — blocked to prevent self-surfacing).
 DAMAGED_EXAMPLE_ITEM_IDS = ["376469060746", "134783144970"]
+
+# Ximilar final grade threshold for SUBMIT (scale 1–10; ~PSA 8.5+ candidate)
+XIMILAR_SUBMIT_THRESHOLD = 8.0
 
 GRADING_PROMPT = """You are a strict PSA card grader analyzing seller photos from an eBay listing. Apply the OFFICIAL PSA grading standards exactly as written below. Be conservative — most cards do not reach PSA 9 or 10. Do not give the benefit of the doubt when a defect is visible.
 
@@ -154,6 +157,30 @@ Return ONLY valid JSON, no other text:
   "summary": "2-3 sentence overall assessment applying PSA standards strictly"
 }"""
 
+RED_FLAGS_PROMPT = """You are authenticating a Pokémon TCG card listing on eBay. Check ONLY for the red flags below — do NOT grade the card.
+
+CARD: {card_name} | {set_name} | #{card_number}
+
+RED FLAGS:
+- stock_photo_suspected: looks like a generic database/stock image, not the seller's own photo
+- back_not_shown: no clear photo of the card back
+- fake_indicators: wrong font, color, holo pattern, or card back design for this set
+- altered_appearance: evidence of trimming, recoloring, or surface treatment
+- glare_obscures_detail: severe glare hiding critical card areas
+
+Return ONLY valid JSON, no other text:
+{
+  "red_flags": {
+    "stock_photo_suspected": {"flag": false, "reason": ""},
+    "back_not_shown": {"flag": false, "reason": ""},
+    "fake_indicators": {"flag": false, "reason": ""},
+    "altered_appearance": {"flag": false, "reason": ""},
+    "glare_obscures_detail": {"flag": false, "reason": ""}
+  },
+  "overall_photo_quality": {"rating": "poor|fair|good|excellent", "notes": ""},
+  "summary": "1-2 sentence assessment of this listing"
+}"""
+
 REFERENCE_INTRO = (
     "The first image below is a REFERENCE EXAMPLE provided by the buyer. "
     "It represents a card they consider a strong PSA 9/10 candidate — "
@@ -223,6 +250,171 @@ def _fetch_reference_image(token: str) -> str | None:
         print(f"  (reference image fetch failed: {e})")
     return None
 
+
+
+def grade_with_ximilar(images_b64: list[str], image_urls: list[str] | None = None) -> dict | None:
+    """
+    Call Ximilar Card Grader API with front (and optionally back) images.
+    Passes up to 2 records (front + back) for the most accurate grade.
+    Prefers _url over _base64 to handle CDN redirects.
+    Returns dict with corners, edges, surface, centering, final, condition — or None on failure.
+    """
+    load_dotenv()
+    api_key = os.environ.get("XIMILAR_API_KEY")
+    if not api_key:
+        return None
+
+    def _call(records: list[dict]) -> dict | None:
+        try:
+            resp = _SESSION.post(
+                "https://api.ximilar.com/card-grader/v2/grade",
+                headers={"Authorization": f"Token {api_key}", "Content-Type": "application/json"},
+                json={"records": records},
+                timeout=30,
+            )
+            if not resp or resp.status_code != 200:
+                print(f"(Ximilar HTTP {resp and resp.status_code})", end=" ", flush=True)
+                return None
+            result_records = resp.json().get("records", [])
+            if not result_records:
+                return None
+            status = result_records[0].get("_status", {})
+            if status.get("code", 200) >= 400:
+                print(f"(Ximilar: {status.get('text', 'error')})", end=" ", flush=True)
+                return None
+            grades = result_records[0].get("grades", {})
+            if not grades or grades.get("final") is None:
+                return None
+            return {
+                "corners":   grades.get("corners"),
+                "edges":     grades.get("edges"),
+                "surface":   grades.get("surface"),
+                "centering": grades.get("centering"),
+                "final":     grades.get("final"),
+                "condition": grades.get("condition"),
+            }
+        except Exception as e:
+            print(f"(Ximilar error: {e})", end=" ", flush=True)
+            return None
+
+    # Build records: up to 2 images (front + back)
+    # Try URL first, fall back to base64
+    if image_urls:
+        url_records = [{"_url": u} for u in image_urls[:2]]
+        result = _call(url_records)
+        if result:
+            return result
+        print("(URL failed, retrying with base64)", end=" ", flush=True)
+
+    b64_records = [{"_base64": b} for b in images_b64[:2]]
+    return _call(b64_records)
+
+
+def check_red_flags_claude(card_name: str, set_name: str, card_number: str,
+                            image_b64: str, reference_b64: str | None = None) -> dict:
+    """Call Claude Vision for red flag / authenticity check only (not grade prediction)."""
+    load_dotenv()
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return {"red_flags": {}, "overall_photo_quality": {"rating": "fair"}, "summary": ""}
+    try:
+        from anthropic import Anthropic
+    except ImportError:
+        return {"red_flags": {}, "overall_photo_quality": {"rating": "fair"}, "summary": ""}
+
+    try:
+        prompt_text = (RED_FLAGS_PROMPT
+                       .replace("{card_name}", card_name)
+                       .replace("{set_name}", set_name)
+                       .replace("{card_number}", card_number or "unknown"))
+        if reference_b64:
+            content = [
+                {"type": "text", "text": REFERENCE_INTRO},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": reference_b64}},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
+                {"type": "text", "text": prompt_text},
+            ]
+        else:
+            content = [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
+                {"type": "text", "text": prompt_text},
+            ]
+        client = Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=MODEL, max_tokens=512,
+            messages=[{"role": "user", "content": content}],
+        )
+        raw = response.content[0].text.strip()
+        raw_clean = re.sub(r"```(?:json)?\s*", "", raw).strip()
+        start = raw_clean.find("{")
+        end   = raw_clean.rfind("}") + 1
+        if start == -1 or end == 0:
+            return {"red_flags": {}, "overall_photo_quality": {"rating": "fair"}, "summary": "JSON parse failed"}
+        parsed = json.loads(raw_clean[start:end])
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception as e:
+        return {"red_flags": {}, "overall_photo_quality": {"rating": "fair"}, "summary": f"Error: {e}"}
+
+
+def _derive_recommendation_ximilar(ximilar: dict | None, flags_result: dict) -> dict:
+    """Combine Ximilar grade + Claude red flags → final recommendation."""
+    red_flags    = flags_result.get("red_flags", {})
+    photo_q_info = flags_result.get("overall_photo_quality", {})
+    photo_quality = photo_q_info.get("rating", "fair") if isinstance(photo_q_info, dict) else "fair"
+    summary = flags_result.get("summary") or ""
+
+    # Critical flags → disqualify
+    active_critical = [f for f in _CRITICAL_FLAGS
+                       if isinstance(red_flags.get(f), dict) and red_flags[f].get("flag")]
+    if active_critical:
+        return {"recommendation": "SKIP", "predicted_grade": None, "psa9_or_better_probability": 0,
+                "photo_quality": "disqualified", "notes": f"Disqualified: {', '.join(active_critical)}",
+                "red_flags_active": ", ".join(active_critical)}
+
+    if photo_quality == "poor":
+        return {"recommendation": "SKIP", "predicted_grade": None, "psa9_or_better_probability": 0,
+                "photo_quality": "poor",
+                "notes": photo_q_info.get("notes", "Photo quality too poor to assess") if isinstance(photo_q_info, dict) else "poor quality",
+                "red_flags_active": None}
+
+    if not ximilar or ximilar.get("final") is None:
+        return {"recommendation": "SKIP", "predicted_grade": None, "psa9_or_better_probability": 0,
+                "photo_quality": photo_quality, "notes": "Ximilar grading unavailable", "red_flags_active": None}
+
+    final = ximilar["final"]
+    predicted_grade = round(final)
+
+    if final >= 9.5:   prob = 85
+    elif final >= 9.0: prob = 70
+    elif final >= 8.5: prob = 50
+    elif final >= XIMILAR_SUBMIT_THRESHOLD: prob = 30
+    else:              prob = 0
+
+    soft_flags = [f for f, info in red_flags.items()
+                  if f not in _CRITICAL_FLAGS and isinstance(info, dict) and info.get("flag")]
+
+    ximilar_detail = (f"Ximilar {final:.1f}/10 "
+                      f"(corners={ximilar.get('corners') or '?'} "
+                      f"edges={ximilar.get('edges') or '?'} "
+                      f"surface={ximilar.get('surface') or '?'} "
+                      f"centering={ximilar.get('centering') or '?'})")
+    notes = (f"⚠️ {', '.join(soft_flags)}. " if soft_flags else "") + ximilar_detail
+    if summary:
+        notes += f" | {summary}"
+
+    return {
+        "recommendation":             "SUBMIT" if final >= XIMILAR_SUBMIT_THRESHOLD else "SKIP",
+        "predicted_grade":            predicted_grade,
+        "psa9_or_better_probability": prob,
+        "photo_quality":              photo_quality,
+        "notes":                      notes,
+        "red_flags_active":           ", ".join(soft_flags) if soft_flags else None,
+        "ximilar_final":              final,
+        "ximilar_corners":            ximilar.get("corners"),
+        "ximilar_edges":              ximilar.get("edges"),
+        "ximilar_surface":            ximilar.get("surface"),
+        "ximilar_centering":          ximilar.get("centering"),
+    }
 
 
 def _get(url: str, params: dict | None = None, max_retries: int = 3) -> object | None:
@@ -345,8 +537,11 @@ def search_ebay_listings(card_name: str, set_name: str, card_number: str = "") -
             image_url = item.get("image", {}).get("imageUrl")
             # Prefer listings that have additional photos (real seller photos)
             extra_images = len(item.get("additionalImages", []))
+            additional_urls = [img.get("imageUrl") for img in item.get("additionalImages", [])
+                               if img.get("imageUrl")]
             out.append({"title": title, "price": price, "url": url,
-                        "image_url": image_url, "extra_images": extra_images})
+                        "image_url": image_url, "extra_images": extra_images,
+                        "additional_image_urls": additional_urls})
             if len(out) >= MAX_LISTINGS * 4:   # gather extras for sorting
                 break
         if strict:
@@ -401,8 +596,8 @@ def search_ebay_listings(card_name: str, set_name: str, card_number: str = "") -
             print("(0 candidates after all filters)", end=" ", flush=True)
             return []
 
-        # Sort by price descending — most expensive raw listings tend to be better condition
-        candidates.sort(key=lambda c: -c["price"])
+        # Sort: most photos first (more likely to include back), then price descending
+        candidates.sort(key=lambda c: (-c["extra_images"], -c["price"]))
         return candidates[:MAX_LISTINGS]
     except Exception as e:
         print(f"  Browse API error: {e}")
@@ -494,17 +689,6 @@ def _derive_from_analysis(parsed: dict) -> dict:
         prob       = int(overlap * 70 * grade_conf)
     else:
         prob = 0
-
-    # No back photo → can't verify card condition; auto-disqualify
-    if isinstance(red_flags.get("back_not_shown"), dict) and red_flags["back_not_shown"].get("flag"):
-        return {
-            "recommendation": "SKIP",
-            "predicted_grade": predicted_grade,
-            "psa9_or_better_probability": 0,
-            "photo_quality": photo_quality,
-            "notes": "Back not shown — cannot verify card condition",
-            "red_flags_active": "back_not_shown",
-        }
 
     soft_flags = [f for f, info in red_flags.items()
                   if f not in _CRITICAL_FLAGS
@@ -613,6 +797,7 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
     best_analysis: dict = {"recommendation": "SKIP", "notes": "photo unverified"}
     best_score = -1
     any_non_disqualified = False
+    all_back_not_shown   = True  # tracks whether every analyzed listing lacked a back photo
 
     for i, listing in enumerate(listings, 1):
         image_url = listing.get("image_url")
@@ -620,26 +805,70 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
             print(f"  [{i}/{len(listings)}] ${listing['price']:.2f} — no image from API")
             continue
 
-        print(f"  [{i}/{len(listings)}] ${listing['price']:.2f} — downloading image...", end=" ", flush=True)
+        print(f"  [{i}/{len(listings)}] ${listing['price']:.2f} — downloading images...", end=" ", flush=True)
         time.sleep(RATE_DELAY)
-        b64 = download_image_b64(_upgrade_ebay_image_url(image_url))
-        if not b64:
+        # Download main image + up to 2 additional images so Claude can see the back
+        all_urls = [_upgrade_ebay_image_url(image_url)] + [
+            _upgrade_ebay_image_url(u) for u in listing.get("additional_image_urls", [])[:2]
+        ]
+        images_b64 = [b for b in (download_image_b64(u) for u in all_urls) if b]
+        if not images_b64:
             print("download failed")
             continue
+        b64 = images_b64[0]  # main image used for Ximilar
 
-        print("analyzing...", end=" ", flush=True)
-        analysis = analyze_image(card_name, set_name, card_number, b64, reference_b64)
+        load_dotenv()
+        if os.environ.get("XIMILAR_API_KEY"):
+            print("Claude flags...", end=" ", flush=True)
+            flags_result = check_red_flags_claude(card_name, set_name, card_number, images_b64, reference_b64)
+            red_flags    = flags_result.get("red_flags", {})
+            # Critical flags → skip before spending an Ximilar credit
+            active_critical = [f for f in _CRITICAL_FLAGS
+                               if isinstance(red_flags.get(f), dict) and red_flags[f].get("flag")]
+            if active_critical:
+                print(f"SKIP [{', '.join(active_critical)}]")
+                continue
+            # Back not shown → skip this listing, try next
+            if isinstance(red_flags.get("back_not_shown"), dict) and red_flags["back_not_shown"].get("flag"):
+                print("SKIP [back_not_shown]")
+                continue
+            print("Ximilar...", end=" ", flush=True)
+            ximilar = grade_with_ximilar(images_b64, image_urls=all_urls)
+            ximilar_passes = ximilar and (ximilar.get("final") or 0) >= XIMILAR_SUBMIT_THRESHOLD
+            if ximilar_passes:
+                # Ximilar looks good — run full Claude grading as second opinion
+                print("Claude grade...", end=" ", flush=True)
+                claude_grade = analyze_image(card_name, set_name, card_number, b64, reference_b64)
+                analysis = _derive_recommendation_ximilar(ximilar, flags_result)
+                # Require Claude to agree: grade_high must be >= 9
+                claude_high = claude_grade.get("grade_high") or 0
+                if analysis.get("recommendation") == "SUBMIT" and claude_high < 9:
+                    analysis["recommendation"] = "SKIP"
+                    analysis["notes"] = (
+                        f"Ximilar {ximilar.get('final', '?'):.1f}/10 but Claude grade too low "
+                        f"(PSA {claude_grade.get('grade_low','?')}–{claude_high}) | "
+                        + (claude_grade.get("notes") or "")
+                    )
+            else:
+                analysis = _derive_recommendation_ximilar(ximilar, flags_result)
+        else:
+            print("analyzing...", end=" ", flush=True)
+            analysis = analyze_image(card_name, set_name, card_number, b64, reference_b64)
+
         rec      = analysis.get("recommendation", "SKIP")
         prob     = analysis.get("psa9_or_better_probability") or 0
-        flags    = analysis.get("red_flags_active") or ""
-        flag_str = f" [{flags}]" if flags else ""
+        active   = analysis.get("red_flags_active") or ""
+        flag_str = f" [{active}]" if active else ""
         print(f"{rec} (PSA 9+: {prob}%){flag_str}")
 
-        # Disqualified (stock photo / fake) listings never win, but cheapest
-        # non-disqualified listing upgrades the fallback
-        if analysis.get("photo_quality") == "disqualified":
-            continue
+        # Claude-only path: check critical flags and back_not_shown here
+        if not os.environ.get("XIMILAR_API_KEY"):
+            if analysis.get("photo_quality") == "disqualified":
+                continue
+            if "back_not_shown" in active:
+                continue
 
+        all_back_not_shown = False
         any_non_disqualified = True
         submit_bonus = 1000 if rec == "SUBMIT" else 0
         score = submit_bonus + prob
@@ -647,8 +876,20 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
             best_score    = score
             best_listing  = listing
             best_analysis = analysis
+        if rec == "SUBMIT":
+            break  # found a good listing — no need to check more
 
-    if not any_non_disqualified:
+    if all_back_not_shown and not any_non_disqualified:
+        print("  No listings show card back — cannot assess condition")
+        best_analysis = {
+            "recommendation": "SKIP",
+            "predicted_grade": None,
+            "psa9_or_better_probability": 0,
+            "photo_quality": "skip",
+            "notes": "No eBay listings show card back — cannot assess condition",
+            "red_flags_active": "back_not_shown",
+        }
+    elif not any_non_disqualified:
         print("  All listings had stock/unverifiable photos — using cheapest listing URL as fallback")
 
     return best_listing, best_analysis
@@ -665,8 +906,14 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
         return pd.DataFrame()
 
     sort_col   = "roi" if "roi" in df.columns else df.columns[0]
-    candidates = df.sort_values(sort_col, ascending=False).head(top_n).copy()
-    print(f"Analyzing top {len(candidates)} cards...\n")
+    # Pass a larger pool so the loop can skip cards with no back photos and still fill top_n
+    pool_size  = min(len(df), top_n)
+    candidates = df.sort_values(sort_col, ascending=False).head(pool_size).copy()
+
+    load_dotenv()
+    ximilar_active = bool(os.environ.get("XIMILAR_API_KEY"))
+    grader_label = "Ximilar + Claude flags" if ximilar_active else "Claude Vision"
+    print(f"Analyzing up to {pool_size} cards ({grader_label}), collecting first {top_n} with back photos...\n")
 
     # Load reference images once — positive + negative anchors for every Claude Vision call
     app_id  = os.environ.get("EBAY_APP_ID")
@@ -690,7 +937,10 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
     print()
 
     rows = []
+    qualified_count = 0  # cards where at least one listing showed the back
     for rank, (_, card) in enumerate(candidates.iterrows(), 1):
+        if qualified_count >= top_n:
+            break
         card_name   = str(card.get("card_name",   "")).strip()
         set_name    = str(card.get("set_name",    "")).strip()
         card_number = str(card.get("card_number", "")).strip()
@@ -739,7 +989,9 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
                 for field in ("recommendation", "predicted_grade", "psa9_or_better_probability",
                               "photo_quality", "notes", "error", "red_flags_active",
                               "centering_front", "corners", "edges", "surface_front",
-                              "holo_condition", "grade_low", "grade_high"):
+                              "holo_condition", "grade_low", "grade_high",
+                              "ximilar_final", "ximilar_corners", "ximilar_edges",
+                              "ximilar_surface", "ximilar_centering"):
                     if field in analysis:
                         result[field] = analysis[field]
         except Exception as e:
@@ -754,6 +1006,9 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
         print(f"  → ${result.get('ebay_price') or 0:.2f} | {rec} | predicted PSA {grade} | PSA 9+: {prob}%\n")
 
         rows.append(result)
+        # Count as qualified if at least one listing showed the back (not all-back-not-shown)
+        if "No eBay listings show card back" not in (result.get("notes") or ""):
+            qualified_count += 1
 
     analysis_df = pd.DataFrame(rows)
     OUTPUT_ANALYSIS.parent.mkdir(parents=True, exist_ok=True)
