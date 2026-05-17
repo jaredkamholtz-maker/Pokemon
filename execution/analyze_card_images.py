@@ -589,8 +589,8 @@ def search_ebay_listings(card_name: str, set_name: str, card_number: str = "") -
             print("(0 candidates after all filters)", end=" ", flush=True)
             return []
 
-        # Sort by price descending — most expensive raw listings tend to be better condition
-        candidates.sort(key=lambda c: -c["price"])
+        # Sort: most photos first (more likely to include back), then price descending
+        candidates.sort(key=lambda c: (-c["extra_images"], -c["price"]))
         return candidates[:MAX_LISTINGS]
     except Exception as e:
         print(f"  Browse API error: {e}")
@@ -790,6 +790,7 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
     best_analysis: dict = {"recommendation": "SKIP", "notes": "photo unverified"}
     best_score = -1
     any_non_disqualified = False
+    all_back_not_shown   = True  # tracks whether every analyzed listing lacked a back photo
 
     for i, listing in enumerate(listings, 1):
         image_url = listing.get("image_url")
@@ -809,22 +810,27 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
             print("Ximilar...", end=" ", flush=True)
             ximilar = grade_with_ximilar(b64, image_url=_upgrade_ebay_image_url(image_url))
             print("Claude flags...", end=" ", flush=True)
-            flags   = check_red_flags_claude(card_name, set_name, card_number, b64, reference_b64)
-            analysis = _derive_recommendation_ximilar(ximilar, flags)
+            flags_result = check_red_flags_claude(card_name, set_name, card_number, b64, reference_b64)
+            analysis = _derive_recommendation_ximilar(ximilar, flags_result)
         else:
             print("analyzing...", end=" ", flush=True)
             analysis = analyze_image(card_name, set_name, card_number, b64, reference_b64)
+
         rec      = analysis.get("recommendation", "SKIP")
         prob     = analysis.get("psa9_or_better_probability") or 0
-        flags    = analysis.get("red_flags_active") or ""
-        flag_str = f" [{flags}]" if flags else ""
+        active   = analysis.get("red_flags_active") or ""
+        flag_str = f" [{active}]" if active else ""
         print(f"{rec} (PSA 9+: {prob}%){flag_str}")
 
-        # Disqualified (stock photo / fake) listings never win, but cheapest
-        # non-disqualified listing upgrades the fallback
+        # Critical red flags (stock photo / fake) — skip this listing entirely
         if analysis.get("photo_quality") == "disqualified":
             continue
 
+        # Back not shown — skip this listing, try the next one
+        if "back_not_shown" in active:
+            continue
+
+        all_back_not_shown = False
         any_non_disqualified = True
         submit_bonus = 1000 if rec == "SUBMIT" else 0
         score = submit_bonus + prob
@@ -833,7 +839,17 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
             best_listing  = listing
             best_analysis = analysis
 
-    if not any_non_disqualified:
+    if all_back_not_shown and not any_non_disqualified:
+        print("  No listings show card back — cannot assess condition")
+        best_analysis = {
+            "recommendation": "SKIP",
+            "predicted_grade": None,
+            "psa9_or_better_probability": 0,
+            "photo_quality": "skip",
+            "notes": "No eBay listings show card back — cannot assess condition",
+            "red_flags_active": "back_not_shown",
+        }
+    elif not any_non_disqualified:
         print("  All listings had stock/unverifiable photos — using cheapest listing URL as fallback")
 
     return best_listing, best_analysis
