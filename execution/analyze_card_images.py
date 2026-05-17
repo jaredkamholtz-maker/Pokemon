@@ -860,6 +860,8 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
             best_score    = score
             best_listing  = listing
             best_analysis = analysis
+        if rec == "SUBMIT":
+            break  # found a good listing — no need to check more
 
     if all_back_not_shown and not any_non_disqualified:
         print("  No listings show card back — cannot assess condition")
