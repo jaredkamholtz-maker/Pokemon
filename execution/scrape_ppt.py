@@ -105,29 +105,32 @@ def _parse_detail_prices(text: str) -> dict:
 
 
 def _fetch_detail_prices(page, cards: list[dict]) -> list[dict]:
-    """Intercept the API call made when VIEW FULL ANALYSIS is clicked."""
+    """Extract PSA prices from page-embedded data or expanded card DOM."""
+    import json
 
-    # Capture the first card to discover the API endpoint and response shape
-    captured = {}
+    # 1. Try __NEXT_DATA__ — Next.js embeds all SSR props as JSON in the page
+    next_data = page.evaluate("""() => {
+        const el = document.getElementById('__NEXT_DATA__');
+        return el ? el.textContent : null;
+    }""")
+    if next_data:
+        print(f"\n── __NEXT_DATA__ sample (first 1500 chars) ──")
+        print(next_data[:1500])
+        print("──────────────────────────────────────────\n")
 
-    def _on_response(response):
-        url = response.url
-        # Skip static assets, images, analytics
-        if any(x in url for x in ['.js', '.css', '.png', '.svg', 'analytics', 'fonts']):
-            return
-        if response.request.method not in ('GET', 'POST'):
-            return
-        try:
-            body = response.json()
-            captured[url] = body
-        except Exception:
-            pass
-
-    page.on('response', _on_response)
-
-    # Click VFA on first card to discover the API
+    # 2. Click VFA on first card and capture the expanded card text
     first = cards[0]
     escaped = first["card_name"].replace("'", "\\'")
+    before_text = page.evaluate(f"""() => {{
+        const allCards = document.querySelectorAll('div[class*="bg-card"][class*="text-card"]');
+        for (const c of allCards) {{
+            if ((c.innerText || '').includes('{escaped}')) {{
+                return c.innerText;
+            }}
+        }}
+        return '';
+    }}""")
+
     page.evaluate(f"""() => {{
         const allCards = document.querySelectorAll('div[class*="bg-card"][class*="text-card"]');
         for (const c of allCards) {{
@@ -140,17 +143,25 @@ def _fetch_detail_prices(page, cards: list[dict]) -> list[dict]:
             }}
         }}
     }}""")
-    time.sleep(4)
-    page.remove_listener('response', _on_response)
+    time.sleep(3)
 
-    print(f"\n── API calls captured after VFA click ({len(captured)}) ──")
-    import json
-    for url, body in list(captured.items())[:10]:
-        body_str = json.dumps(body)[:300]
-        print(f"  {url}\n    {body_str}\n")
+    after_text = page.evaluate(f"""() => {{
+        const allCards = document.querySelectorAll('div[class*="bg-card"][class*="text-card"]');
+        for (const c of allCards) {{
+            if ((c.innerText || '').includes('{escaped}')) {{
+                return c.innerText;
+            }}
+        }}
+        // Also check for any modal/drawer that appeared
+        const modal = document.querySelector('[role="dialog"], [class*="modal"], [class*="drawer"], [class*="sheet"]');
+        return modal ? modal.innerText : '';
+    }}""")
+
+    print(f"\n── Card text BEFORE click ──\n{before_text[:600]}")
+    print(f"\n── Card text AFTER click ──\n{after_text[:1000]}")
     print("──────────────────────────────────────────\n")
 
-    # For now return cards with None prices — will implement once API is known
+    # For now return cards with None prices — will implement once structure is known
     for card in cards:
         card.setdefault("psa9_price", None)
         card.setdefault("psa10_price", None)
