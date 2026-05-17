@@ -131,19 +131,14 @@ def _fetch_detail_prices(page, cards: list[dict]) -> list[dict]:
         return '';
     }}""")
 
-    page.evaluate(f"""() => {{
-        const allCards = document.querySelectorAll('div[class*="bg-card"][class*="text-card"]');
-        for (const c of allCards) {{
-            if ((c.innerText || '').includes('{escaped}')) {{
-                const vfa = Array.from(c.querySelectorAll('*')).find(
-                    el => el.children.length === 0 && (el.innerText || '').trim() === 'VIEW FULL ANALYSIS'
-                );
-                if (vfa) {{ vfa.click(); return; }}
-                c.click(); return;
-            }}
-        }}
-    }}""")
-    time.sleep(3)
+    # Use Playwright's native locator to click VIEW FULL ANALYSIS
+    try:
+        page.get_by_text("VIEW FULL ANALYSIS").first.click()
+    except Exception as e:
+        print(f"  Native click failed: {e}")
+    time.sleep(4)
+    # Check if URL changed (Next.js client-side navigation)
+    print(f"  URL after click: {page.url}")
 
     after_text = page.evaluate(f"""() => {{
         const allCards = document.querySelectorAll('div[class*="bg-card"][class*="text-card"]');
