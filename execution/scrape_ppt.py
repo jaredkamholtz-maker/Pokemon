@@ -16,6 +16,8 @@ Usage:
     python3 execution/scrape_ppt.py                        # page 1 only (~84 cards)
     python3 execution/scrape_ppt.py --all-pages            # all pages (~10 min)
     python3 execution/scrape_ppt.py --all-pages --target-sets data/target_sets.csv
+    python3 execution/scrape_ppt.py --save-session         # one-time: log in and save session
+    python3 execution/scrape_ppt.py --detail-prices        # fetch PSA 9/10 prices (needs saved session)
 """
 
 import csv
@@ -69,43 +71,84 @@ def _parse_psa_prices(text: str) -> dict:
     }
 
 
-def _intercept_page_load_prices(page) -> dict:
+SESSION_FILE = Path(".tmp/ppt_session.json")
+
+
+def save_session(headless: bool = False):
     """
-    Capture JSON API responses during page load to find embedded PSA price data.
-    Returns a dict keyed by card_name -> {psa9_price, psa10_price}.
+    Open a visible browser, let you log in manually, then save the session.
+    Run once: python3 execution/scrape_ppt.py --save-session
     """
+    from playwright.sync_api import sync_playwright
     import json
-    captured = {}
-
-    def on_response(response):
-        url = response.url
-        if any(x in url for x in ('.js', '.css', '.png', '.svg', '.ico', 'fonts', 'analytics', 'gtag')):
-            return
-        try:
-            body = response.json()
-            captured[url] = body
-        except Exception:
-            pass
-
-    page.on('response', on_response)
-    page.reload(wait_until='networkidle', timeout=60_000)
-    time.sleep(3)
-    page.remove_listener('response', on_response)
-
-    print(f"\n── API responses captured during page load: {len(captured)} ──")
-    for url, body in list(captured.items())[:20]:
-        body_str = json.dumps(body)[:400]
-        print(f"  {url}\n    {body_str}\n")
-    print("──────────────────────────────────────────\n")
-    return {}
+    print("Opening browser — log in to pokemonpricetracker.com, then press Enter here.")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        ctx = browser.new_context()
+        page = ctx.new_page()
+        page.goto("https://www.pokemonpricetracker.com/sign-in",
+                  wait_until="networkidle", timeout=30_000)
+        input("  → Log in via Google in the browser window, then press Enter to save session...")
+        cookies = ctx.cookies()
+        storage = ctx.storage_state()
+        SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SESSION_FILE.write_text(json.dumps(storage))
+        print(f"  Session saved to {SESSION_FILE}")
+        browser.close()
 
 
 def _fetch_detail_prices(page, cards: list[dict]) -> list[dict]:
-    """Intercept page load API calls to extract PSA 9/10 prices."""
-    _intercept_page_load_prices(page)
-    for card in cards:
-        card.setdefault("psa9_price", None)
-        card.setdefault("psa10_price", None)
+    """Click VIEW FULL ANALYSIS (authenticated) and scrape PSA prices."""
+    debug_done = False
+
+    for i, card in enumerate(cards):
+        name = card["card_name"]
+        try:
+            before = set(page.evaluate("() => document.body.innerText").splitlines())
+
+            # Use native Playwright click on the VFA button for this card
+            escaped = name.replace("'", "\\'")
+            clicked = page.evaluate(f"""() => {{
+                for (const c of document.querySelectorAll('div[class*="bg-card"][class*="text-card"]')) {{
+                    if ((c.innerText || '').includes('{escaped}')) {{
+                        const vfa = [...c.querySelectorAll('*')].find(
+                            el => !el.children.length && (el.innerText||'').trim()==='VIEW FULL ANALYSIS'
+                        );
+                        if (vfa) {{ vfa.click(); return true; }}
+                        c.click(); return true;
+                    }}
+                }}
+                return false;
+            }}""")
+
+            if not clicked:
+                print(f"  [{i+1}/{len(cards)}] {name}: VFA button not found")
+                card["psa9_price"] = card["psa10_price"] = None
+                continue
+
+            time.sleep(3)
+
+            after_lines = page.evaluate("() => document.body.innerText").splitlines()
+            new_text = "\n".join(l for l in after_lines if l not in before)
+
+            if not debug_done:
+                print(f"\n── New text after VFA click (authenticated) ──")
+                print(new_text[:2000] if new_text else "[NO NEW TEXT]")
+                print("──────────────────────────────────────────\n")
+                debug_done = True
+
+            prices = _parse_psa_prices(new_text)
+            card["psa9_price"]  = prices["psa9_price"]
+            card["psa10_price"] = prices["psa10_price"]
+            print(f"  [{i+1}/{len(cards)}] {name}: PSA9=${prices['psa9_price']} PSA10=${prices['psa10_price']}")
+
+            page.keyboard.press("Escape")
+            time.sleep(1)
+
+        except Exception as e:
+            print(f"  [{i+1}/{len(cards)}] {name}: error — {e}")
+            card["psa9_price"] = card["psa10_price"] = None
+
     return cards
 
 
@@ -165,7 +208,15 @@ def run(
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
-        page = browser.new_page(ignore_https_errors=True)
+        # Load saved PPT session if available (required for --detail-prices)
+        storage_state = str(SESSION_FILE) if SESSION_FILE.exists() else None
+        if detail_prices and not storage_state:
+            print("  Warning: no saved session found. Run with --save-session first.")
+        ctx = browser.new_context(
+            storage_state=storage_state,
+            ignore_https_errors=True,
+        )
+        page = ctx.new_page()
         page.set_extra_http_headers({"User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -249,14 +300,20 @@ if __name__ == "__main__":
     parser.add_argument("--target-sets", default=None, metavar="PATH",
                         help="CSV with set_name column — filter to these sets only.")
     parser.add_argument("--detail-prices", action="store_true",
-                        help="Click each card to fetch PSA 9/10 prices (slower, run locally).")
+                        help="Click each card to fetch PSA 9/10 prices (requires --save-session first).")
+    parser.add_argument("--save-session", action="store_true",
+                        help="Open browser to log in manually and save session for --detail-prices.")
     parser.add_argument("--headless", action="store_true", default=True)
     parser.add_argument("--no-headless", dest="headless", action="store_false")
     args = parser.parse_args()
-    run(
-        output_path=args.output,
-        headless=args.headless,
-        detail_prices=args.detail_prices,
-        all_pages=args.all_pages,
-        target_sets_path=args.target_sets,
-    )
+
+    if args.save_session:
+        save_session()
+    else:
+        run(
+            output_path=args.output,
+            headless=args.headless,
+            detail_prices=args.detail_prices,
+            all_pages=args.all_pages,
+            target_sets_path=args.target_sets,
+        )
