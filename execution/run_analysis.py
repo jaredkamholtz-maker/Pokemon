@@ -408,38 +408,6 @@ def run(
         final = final[final["ebay_listing_url"].notna() & (final["ebay_listing_url"] != "")].copy()
     final = final.drop_duplicates(subset=["card_name", "set_name"], keep="first").copy()
 
-    # Enrich with eBay PSA 9/10 sold prices whenever they're missing
-    needs_psa_prices = (
-        "psa9_price" not in final.columns
-        or not final["psa9_price"].notna().any()
-    )
-    if needs_psa_prices and not final.empty:
-        try:
-            import fetch_ebay_prices as _feb
-            app_id  = os.environ.get("EBAY_APP_ID", "")
-            cert_id = os.environ.get("EBAY_CERT_ID", "")
-            token = _feb._get_oauth_token(app_id, cert_id) if app_id and cert_id else None
-            if not token:
-                raise RuntimeError("EBAY_APP_ID / EBAY_CERT_ID not set or token failed")
-            print(f"[3b] Fetching eBay PSA 9/10 sold prices for {len(final)} cards...")
-            psa9_vals, psa10_vals = [], []
-            for _, row in final.iterrows():
-                prices = _feb.fetch_card_prices(
-                    row.get("card_name", ""),
-                    row.get("set_name", ""),
-                    row.get("card_number", ""),
-                    token,
-                )
-                psa9_vals.append(prices.get("psa9_price"))
-                psa10_vals.append(prices.get("psa10_price"))
-                print(f"  {row['card_name']}: PSA9=${prices.get('psa9_price')} PSA10=${prices.get('psa10_price')}")
-            final = final.copy()
-            final["psa9_price"]  = psa9_vals
-            final["psa10_price"] = psa10_vals
-            print()
-        except Exception as e:
-            print(f"  Warning: could not fetch PSA prices — {e}")
-
     # Drop cards where the actual eBay listing price leaves no margin after grading fee.
     if "ebay_price" in final.columns and has_image_analysis:
         has_psa_prices = (("psa9_price" in final.columns and final["psa9_price"].notna().any()) or

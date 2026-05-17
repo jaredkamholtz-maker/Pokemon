@@ -38,6 +38,11 @@ _EXTRACT_JS = """() => {
         const rawMatch   = text.match(/RAW PRICE:[^\\n]*\\n\\s*\\$?([\\d,]+(?:\\.\\d+)?)/);
         const psa10Match = text.match(/PSA 10 CHANCE:[^\\n]*\\n\\s*([\\d.]+)%/);
         const profMatch  = text.match(/EXP\\.\\s*PROFIT:[^\\n]*\\n\\s*\\$?([\\d,]+(?:\\.\\d+)?)/);
+        // PSA grade prices — try multiple label variants PPT may use
+        const psa9Match  = text.match(/PSA\\s*9\\s*(?:PRICE)?:[^\\n]*\\n\\s*\\$?([\\d,]+(?:\\.\\d+)?)/i)
+                        || text.match(/GRADE\\s*9\\s*(?:PRICE)?:[^\\n]*\\n\\s*\\$?([\\d,]+(?:\\.\\d+)?)/i);
+        const psa10PriceMatch = text.match(/PSA\\s*10\\s*(?:PRICE)?:[^\\n]*\\n\\s*\\$?([\\d,]+(?:\\.\\d+)?)/i)
+                             || text.match(/GRADE\\s*10\\s*(?:PRICE)?:[^\\n]*\\n\\s*\\$?([\\d,]+(?:\\.\\d+)?)/i);
 
         const vfaIdx  = lines.indexOf('VIEW FULL ANALYSIS');
         const cardName = vfaIdx >= 0 ? (lines[vfaIdx + 1] || '') : '';
@@ -51,10 +56,13 @@ _EXTRACT_JS = """() => {
             set_name:        parts[0] || '',
             card_number:     (parts[1] || '').replace(/^#/, '').trim(),
             rarity:          parts[2] || '',
-            roi_pct:         roiMatch  ? parse(roiMatch[1])  : null,
-            raw_price:       rawMatch  ? parse(rawMatch[1])  : null,
-            psa10_chance:    psa10Match ? parse(psa10Match[1]) / 100 : null,
-            expected_profit: profMatch  ? parse(profMatch[1]) : null,
+            roi_pct:         roiMatch       ? parse(roiMatch[1])       : null,
+            raw_price:       rawMatch       ? parse(rawMatch[1])       : null,
+            psa9_price:      psa9Match      ? parse(psa9Match[1])      : null,
+            psa10_price:     psa10PriceMatch ? parse(psa10PriceMatch[1]) : null,
+            psa10_chance:    psa10Match     ? parse(psa10Match[1]) / 100 : null,
+            expected_profit: profMatch      ? parse(profMatch[1])      : null,
+            _raw_text:       text,  // debug: remove once labels confirmed
         };
     });
 }"""
@@ -157,6 +165,11 @@ def run(
                     pass
 
             cards = page.evaluate(_EXTRACT_JS)
+            # Debug: print raw text of first card on first page to confirm PSA price label names
+            if page_num == 1 and cards:
+                print("\n── First card raw text (debug) ──")
+                print(cards[0].get("_raw_text", "")[:600])
+                print("─────────────────────────────────\n")
             added = 0
             for card in cards:
                 if not card.get("card_name") or not card.get("raw_price"):
@@ -183,7 +196,8 @@ def run(
               f"profit=${r['expected_profit']} roi={r['roi_pct']}%")
 
     fieldnames = ["card_name", "set_name", "card_number", "rarity",
-                  "raw_price", "psa10_chance", "expected_profit", "roi_pct"]
+                  "raw_price", "psa9_price", "psa10_price",
+                  "psa10_chance", "expected_profit", "roi_pct"]
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
