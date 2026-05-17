@@ -137,8 +137,19 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
         _raw_price = row.get("raw_price")
         buy_price_val = _ebay_price if pd.notna(_ebay_price) else _raw_price
         raw = _fmt_price(buy_price_val)
-        psa9 = _fmt_price(row.get("psa9_price"))
-        psa10 = _fmt_price(row.get("psa10_price"))
+        # Use PPT expected_profit/roi/psa10_chance when PSA prices not available
+        psa9_price_val  = row.get("psa9_price")
+        psa10_price_val = row.get("psa10_price")
+        has_psa_prices  = pd.notna(psa9_price_val) or pd.notna(psa10_price_val)
+        if has_psa_prices:
+            psa9  = _fmt_price(psa9_price_val)
+            psa10 = _fmt_price(psa10_price_val)
+        else:
+            exp_profit = row.get("expected_profit")
+            roi_pct    = row.get("roi_pct") or (row.get("roi", 0) * 100 if pd.notna(row.get("roi")) else None)
+            psa10_ch   = row.get("psa10_chance")
+            psa9  = f"{_fmt_price(exp_profit)} exp. profit" if pd.notna(exp_profit) else "—"
+            psa10 = f"{roi_pct:.0f}% ROI" if pd.notna(roi_pct) and roi_pct == roi_pct else "—"
         is_breakeven = row.get("track") == "breakeven"
         gem_val = row.get("gem_rate")
         total = row.get("total_graded")
@@ -152,6 +163,8 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
                 gem = f"{pct} ({int(psa9_count + psa10_count):,} / {int(total):,}{src_label})"
             else:
                 gem = pct
+        elif pd.notna(row.get("psa10_chance")) and row.get("psa10_chance") == row.get("psa10_chance"):
+            gem = f"{row['psa10_chance'] * 100:.0f}% PSA 10 chance"
         elif is_breakeven:
             be = row.get("breakeven_gem_rate")
             gem = f"BE ≤ {_fmt_pct(be)}" if pd.notna(be) and be == be else "No data"
@@ -228,9 +241,9 @@ def format_email_body(opportunities: pd.DataFrame, today: str, has_image_analysi
     <tr style="background:#f1f5f9;text-align:left;">
       <th style="padding:10px 14px;">Card</th>
       <th style="padding:10px 14px;text-align:right;">{"Buy Price (eBay)" if has_image_analysis else "Raw (Ungraded)"}</th>
-      <th style="padding:10px 14px;text-align:right;">PSA 9</th>
-      <th style="padding:10px 14px;text-align:right;">PSA 10</th>
-      <th style="padding:10px 14px;text-align:right;">Gem Rate (gem / total)</th>
+      <th style="padding:10px 14px;text-align:right;">Exp. Profit</th>
+      <th style="padding:10px 14px;text-align:right;">ROI</th>
+      <th style="padding:10px 14px;text-align:right;">PSA 10 Chance / Gem Rate</th>
     </tr>
   </thead>
   <tbody>
