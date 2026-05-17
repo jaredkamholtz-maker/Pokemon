@@ -807,10 +807,21 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
 
         load_dotenv()
         if os.environ.get("XIMILAR_API_KEY"):
-            print("Ximilar...", end=" ", flush=True)
-            ximilar = grade_with_ximilar(b64, image_url=_upgrade_ebay_image_url(image_url))
             print("Claude flags...", end=" ", flush=True)
             flags_result = check_red_flags_claude(card_name, set_name, card_number, b64, reference_b64)
+            red_flags    = flags_result.get("red_flags", {})
+            # Critical flags → skip before spending an Ximilar credit
+            active_critical = [f for f in _CRITICAL_FLAGS
+                               if isinstance(red_flags.get(f), dict) and red_flags[f].get("flag")]
+            if active_critical:
+                print(f"SKIP [{', '.join(active_critical)}]")
+                continue
+            # Back not shown → skip this listing, try next
+            if isinstance(red_flags.get("back_not_shown"), dict) and red_flags["back_not_shown"].get("flag"):
+                print("SKIP [back_not_shown]")
+                continue
+            print("Ximilar...", end=" ", flush=True)
+            ximilar  = grade_with_ximilar(b64, image_url=_upgrade_ebay_image_url(image_url))
             analysis = _derive_recommendation_ximilar(ximilar, flags_result)
         else:
             print("analyzing...", end=" ", flush=True)
@@ -822,13 +833,12 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
         flag_str = f" [{active}]" if active else ""
         print(f"{rec} (PSA 9+: {prob}%){flag_str}")
 
-        # Critical red flags (stock photo / fake) — skip this listing entirely
-        if analysis.get("photo_quality") == "disqualified":
-            continue
-
-        # Back not shown — skip this listing, try the next one
-        if "back_not_shown" in active:
-            continue
+        # Claude-only path: check critical flags and back_not_shown here
+        if not os.environ.get("XIMILAR_API_KEY"):
+            if analysis.get("photo_quality") == "disqualified":
+                continue
+            if "back_not_shown" in active:
+                continue
 
         all_back_not_shown = False
         any_non_disqualified = True
