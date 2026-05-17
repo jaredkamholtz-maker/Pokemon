@@ -395,24 +395,28 @@ def run(
         final = final[final["ebay_listing_url"].notna() & (final["ebay_listing_url"] != "")].copy()
     final = final.drop_duplicates(subset=["card_name", "set_name"], keep="first").copy()
 
-    # Drop cards where the actual listing price leaves no margin after grading fee
+    # Drop cards where the actual eBay listing price leaves no margin after grading fee.
+    # Only apply this check when we have PSA price data — PPT data uses expected_profit instead.
     if "ebay_price" in final.columns and has_image_analysis:
-        def _still_profitable(row):
-            buy = row.get("ebay_price")
-            if pd.isna(buy) or buy == 0:
-                return True
-            psa9  = row.get("psa9_price")
-            psa10 = row.get("psa10_price")
-            if pd.notna(psa9)  and psa9  - buy > grading_fee:
-                return True
-            if pd.notna(psa10) and psa10 - buy > grading_fee:
-                return True
-            return False
-        before = len(final)
-        final = final[final.apply(_still_profitable, axis=1)].copy()
-        dropped = before - len(final)
-        if dropped:
-            print(f"  Dropped {dropped} card(s) whose actual listing price left no margin after grading fee.")
+        has_psa_prices = (("psa9_price" in final.columns and final["psa9_price"].notna().any()) or
+                          ("psa10_price" in final.columns and final["psa10_price"].notna().any()))
+        if has_psa_prices:
+            def _still_profitable(row):
+                buy = row.get("ebay_price")
+                if pd.isna(buy) or buy == 0:
+                    return True
+                psa9  = row.get("psa9_price")
+                psa10 = row.get("psa10_price")
+                if pd.notna(psa9)  and psa9  - buy > grading_fee:
+                    return True
+                if pd.notna(psa10) and psa10 - buy > grading_fee:
+                    return True
+                return False
+            before = len(final)
+            final = final[final.apply(_still_profitable, axis=1)].copy()
+            dropped = before - len(final)
+            if dropped:
+                print(f"  Dropped {dropped} card(s) whose actual listing price left no margin after grading fee.")
 
     # Email
     if not skip_email:
