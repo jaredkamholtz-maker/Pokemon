@@ -833,8 +833,24 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
                 print("SKIP [back_not_shown]")
                 continue
             print("Ximilar...", end=" ", flush=True)
-            ximilar  = grade_with_ximilar(images_b64, image_urls=all_urls)
-            analysis = _derive_recommendation_ximilar(ximilar, flags_result)
+            ximilar = grade_with_ximilar(images_b64, image_urls=all_urls)
+            ximilar_passes = ximilar and (ximilar.get("final") or 0) >= XIMILAR_SUBMIT_THRESHOLD
+            if ximilar_passes:
+                # Ximilar looks good — run full Claude grading as second opinion
+                print("Claude grade...", end=" ", flush=True)
+                claude_grade = analyze_image(card_name, set_name, card_number, b64, reference_b64)
+                analysis = _derive_recommendation_ximilar(ximilar, flags_result)
+                # Require Claude to agree: grade_high must be >= 9
+                claude_high = claude_grade.get("grade_high") or 0
+                if analysis.get("recommendation") == "SUBMIT" and claude_high < 9:
+                    analysis["recommendation"] = "SKIP"
+                    analysis["notes"] = (
+                        f"Ximilar {ximilar.get('final', '?'):.1f}/10 but Claude grade too low "
+                        f"(PSA {claude_grade.get('grade_low','?')}–{claude_high}) | "
+                        + (claude_grade.get("notes") or "")
+                    )
+            else:
+                analysis = _derive_recommendation_ximilar(ximilar, flags_result)
         else:
             print("analyzing...", end=" ", flush=True)
             analysis = analyze_image(card_name, set_name, card_number, b64, reference_b64)
