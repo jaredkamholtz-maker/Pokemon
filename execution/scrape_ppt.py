@@ -141,7 +141,7 @@ def _fetch_detail_prices(page, cards: list[dict]) -> list[dict]:
         }}
     }}""")
     time.sleep(4)
-    page.off('response', _on_response)
+    page.remove_listener('response', _on_response)
 
     print(f"\n── API calls captured after VFA click ({len(captured)}) ──")
     import json
