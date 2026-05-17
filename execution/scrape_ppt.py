@@ -44,10 +44,27 @@ _EXTRACT_JS = """() => {
         const vfaIdx  = lines.indexOf('VIEW FULL ANALYSIS');
         const cardName = vfaIdx >= 0 ? (lines[vfaIdx + 1] || '') : '';
 
-        // Capture the href of the VIEW FULL ANALYSIS link
-        const links = Array.from(card.querySelectorAll('a'));
-        const vfaLink = links.find(a => a.innerText.trim() === 'VIEW FULL ANALYSIS');
-        const detailUrl = vfaLink ? vfaLink.href : '';
+        // Capture the detail page URL — walk up from the VFA text node to find the nearest <a>
+        let detailUrl = '';
+        const allEls = Array.from(card.querySelectorAll('*'));
+        for (const el of allEls) {
+            if (el.children.length === 0 && (el.innerText || '').trim() === 'VIEW FULL ANALYSIS') {
+                // Walk up to find enclosing <a>
+                let ancestor = el;
+                for (let i = 0; i < 6; i++) {
+                    if (!ancestor) break;
+                    if (ancestor.tagName === 'A' && ancestor.href) { detailUrl = ancestor.href; break; }
+                    ancestor = ancestor.parentElement;
+                }
+                break;
+            }
+        }
+        // Fallback: any <a> in the card whose href contains the card slug
+        if (!detailUrl) {
+            const anyLink = Array.from(card.querySelectorAll('a[href]'))
+                .find(a => a.href && !a.href.endsWith('/psa-analysis'));
+            if (anyLink) detailUrl = anyLink.href;
+        }
 
         const setLine = lines.find(l => l.includes('\\u00b7') || l.includes('·')) || '';
         const parts   = setLine.split(/\\s*[·\\u00b7]\\s*/).map(p => p.trim());
@@ -243,6 +260,10 @@ def run(
                     added += 1
 
             print(f"  Page {page_num}/{pages_to_scrape}: +{added} cards (total {len(all_cards)})")
+
+        # Debug: show first card's captured detail URL
+        if all_cards:
+            print(f"  First card detail URL: {all_cards[0].get('detail_url') or '[EMPTY — link not found]'}")
 
         # Visit each card's detail page to get PSA 9/10 prices
         if detail_prices and all_cards:
