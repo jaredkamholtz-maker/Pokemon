@@ -252,40 +252,58 @@ def _fetch_reference_image(token: str) -> str | None:
 
 
 
-def grade_with_ximilar(image_b64: str) -> dict | None:
+def grade_with_ximilar(image_b64: str, image_url: str | None = None) -> dict | None:
     """
-    Call Ximilar Card Grader API with a base64 image.
+    Call Ximilar Card Grader API.
+    Prefers _url (direct fetch by Ximilar) over _base64 to avoid CDN redirect issues.
     Returns dict with corners, edges, surface, centering, final, condition — or None on failure.
     """
     load_dotenv()
     api_key = os.environ.get("XIMILAR_API_KEY")
     if not api_key:
         return None
-    try:
-        resp = _SESSION.post(
-            "https://api.ximilar.com/card-grader/v2/grade",
-            headers={"Authorization": f"Token {api_key}", "Content-Type": "application/json"},
-            json={"records": [{"_base64": image_b64}]},
-            timeout=30,
-        )
-        if not resp or resp.status_code != 200:
-            print(f"(Ximilar HTTP {resp and resp.status_code})", end=" ", flush=True)
+
+    def _call(record: dict) -> dict | None:
+        try:
+            resp = _SESSION.post(
+                "https://api.ximilar.com/card-grader/v2/grade",
+                headers={"Authorization": f"Token {api_key}", "Content-Type": "application/json"},
+                json={"records": [record]},
+                timeout=30,
+            )
+            if not resp or resp.status_code != 200:
+                print(f"(Ximilar HTTP {resp and resp.status_code})", end=" ", flush=True)
+                return None
+            records = resp.json().get("records", [])
+            if not records:
+                return None
+            status = records[0].get("_status", {})
+            if status.get("code", 200) >= 400:
+                print(f"(Ximilar: {status.get('text', 'error')})", end=" ", flush=True)
+                return None
+            grades = records[0].get("grades", {})
+            if not grades or grades.get("final") is None:
+                return None
+            return {
+                "corners":   grades.get("corners"),
+                "edges":     grades.get("edges"),
+                "surface":   grades.get("surface"),
+                "centering": grades.get("centering"),
+                "final":     grades.get("final"),
+                "condition": grades.get("condition"),
+            }
+        except Exception as e:
+            print(f"(Ximilar error: {e})", end=" ", flush=True)
             return None
-        records = resp.json().get("records", [])
-        if not records:
-            return None
-        grades = records[0].get("grades", {})
-        return {
-            "corners":   grades.get("corners"),
-            "edges":     grades.get("edges"),
-            "surface":   grades.get("surface"),
-            "centering": grades.get("centering"),
-            "final":     grades.get("final"),
-            "condition": grades.get("condition"),
-        }
-    except Exception as e:
-        print(f"(Ximilar error: {e})", end=" ", flush=True)
-        return None
+
+    # Try URL first (Ximilar fetches directly — handles CDN redirects better than our downloader)
+    if image_url:
+        result = _call({"_url": image_url})
+        if result:
+            return result
+        print("(URL failed, retrying with base64)", end=" ", flush=True)
+
+    return _call({"_base64": image_b64})
 
 
 def check_red_flags_claude(card_name: str, set_name: str, card_number: str,
@@ -805,7 +823,7 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
         load_dotenv()
         if os.environ.get("XIMILAR_API_KEY"):
             print("Ximilar...", end=" ", flush=True)
-            ximilar = grade_with_ximilar(b64)
+            ximilar = grade_with_ximilar(b64, image_url=_upgrade_ebay_image_url(image_url))
             print("Claude flags...", end=" ", flush=True)
             flags   = check_red_flags_claude(card_name, set_name, card_number, b64, reference_b64)
             analysis = _derive_recommendation_ximilar(ximilar, flags)
