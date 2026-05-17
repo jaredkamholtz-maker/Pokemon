@@ -58,6 +58,71 @@ _EXTRACT_JS = """() => {
 }"""
 
 
+def _parse_psa_prices(text: str) -> dict:
+    """Extract PSA 9 and PSA 10 prices from page text."""
+    parse = lambda s: float(s.replace(',', '')) if s else None
+    psa9  = re.search(r'(?:PSA\s*9|Grade\s*9)[^\n$]*\$?([\d,]+(?:\.\d+)?)', text, re.I)
+    psa10 = re.search(r'(?:PSA\s*10|Grade\s*10|Gem\s*Mint)[^\n$]*\$?([\d,]+(?:\.\d+)?)', text, re.I)
+    return {
+        "psa9_price":  parse(psa9.group(1))  if psa9  else None,
+        "psa10_price": parse(psa10.group(1)) if psa10 else None,
+    }
+
+
+def _fetch_detail_prices(page, cards: list[dict]) -> list[dict]:
+    """Click VIEW FULL ANALYSIS, diff body text, extract PSA prices."""
+    debug_done = False
+
+    for i, card in enumerate(cards):
+        name = card["card_name"]
+        try:
+            before = page.evaluate("() => document.body.innerText")
+
+            # Click the VFA text for this specific card
+            escaped = name.replace("'", "\\'")
+            page.evaluate(f"""() => {{
+                for (const c of document.querySelectorAll('div[class*="bg-card"][class*="text-card"]')) {{
+                    if ((c.innerText || '').includes('{escaped}')) {{
+                        const vfa = [...c.querySelectorAll('*')].find(
+                            el => !el.children.length && (el.innerText||'').trim()==='VIEW FULL ANALYSIS'
+                        );
+                        if (vfa) {{ vfa.dispatchEvent(new MouseEvent('click',{{bubbles:true}})); return; }}
+                        c.dispatchEvent(new MouseEvent('click',{{bubbles:true}}));
+                        return;
+                    }}
+                }}
+            }}""")
+            time.sleep(3)
+
+            after = page.evaluate("() => document.body.innerText")
+
+            # Diff: lines that are new after the click
+            before_lines = set(before.splitlines())
+            new_text = "\n".join(l for l in after.splitlines() if l not in before_lines)
+
+            if not debug_done:
+                print(f"\n── New text after VFA click on '{name}' ──")
+                print(new_text[:1500] if new_text else "[NO NEW TEXT — overlay may not have opened]")
+                print("──────────────────────────────────────────\n")
+                debug_done = True
+
+            prices = _parse_psa_prices(new_text or after)
+            card["psa9_price"]  = prices["psa9_price"]
+            card["psa10_price"] = prices["psa10_price"]
+            print(f"  [{i+1}/{len(cards)}] {name}: PSA9=${prices['psa9_price']} PSA10=${prices['psa10_price']}")
+
+            # Close overlay: Escape or click outside
+            page.keyboard.press("Escape")
+            time.sleep(1)
+
+        except Exception as e:
+            print(f"  [{i+1}/{len(cards)}] {name}: error — {e}")
+            card["psa9_price"]  = None
+            card["psa10_price"] = None
+
+    return cards
+
+
 def _load_target_sets(path: str) -> set[str]:
     p = Path(path)
     if not p.exists():
@@ -100,6 +165,7 @@ def run(
     headless: bool = True,
     all_pages: bool = False,
     target_sets_path: str | None = None,
+    detail_prices: bool = False,
 ) -> list[dict]:
     from playwright.sync_api import sync_playwright
 
@@ -162,6 +228,10 @@ def run(
 
             print(f"  Page {page_num}/{pages_to_scrape}: +{added} cards (total {len(all_cards)})")
 
+        if detail_prices and all_cards:
+            print(f"\nFetching PSA 9/10 prices from {len(all_cards)} detail pages...")
+            all_cards = _fetch_detail_prices(page, all_cards)
+
         browser.close()
 
     print(f"\nExtracted {len(all_cards)} cards total")
@@ -174,7 +244,8 @@ def run(
               f"profit=${r['expected_profit']} roi={r['roi_pct']}%")
 
     fieldnames = ["card_name", "set_name", "card_number", "rarity",
-                  "raw_price", "psa10_chance", "expected_profit", "roi_pct"]
+                  "raw_price", "psa9_price", "psa10_price",
+                  "psa10_chance", "expected_profit", "roi_pct"]
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
@@ -191,12 +262,15 @@ if __name__ == "__main__":
                         help="Scrape all pages (~10 min). Default: page 1 only.")
     parser.add_argument("--target-sets", default=None, metavar="PATH",
                         help="CSV with set_name column — filter to these sets only.")
+    parser.add_argument("--detail-prices", action="store_true",
+                        help="Click each card to fetch PSA 9/10 prices (slower, run locally).")
     parser.add_argument("--headless", action="store_true", default=True)
     parser.add_argument("--no-headless", dest="headless", action="store_false")
     args = parser.parse_args()
     run(
         output_path=args.output,
         headless=args.headless,
+        detail_prices=args.detail_prices,
         all_pages=args.all_pages,
         target_sets_path=args.target_sets,
     )
