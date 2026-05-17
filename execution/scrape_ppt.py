@@ -12,12 +12,13 @@ Paginates through all pages and optionally filters to target sets.
 
 Output: .tmp/ppt_cards.csv
     card_name, set_name, card_number, rarity,
-    raw_price, psa10_chance, expected_profit, roi_pct
+    raw_price, psa9_price, psa10_price, psa10_chance, expected_profit, roi_pct
 
 Usage:
     python3 execution/scrape_ppt.py                        # top 100 cards (page 1 only)
     python3 execution/scrape_ppt.py --all-pages            # all pages (~10 min)
     python3 execution/scrape_ppt.py --all-pages --target-sets data/target_sets.csv
+    python3 execution/scrape_ppt.py --detail-prices        # also fetch PSA 9/10 prices from detail pages
 """
 
 import csv
@@ -28,6 +29,7 @@ from pathlib import Path
 OUTPUT_FILE = Path(".tmp/ppt_cards.csv")
 BASE_URL = "https://www.pokemonpricetracker.com/psa-analysis"
 
+# Extracts summary data + the "VIEW FULL ANALYSIS" link from each card on the listing page
 _EXTRACT_JS = """() => {
     const cards = document.querySelectorAll('div[class*="bg-card"][class*="text-card"]');
     return Array.from(cards).map(card => {
@@ -38,14 +40,14 @@ _EXTRACT_JS = """() => {
         const rawMatch   = text.match(/RAW PRICE:[^\\n]*\\n\\s*\\$?([\\d,]+(?:\\.\\d+)?)/);
         const psa10Match = text.match(/PSA 10 CHANCE:[^\\n]*\\n\\s*([\\d.]+)%/);
         const profMatch  = text.match(/EXP\\.\\s*PROFIT:[^\\n]*\\n\\s*\\$?([\\d,]+(?:\\.\\d+)?)/);
-        // PSA grade prices — try multiple label variants PPT may use
-        const psa9Match  = text.match(/PSA\\s*9\\s*(?:PRICE)?:[^\\n]*\\n\\s*\\$?([\\d,]+(?:\\.\\d+)?)/i)
-                        || text.match(/GRADE\\s*9\\s*(?:PRICE)?:[^\\n]*\\n\\s*\\$?([\\d,]+(?:\\.\\d+)?)/i);
-        const psa10PriceMatch = text.match(/PSA\\s*10\\s*(?:PRICE)?:[^\\n]*\\n\\s*\\$?([\\d,]+(?:\\.\\d+)?)/i)
-                             || text.match(/GRADE\\s*10\\s*(?:PRICE)?:[^\\n]*\\n\\s*\\$?([\\d,]+(?:\\.\\d+)?)/i);
 
         const vfaIdx  = lines.indexOf('VIEW FULL ANALYSIS');
         const cardName = vfaIdx >= 0 ? (lines[vfaIdx + 1] || '') : '';
+
+        // Capture the href of the VIEW FULL ANALYSIS link
+        const links = Array.from(card.querySelectorAll('a'));
+        const vfaLink = links.find(a => a.innerText.trim() === 'VIEW FULL ANALYSIS');
+        const detailUrl = vfaLink ? vfaLink.href : '';
 
         const setLine = lines.find(l => l.includes('\\u00b7') || l.includes('·')) || '';
         const parts   = setLine.split(/\\s*[·\\u00b7]\\s*/).map(p => p.trim());
@@ -56,20 +58,85 @@ _EXTRACT_JS = """() => {
             set_name:        parts[0] || '',
             card_number:     (parts[1] || '').replace(/^#/, '').trim(),
             rarity:          parts[2] || '',
-            roi_pct:         roiMatch       ? parse(roiMatch[1])       : null,
-            raw_price:       rawMatch       ? parse(rawMatch[1])       : null,
-            psa9_price:      psa9Match      ? parse(psa9Match[1])      : null,
-            psa10_price:     psa10PriceMatch ? parse(psa10PriceMatch[1]) : null,
-            psa10_chance:    psa10Match     ? parse(psa10Match[1]) / 100 : null,
-            expected_profit: profMatch      ? parse(profMatch[1])      : null,
-            _raw_text:       text,  // debug: remove once labels confirmed
+            roi_pct:         roiMatch  ? parse(roiMatch[1])       : null,
+            raw_price:       rawMatch  ? parse(rawMatch[1])       : null,
+            psa10_chance:    psa10Match ? parse(psa10Match[1]) / 100 : null,
+            expected_profit: profMatch  ? parse(profMatch[1])     : null,
+            detail_url:      detailUrl,
         };
     });
 }"""
 
+# Extracts PSA grade prices from a card's full analysis detail page
+_DETAIL_EXTRACT_JS = """() => {
+    const text = document.body.innerText || '';
+    return { text: text.slice(0, 1500) };
+}"""
+
+
+def _parse_detail_prices(text: str) -> dict:
+    """Parse PSA 9 and PSA 10 prices from a detail page's raw text."""
+    parse = lambda s: float(s.replace(',', '')) if s else None
+
+    # Try common label patterns — will refine once we see the real page
+    psa9_match = (
+        re.search(r'PSA\s*9\s*(?:PRICE|AVG|SALE|VALUE)?[:\s]*\$?([\d,]+(?:\.\d+)?)', text, re.I)
+        or re.search(r'GRADE\s*9[:\s]*\$?([\d,]+(?:\.\d+)?)', text, re.I)
+    )
+    psa10_match = (
+        re.search(r'PSA\s*10\s*(?:PRICE|AVG|SALE|VALUE)?[:\s]*\$?([\d,]+(?:\.\d+)?)', text, re.I)
+        or re.search(r'GRADE\s*10[:\s]*\$?([\d,]+(?:\.\d+)?)', text, re.I)
+    )
+    return {
+        "psa9_price":  parse(psa9_match.group(1))  if psa9_match  else None,
+        "psa10_price": parse(psa10_match.group(1)) if psa10_match else None,
+    }
+
+
+def _fetch_detail_prices(browser, cards: list[dict]) -> list[dict]:
+    """Visit each card's detail page and attach psa9_price / psa10_price."""
+    detail_page = browser.new_page(ignore_https_errors=True)
+    detail_page.set_extra_http_headers({"User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )})
+
+    debug_printed = False
+    for i, card in enumerate(cards):
+        url = card.get("detail_url", "")
+        if not url:
+            card["psa9_price"] = None
+            card["psa10_price"] = None
+            continue
+        try:
+            detail_page.goto(url, wait_until="networkidle", timeout=30_000)
+            time.sleep(1)
+            result = detail_page.evaluate(_DETAIL_EXTRACT_JS)
+            text = result.get("text", "")
+
+            if not debug_printed:
+                print(f"\n── Detail page raw text (debug: {url}) ──")
+                print(text[:1000])
+                print("──────────────────────────────────────────\n")
+                debug_printed = True
+
+            prices = _parse_detail_prices(text)
+            card["psa9_price"]  = prices["psa9_price"]
+            card["psa10_price"] = prices["psa10_price"]
+            print(f"  [{i+1}/{len(cards)}] {card['card_name']}: "
+                  f"PSA9=${prices['psa9_price']} PSA10=${prices['psa10_price']}")
+        except Exception as e:
+            print(f"  [{i+1}/{len(cards)}] {card['card_name']}: detail page error — {e}")
+            card["psa9_price"] = None
+            card["psa10_price"] = None
+
+    detail_page.close()
+    return cards
+
 
 def _load_target_sets(path: str) -> set[str]:
-    """Return a set of lowercased set names from target_sets.csv."""
+    """Return a set of set names from target_sets.csv."""
     p = Path(path)
     if not p.exists():
         print(f"  Warning: target sets file not found: {path}")
@@ -89,9 +156,6 @@ def _matches_target(card_set: str, target_sets: set[str]) -> bool:
     ppt = _norm(card_set)
     for t in target_sets:
         tn = _norm(t)
-        # Exact normalized match, or target is a long-enough substring of PPT name
-        # (handles "XY - ROARING SKIES" matching target "Roaring Skies")
-        # Short targets (≤3 chars like "xy", "151") require exact match to avoid false positives
         if tn == ppt or (len(tn) >= 4 and tn in ppt):
             return True
     return False
@@ -116,6 +180,7 @@ def run(
     headless: bool = True,
     all_pages: bool = False,
     target_sets_path: str | None = None,
+    detail_prices: bool = False,
 ) -> list[dict]:
     from playwright.sync_api import sync_playwright
 
@@ -158,18 +223,13 @@ def run(
                 time.sleep(3)
                 try:
                     page.wait_for_function(
-                        f"""() => document.querySelectorAll('div[class*="bg-card"]').length > 0""",
+                        """() => document.querySelectorAll('div[class*="bg-card"]').length > 0""",
                         timeout=10_000,
                     )
                 except Exception:
                     pass
 
             cards = page.evaluate(_EXTRACT_JS)
-            # Debug: print raw text of first card on first page to confirm PSA price label names
-            if page_num == 1 and cards:
-                print("\n── First card raw text (debug) ──")
-                print(cards[0].get("_raw_text", "")[:600])
-                print("─────────────────────────────────\n")
             added = 0
             for card in cards:
                 if not card.get("card_name") or not card.get("raw_price"):
@@ -184,6 +244,11 @@ def run(
 
             print(f"  Page {page_num}/{pages_to_scrape}: +{added} cards (total {len(all_cards)})")
 
+        # Visit each card's detail page to get PSA 9/10 prices
+        if detail_prices and all_cards:
+            print(f"\nFetching PSA 9/10 prices from {len(all_cards)} detail pages (~{len(all_cards)*2//60+1} min)...")
+            all_cards = _fetch_detail_prices(browser, all_cards)
+
         browser.close()
 
     print(f"\nExtracted {len(all_cards)} cards total")
@@ -193,11 +258,12 @@ def run(
 
     for r in all_cards[:3]:
         print(f"  {r['card_name']} | {r['set_name']} | raw=${r['raw_price']} "
+              f"psa9=${r.get('psa9_price')} psa10=${r.get('psa10_price')} "
               f"profit=${r['expected_profit']} roi={r['roi_pct']}%")
 
     fieldnames = ["card_name", "set_name", "card_number", "rarity",
                   "raw_price", "psa9_price", "psa10_price",
-                  "psa10_chance", "expected_profit", "roi_pct"]
+                  "psa10_chance", "expected_profit", "roi_pct", "detail_url"]
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
@@ -214,6 +280,8 @@ if __name__ == "__main__":
                         help="Scrape all pages (~10 min). Default: page 1 only.")
     parser.add_argument("--target-sets", default=None, metavar="PATH",
                         help="CSV with set_name column — filter to these sets only.")
+    parser.add_argument("--detail-prices", action="store_true",
+                        help="Visit each card's full analysis page to fetch PSA 9/10 prices.")
     parser.add_argument("--headless", action="store_true", default=True)
     parser.add_argument("--no-headless", dest="headless", action="store_false")
     args = parser.parse_args()
@@ -222,4 +290,5 @@ if __name__ == "__main__":
         headless=args.headless,
         all_pages=args.all_pages,
         target_sets_path=args.target_sets,
+        detail_prices=args.detail_prices,
     )
