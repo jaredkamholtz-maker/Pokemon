@@ -252,10 +252,11 @@ def _fetch_reference_image(token: str) -> str | None:
 
 
 
-def grade_with_ximilar(image_b64: str, image_url: str | None = None) -> dict | None:
+def grade_with_ximilar(images_b64: list[str], image_urls: list[str] | None = None) -> dict | None:
     """
-    Call Ximilar Card Grader API.
-    Prefers _url (direct fetch by Ximilar) over _base64 to avoid CDN redirect issues.
+    Call Ximilar Card Grader API with front (and optionally back) images.
+    Passes up to 2 records (front + back) for the most accurate grade.
+    Prefers _url over _base64 to handle CDN redirects.
     Returns dict with corners, edges, surface, centering, final, condition — or None on failure.
     """
     load_dotenv()
@@ -263,25 +264,25 @@ def grade_with_ximilar(image_b64: str, image_url: str | None = None) -> dict | N
     if not api_key:
         return None
 
-    def _call(record: dict) -> dict | None:
+    def _call(records: list[dict]) -> dict | None:
         try:
             resp = _SESSION.post(
                 "https://api.ximilar.com/card-grader/v2/grade",
                 headers={"Authorization": f"Token {api_key}", "Content-Type": "application/json"},
-                json={"records": [record]},
+                json={"records": records},
                 timeout=30,
             )
             if not resp or resp.status_code != 200:
                 print(f"(Ximilar HTTP {resp and resp.status_code})", end=" ", flush=True)
                 return None
-            records = resp.json().get("records", [])
-            if not records:
+            result_records = resp.json().get("records", [])
+            if not result_records:
                 return None
-            status = records[0].get("_status", {})
+            status = result_records[0].get("_status", {})
             if status.get("code", 200) >= 400:
                 print(f"(Ximilar: {status.get('text', 'error')})", end=" ", flush=True)
                 return None
-            grades = records[0].get("grades", {})
+            grades = result_records[0].get("grades", {})
             if not grades or grades.get("final") is None:
                 return None
             return {
@@ -296,14 +297,17 @@ def grade_with_ximilar(image_b64: str, image_url: str | None = None) -> dict | N
             print(f"(Ximilar error: {e})", end=" ", flush=True)
             return None
 
-    # Try URL first (Ximilar fetches directly — handles CDN redirects better than our downloader)
-    if image_url:
-        result = _call({"_url": image_url})
+    # Build records: up to 2 images (front + back)
+    # Try URL first, fall back to base64
+    if image_urls:
+        url_records = [{"_url": u} for u in image_urls[:2]]
+        result = _call(url_records)
         if result:
             return result
         print("(URL failed, retrying with base64)", end=" ", flush=True)
 
-    return _call({"_base64": image_b64})
+    b64_records = [{"_base64": b} for b in images_b64[:2]]
+    return _call(b64_records)
 
 
 def check_red_flags_claude(card_name: str, set_name: str, card_number: str,
@@ -829,7 +833,7 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
                 print("SKIP [back_not_shown]")
                 continue
             print("Ximilar...", end=" ", flush=True)
-            ximilar  = grade_with_ximilar(b64, image_url=_upgrade_ebay_image_url(image_url))
+            ximilar  = grade_with_ximilar(images_b64, image_urls=all_urls)
             analysis = _derive_recommendation_ximilar(ximilar, flags_result)
         else:
             print("analyzing...", end=" ", flush=True)
