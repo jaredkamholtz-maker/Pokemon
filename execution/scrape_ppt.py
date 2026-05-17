@@ -132,19 +132,14 @@ def _fetch_detail_prices(page, cards: list[dict]) -> list[dict]:
                 card["psa10_price"] = None
                 continue
 
-            # Wait for navigation away from the listing page
-            page.wait_for_function(
-                f"() => !window.location.pathname.endsWith('/psa-analysis') && window.location.pathname !== '/'",
-                timeout=10_000,
-            )
-            page.wait_for_load_state("networkidle", timeout=15_000)
-            time.sleep(1)
-
+            # Give the page time to react (modal open or navigation)
+            time.sleep(3)
             detail_url = page.url
+            # Grab full page text — covers both navigation AND modal/drawer overlays
             text = page.evaluate("() => document.body.innerText || ''")
 
             if not debug_printed:
-                print(f"\n── Detail page raw text (debug: {detail_url}) ──")
+                print(f"\n── After click: URL={detail_url} ──")
                 print(text[:1200])
                 print("──────────────────────────────────────────\n")
                 debug_printed = True
@@ -161,13 +156,15 @@ def _fetch_detail_prices(page, cards: list[dict]) -> list[dict]:
             card["psa10_price"] = None
 
         finally:
-            # Go back to listing page and wait for cards to render
+            # Return to listing — press Escape (closes modal) then go back if URL changed
             try:
-                page.go_back(wait_until="networkidle", timeout=15_000)
+                page.keyboard.press("Escape")
+                time.sleep(0.5)
+                if BASE_URL.rstrip('/') not in page.url:
+                    page.go_back(wait_until="networkidle", timeout=15_000)
                 page.wait_for_selector('div[class*="bg-card"][class*="text-card"]', timeout=10_000)
                 time.sleep(1)
             except Exception:
-                # If back fails, reload the listing page
                 page.goto(BASE_URL, wait_until="networkidle", timeout=30_000)
                 page.wait_for_selector('div[class*="bg-card"][class*="text-card"]', timeout=10_000)
                 time.sleep(2)
