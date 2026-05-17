@@ -876,39 +876,14 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
         return pd.DataFrame()
 
     sort_col   = "roi" if "roi" in df.columns else df.columns[0]
-    candidates = df.sort_values(sort_col, ascending=False).head(top_n).copy()
-
-    # Pre-filter: only keep cards where at least one eBay listing has multiple photos
-    # (extra_images > 0 strongly correlates with sellers showing front AND back)
-    print(f"Pre-filtering {len(candidates)} cards — checking eBay listing photo counts...")
-    app_id  = os.environ.get("EBAY_APP_ID")
-    cert_id = os.environ.get("EBAY_CERT_ID")
-    qualified = []
-    for _, card in candidates.iterrows():
-        listings = search_ebay_listings(
-            str(card.get("card_name", "")),
-            str(card.get("set_name", "")),
-            str(card.get("card_number", "")),
-        )
-        has_multi = any(l.get("extra_images", 0) > 0 for l in listings)
-        status = "✓" if has_multi else "✗"
-        print(f"  {status} {card.get('card_name')} | {card.get('set_name')}")
-        if has_multi:
-            qualified.append(card)
-        if len(qualified) >= top_n:
-            break
-
-    if not qualified:
-        print("No cards found with multi-photo eBay listings — skipping image analysis.")
-        return pd.DataFrame()
-
-    candidates = pd.DataFrame(qualified).reset_index(drop=True)
-    print(f"  → {len(candidates)} cards with multi-photo listings\n")
+    # Pass a larger pool so the loop can skip cards with no back photos and still fill top_n
+    pool_size  = min(len(df), top_n * 5)
+    candidates = df.sort_values(sort_col, ascending=False).head(pool_size).copy()
 
     load_dotenv()
     ximilar_active = bool(os.environ.get("XIMILAR_API_KEY"))
     grader_label = "Ximilar + Claude flags" if ximilar_active else "Claude Vision"
-    print(f"Analyzing {len(candidates)} cards ({grader_label})...\n")
+    print(f"Analyzing up to {pool_size} cards ({grader_label}), collecting first {top_n} with back photos...\n")
 
     # Load reference images once — positive + negative anchors for every Claude Vision call
     app_id  = os.environ.get("EBAY_APP_ID")
@@ -932,7 +907,10 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
     print()
 
     rows = []
+    qualified_count = 0  # cards where at least one listing showed the back
     for rank, (_, card) in enumerate(candidates.iterrows(), 1):
+        if qualified_count >= top_n:
+            break
         card_name   = str(card.get("card_name",   "")).strip()
         set_name    = str(card.get("set_name",    "")).strip()
         card_number = str(card.get("card_number", "")).strip()
@@ -998,6 +976,9 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
         print(f"  → ${result.get('ebay_price') or 0:.2f} | {rec} | predicted PSA {grade} | PSA 9+: {prob}%\n")
 
         rows.append(result)
+        # Count as qualified if at least one listing showed the back (not all-back-not-shown)
+        if "No eBay listings show card back" not in (result.get("notes") or ""):
+            qualified_count += 1
 
     analysis_df = pd.DataFrame(rows)
     OUTPUT_ANALYSIS.parent.mkdir(parents=True, exist_ok=True)

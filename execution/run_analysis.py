@@ -358,8 +358,8 @@ def run(
     Path(OUTPUT_PATH).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(OUTPUT_PATH, index=False)
 
-    n_for_vision = min(len(df), IMAGE_ANALYSIS_CAP)
-    print(f"  → {n_for_vision}/{len(df)} cards → Claude Vision\n")
+    n_for_vision = len(df)  # pass all; analyze_card_images stops at IMAGE_ANALYSIS_CAP qualifying cards
+    print(f"  → up to {IMAGE_ANALYSIS_CAP} qualifying cards from pool of {len(df)} → image analysis\n")
 
     # Step 3: eBay image analysis (top IMAGE_ANALYSIS_CAP by expected profit)
     final = df
