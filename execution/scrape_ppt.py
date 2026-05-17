@@ -69,57 +69,43 @@ def _parse_psa_prices(text: str) -> dict:
     }
 
 
-def _fetch_detail_prices(page, cards: list[dict]) -> list[dict]:
-    """Click VIEW FULL ANALYSIS, diff body text, extract PSA prices."""
-    debug_done = False
+def _intercept_page_load_prices(page) -> dict:
+    """
+    Capture JSON API responses during page load to find embedded PSA price data.
+    Returns a dict keyed by card_name -> {psa9_price, psa10_price}.
+    """
+    import json
+    captured = {}
 
-    for i, card in enumerate(cards):
-        name = card["card_name"]
+    def on_response(response):
+        url = response.url
+        if any(x in url for x in ('.js', '.css', '.png', '.svg', '.ico', 'fonts', 'analytics', 'gtag')):
+            return
         try:
-            before = page.evaluate("() => document.body.innerText")
+            body = response.json()
+            captured[url] = body
+        except Exception:
+            pass
 
-            # Click the VFA text for this specific card
-            escaped = name.replace("'", "\\'")
-            page.evaluate(f"""() => {{
-                for (const c of document.querySelectorAll('div[class*="bg-card"][class*="text-card"]')) {{
-                    if ((c.innerText || '').includes('{escaped}')) {{
-                        const vfa = [...c.querySelectorAll('*')].find(
-                            el => !el.children.length && (el.innerText||'').trim()==='VIEW FULL ANALYSIS'
-                        );
-                        if (vfa) {{ vfa.dispatchEvent(new MouseEvent('click',{{bubbles:true}})); return; }}
-                        c.dispatchEvent(new MouseEvent('click',{{bubbles:true}}));
-                        return;
-                    }}
-                }}
-            }}""")
-            time.sleep(3)
+    page.on('response', on_response)
+    page.reload(wait_until='networkidle', timeout=60_000)
+    time.sleep(3)
+    page.remove_listener('response', on_response)
 
-            after = page.evaluate("() => document.body.innerText")
+    print(f"\n── API responses captured during page load: {len(captured)} ──")
+    for url, body in list(captured.items())[:20]:
+        body_str = json.dumps(body)[:400]
+        print(f"  {url}\n    {body_str}\n")
+    print("──────────────────────────────────────────\n")
+    return {}
 
-            # Diff: lines that are new after the click
-            before_lines = set(before.splitlines())
-            new_text = "\n".join(l for l in after.splitlines() if l not in before_lines)
 
-            if not debug_done:
-                print(f"\n── New text after VFA click on '{name}' ──")
-                print(new_text[:1500] if new_text else "[NO NEW TEXT — overlay may not have opened]")
-                print("──────────────────────────────────────────\n")
-                debug_done = True
-
-            prices = _parse_psa_prices(new_text or after)
-            card["psa9_price"]  = prices["psa9_price"]
-            card["psa10_price"] = prices["psa10_price"]
-            print(f"  [{i+1}/{len(cards)}] {name}: PSA9=${prices['psa9_price']} PSA10=${prices['psa10_price']}")
-
-            # Close overlay: Escape or click outside
-            page.keyboard.press("Escape")
-            time.sleep(1)
-
-        except Exception as e:
-            print(f"  [{i+1}/{len(cards)}] {name}: error — {e}")
-            card["psa9_price"]  = None
-            card["psa10_price"] = None
-
+def _fetch_detail_prices(page, cards: list[dict]) -> list[dict]:
+    """Intercept page load API calls to extract PSA 9/10 prices."""
+    _intercept_page_load_prices(page)
+    for card in cards:
+        card.setdefault("psa9_price", None)
+        card.setdefault("psa10_price", None)
     return cards
 
 
