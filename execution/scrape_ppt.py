@@ -84,12 +84,6 @@ _EXTRACT_JS = """() => {
     });
 }"""
 
-# Extracts PSA grade prices from a card's full analysis detail page
-_DETAIL_EXTRACT_JS = """() => {
-    const text = document.body.innerText || '';
-    return { text: text.slice(0, 1500) };
-}"""
-
 
 def _parse_detail_prices(text: str) -> dict:
     """Parse PSA 9 and PSA 10 prices from a detail page's raw text."""
@@ -110,45 +104,74 @@ def _parse_detail_prices(text: str) -> dict:
     }
 
 
-def _fetch_detail_prices(browser, cards: list[dict]) -> list[dict]:
-    """Visit each card's detail page and attach psa9_price / psa10_price."""
-    detail_page = browser.new_page(ignore_https_errors=True)
-    detail_page.set_extra_http_headers({"User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )})
-
+def _fetch_detail_prices(page, cards: list[dict]) -> list[dict]:
+    """Click VIEW FULL ANALYSIS for each card, scrape PSA prices, go back."""
     debug_printed = False
+
     for i, card in enumerate(cards):
-        url = card.get("detail_url", "")
-        if not url:
-            card["psa9_price"] = None
-            card["psa10_price"] = None
-            continue
+        card_name = card["card_name"]
         try:
-            detail_page.goto(url, wait_until="networkidle", timeout=30_000)
+            # Click the VFA element for this card by matching card name in text
+            escaped = card_name.replace("'", "\\'")
+            clicked = page.evaluate(f"""() => {{
+                const allCards = document.querySelectorAll('div[class*="bg-card"][class*="text-card"]');
+                for (const c of allCards) {{
+                    if ((c.innerText || '').includes('{escaped}')) {{
+                        const vfa = Array.from(c.querySelectorAll('*')).find(
+                            el => el.children.length === 0 && (el.innerText || '').trim() === 'VIEW FULL ANALYSIS'
+                        );
+                        if (vfa) {{ vfa.click(); return true; }}
+                    }}
+                }}
+                return false;
+            }}""")
+
+            if not clicked:
+                print(f"  [{i+1}/{len(cards)}] {card_name}: VFA button not found")
+                card["psa9_price"] = None
+                card["psa10_price"] = None
+                continue
+
+            # Wait for navigation away from the listing page
+            page.wait_for_function(
+                f"() => !window.location.pathname.endsWith('/psa-analysis') && window.location.pathname !== '/'",
+                timeout=10_000,
+            )
+            page.wait_for_load_state("networkidle", timeout=15_000)
             time.sleep(1)
-            result = detail_page.evaluate(_DETAIL_EXTRACT_JS)
-            text = result.get("text", "")
+
+            detail_url = page.url
+            text = page.evaluate("() => document.body.innerText || ''")
 
             if not debug_printed:
-                print(f"\n── Detail page raw text (debug: {url}) ──")
-                print(text[:1000])
+                print(f"\n── Detail page raw text (debug: {detail_url}) ──")
+                print(text[:1200])
                 print("──────────────────────────────────────────\n")
                 debug_printed = True
 
             prices = _parse_detail_prices(text)
             card["psa9_price"]  = prices["psa9_price"]
             card["psa10_price"] = prices["psa10_price"]
-            print(f"  [{i+1}/{len(cards)}] {card['card_name']}: "
-                  f"PSA9=${prices['psa9_price']} PSA10=${prices['psa10_price']}")
+            card["detail_url"]  = detail_url
+            print(f"  [{i+1}/{len(cards)}] {card_name}: PSA9=${prices['psa9_price']} PSA10=${prices['psa10_price']}")
+
         except Exception as e:
-            print(f"  [{i+1}/{len(cards)}] {card['card_name']}: detail page error — {e}")
+            print(f"  [{i+1}/{len(cards)}] {card_name}: error — {e}")
             card["psa9_price"] = None
             card["psa10_price"] = None
 
-    detail_page.close()
+        finally:
+            # Go back to listing page and wait for cards to render
+            try:
+                page.go_back(wait_until="networkidle", timeout=15_000)
+                page.wait_for_selector('div[class*="bg-card"][class*="text-card"]', timeout=10_000)
+                time.sleep(1)
+            except Exception:
+                # If back fails, reload the listing page
+                page.goto(BASE_URL, wait_until="networkidle", timeout=30_000)
+                page.wait_for_selector('div[class*="bg-card"][class*="text-card"]', timeout=10_000)
+                time.sleep(2)
+
     return cards
 
 
@@ -290,8 +313,8 @@ def run(
 
         # Visit each card's detail page to get PSA 9/10 prices
         if detail_prices and all_cards:
-            print(f"\nFetching PSA 9/10 prices from {len(all_cards)} detail pages (~{len(all_cards)*2//60+1} min)...")
-            all_cards = _fetch_detail_prices(browser, all_cards)
+            print(f"\nFetching PSA 9/10 prices from {len(all_cards)} detail pages (~{len(all_cards)*3//60+1} min)...")
+            all_cards = _fetch_detail_prices(page, all_cards)
 
         browser.close()
 
