@@ -50,7 +50,7 @@ INPUT_FILE = Path(".tmp/flip_opportunities.csv")
 OUTPUT_ANALYSIS = Path(".tmp/image_analysis.csv")
 OUTPUT_SHORTLIST = Path(".tmp/final_shortlist.csv")
 
-MAX_LISTINGS = 3        # analyze the top 3 most expensive ungraded listings
+MAX_LISTINGS = 6        # analyze up to 6 ungraded listings per card
 BROWSE_LIMIT = 50       # how many results to fetch from Browse API before filtering
 RATE_DELAY = 0.5
 MODEL = "claude-sonnet-4-6"
