@@ -889,7 +889,7 @@ def run(input_path: str = str(INPUT_FILE), top_n: int = 20) -> pd.DataFrame:
 
     sort_col   = "roi" if "roi" in df.columns else df.columns[0]
     # Pass a larger pool so the loop can skip cards with no back photos and still fill top_n
-    pool_size  = min(len(df), top_n * 2)
+    pool_size  = min(len(df), top_n)
     candidates = df.sort_values(sort_col, ascending=False).head(pool_size).copy()
 
     load_dotenv()
