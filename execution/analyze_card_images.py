@@ -533,8 +533,11 @@ def search_ebay_listings(card_name: str, set_name: str, card_number: str = "") -
             image_url = item.get("image", {}).get("imageUrl")
             # Prefer listings that have additional photos (real seller photos)
             extra_images = len(item.get("additionalImages", []))
+            additional_urls = [img.get("imageUrl") for img in item.get("additionalImages", [])
+                               if img.get("imageUrl")]
             out.append({"title": title, "price": price, "url": url,
-                        "image_url": image_url, "extra_images": extra_images})
+                        "image_url": image_url, "extra_images": extra_images,
+                        "additional_image_urls": additional_urls})
             if len(out) >= MAX_LISTINGS * 4:   # gather extras for sorting
                 break
         if strict:
@@ -798,17 +801,22 @@ def pick_best_listing(card_name: str, set_name: str, card_number: str,
             print(f"  [{i}/{len(listings)}] ${listing['price']:.2f} — no image from API")
             continue
 
-        print(f"  [{i}/{len(listings)}] ${listing['price']:.2f} — downloading image...", end=" ", flush=True)
+        print(f"  [{i}/{len(listings)}] ${listing['price']:.2f} — downloading images...", end=" ", flush=True)
         time.sleep(RATE_DELAY)
-        b64 = download_image_b64(_upgrade_ebay_image_url(image_url))
-        if not b64:
+        # Download main image + up to 2 additional images so Claude can see the back
+        all_urls = [_upgrade_ebay_image_url(image_url)] + [
+            _upgrade_ebay_image_url(u) for u in listing.get("additional_image_urls", [])[:2]
+        ]
+        images_b64 = [b for b in (download_image_b64(u) for u in all_urls) if b]
+        if not images_b64:
             print("download failed")
             continue
+        b64 = images_b64[0]  # main image used for Ximilar
 
         load_dotenv()
         if os.environ.get("XIMILAR_API_KEY"):
             print("Claude flags...", end=" ", flush=True)
-            flags_result = check_red_flags_claude(card_name, set_name, card_number, b64, reference_b64)
+            flags_result = check_red_flags_claude(card_name, set_name, card_number, images_b64, reference_b64)
             red_flags    = flags_result.get("red_flags", {})
             # Critical flags → skip before spending an Ximilar credit
             active_critical = [f for f in _CRITICAL_FLAGS
